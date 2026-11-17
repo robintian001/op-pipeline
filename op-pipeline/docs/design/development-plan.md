@@ -3,7 +3,7 @@
 > 本文是 [演进路线](../architecture/roadmap.md) 的任务级分解：
 > 每个任务给出**改动落点**与**可验证的验收标准**，按里程碑组织。
 > 任务编号规则：`M<里程碑>-<序号>`。技术债编号（T*）见
-> [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口)，映射关系见本文 §5。
+> [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口)，映射关系见本文 §6。
 
 ---
 
@@ -11,7 +11,7 @@
 
 | 约定项 | 内容 |
 | --- | --- |
-| 版本节奏 | M1 → `0.2.x`，M2 → `0.3.x`，M3 → `0.4+`（一个里程碑一个 minor 版本） |
+| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4+` |
 | 合入门槛 | `python -m unittest discover -s tests -v` 全绿 + 新任务自带测试 + 两个示例流水线端到端通过 |
 | 回归基线 | 每个任务合入前先跑基线；M2 的抽象类任务要求"平移后行为零变化"（现有 21 用例不改断言） |
 | 文档同步 | 改动涉及节点字段/执行语义/CLI 的，同一变更内更新 [运行时语义](../architecture/runtime-semantics.md) 与 [配置规范](../reference/config-schema.md)；新增算子更新 [算子清单](../reference/operator-catalog.md) |
@@ -20,7 +20,7 @@
 
 ---
 
-## 2. M1：正确性与承诺补齐（v0.2）
+## 2. M1：正确性与承诺补齐（v0.2.0）
 
 目标：实现与文档一致，消除隐性正确性问题。全部为小改动，可按任意顺序执行，
 建议按下列顺序（先修"承诺未兑现"，再做清理）。
@@ -42,9 +42,31 @@
 
 ---
 
-## 3. M2：三个抽象（v0.3）
+## 3. M1.5：库通用性补齐（v0.2.x）
 
-目标：解锁硬超时、CPU 并行、断点续跑、可观测性。任务有依赖关系：M2-1 → M2-2，M2-5 → M2-6。
+> 背景：项目的差异化定位是"**可嵌入库**"（[roadmap §1](../architecture/roadmap.md)）。
+> 本里程碑专门消除"嵌入到任意宿主（服务、测试、async 宿主、多流水线并发进程）时的惊讶行为"。
+> 任务全部小粒度、相互独立，**每个任务可单独发一个 `0.2.x` 小版本**（小步快跑），可与 M1 交错执行。
+
+| 编号 | 任务 | 消除的通用性缺口 | 改动落点 | 验收标准 |
+| --- | --- | --- | --- | --- |
+| M1.5-1 | 独立注册表收尾：`load_plugins(..., registry=None)` 注入；`run(..., registry=None)`（当前写死 `default_registry`）；文档化既有的 `@op(registry=...)` 用法 | `@op` 已支持注入但插件加载/快捷入口不支持：全局单例导致多流水线共享一张表、测试互相污染（现有测试被迫用 `replace=True` 即此症状） | [registry.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py) `load_plugins`、[__init__.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/__init__.py) `run()` | 单测：两个独立 `Registry` 经 `run(..., registry=...)` 各自跑通且算子集隔离；不传参行为完全向后兼容 |
+| M1.5-2 | 打包完备：新增 `op_pipeline/py.typed`；补 `license`/`classifiers`/`[tool.setuptools.package-data]` | 外部消费者拿到的是"盲类型"（无 py.typed，mypy/pyright 忽略全部内联标注）；PyPI 元数据不完整 | [pyproject.toml](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/pyproject.toml)、新文件 `op_pipeline/py.typed` | `pip install -e .` 后第三方项目类型检查无"缺 py.typed"提示；构建 wheel 含 py.typed |
+| M1.5-3 | 无惊讶副作用：`artifacts_dir` 惰性创建（首次 `artifact_path` 才 mkdir）；`RunContext.create` 增加位置覆盖参数 | 嵌入方只想做纯内存计算，workdir 却被强制留下 `.op_pipeline/`（`create` 当前无条件 mkdir） | [context.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/context.py) `RunContext.create` | 单测：纯内存流水线跑完后 workdir 无 `.op_pipeline/`；用到产物的运行写盘行为不变 |
+| M1.5-4 | 未知配置键告警：`PipelineSpec.from_dict` / `NodeSpec.from_dict` 对未知键发 `logging.warning` | `[nodes]` 拼错成 `[Nodes]` 会得到"0 节点运行成功"，笔误静默通过 | [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) | 单测：assertLogs 捕获未知键告警，正确配置零告警；`validate` 命令展示告警 |
+| M1.5-5 | `when` 参数一致性：`env["params"]` 改为解析后的值，原值保留为 `env["raw_params"]` | 当前 `params` 是原始配置串（可能是 `${p.x}`），与平铺名（解析值）混排在同一环境，配置作者易踩坑（运行时语义已标注该坑） | [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) `_eval_when` + [运行时语义](../architecture/runtime-semantics.md) | 单测：`when = "params.n > 0"` 与 `when = "n > 0"` 均按预期命中；现有 when 用例通过；文档同步 |
+| M1.5-6 | 表达式函数扩展钩子：公开 `expression.register_function(name, fn)`（约束：纯函数、禁止覆盖内置名） | 白名单仅 14 个内建函数；配置作者无法使用领域函数（日期解析、正则辅助），复杂条件被迫写算子，"配置驱动"价值打折 | [expression.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/expression.py) | 单测：注册自定义函数后 `when` 可用；覆盖内置名被拒绝；AST 拦截规则不变 |
+| M1.5-7 | 取消机制：`Engine.cancel(reason)` + `run_pipeline(..., cancel_event: threading.Event)`；取消后待调度节点标记 skipped、在跑节点自然结束、报告照常产出 | 运行一旦启动无法中断——嵌入服务后请求取消/超时，流水线仍跑完浪费资源；Ctrl+C 同样没有干净出口 | [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) `_dispatch/collect` | 单测：并行流水线运行中 set 事件，未调度节点 skipped（note 含原因）、报告 status=partial；不 set 行为不变 |
+| M1.5-8 | 注册表线程安全：`Registry.register`、`load_plugins` 加 `RLock` | 单进程多线程并发调用 `run()`（内部 load_plugins）存在 dict 写竞态 | [registry.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py) | 单测：N 线程并发注册/加载无异常、注册数量正确 |
+
+**M1.5 完成定义（DoD）**：各任务独立合入、各自可发版；收尾时在 `examples/` 新增
+"库嵌入模式"综合示例（独立注册表 + 取消事件 + 纯内存运行三合一）；现有测试与新增单测全绿。
+
+---
+
+## 4. M2：三个抽象（v0.3）
+
+目标：解锁硬超时、CPU 并行、断点续跑、可观测性。任务有依赖关系：M2-1 → M2-2，M2-5 → M2-6；M2-8 独立，可先行合入。
 
 | 编号 | 任务 | 改动落点 | 验收标准 |
 | --- | --- | --- | --- |
@@ -55,14 +77,15 @@
 | M2-5 | `RunStore` + SQLite：新模块定义 `record_run/record_node/query`；表结构 `runs(run_id, pipeline, version, status, started_at, finished_at, params_json)`、`nodes(run_id, node_id, op, status, attempts, cached, error, cache_key, finished_at)`；`Engine` 在 `_collect` 时写入；`--runs <db>` 开关（默认关闭，保持零副作用）；同时把算子源码摘要纳入 cache_key 的可选开关（缓解 T7） | 新增 [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/store.py)，改 [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py)、[cli.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cli.py) | 单测：跑完后 SQLite 可查询到与 `RunReport` 一致的节点状态/attempts；不传开关时不产生任何文件 |
 | M2-6 | 断点续跑：`--resume <run_id>`——从 `RunStore` 读取上次成功节点的 `cache_key`，与本次编译后的 key 比对，一致则直接复用缓存/句柄并标记 `[resumed]` | [cli.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cli.py)、[engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) `_run_node` 缓存查询处 | 单测：三段流水线首跑到第二段失败；修数据后 `--resume` 只重跑失败段及下游，首段 `[resumed]`；依赖 M2-5 |
 | M2-7 | 执行事件钩子：`Engine(hooks=[Hook])`，Hook 协议 `on_node_start(node_id, op)`、`on_node_finish(node_id, status, duration, cached)`、`on_run_finish(report)` | [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) `_run_node/_collect/run` | 单测：钩子按调度顺序收到事件；失败节点也触发 `on_node_finish`；文档给出进度条示例 |
+| M2-8 | async 宿主嵌入：新增 `run_pipeline_async(...)`（以 `loop.run_in_executor` 包装同步引擎；缺口：`run_pipeline` 是同步阻塞函数，在 async 宿主内调用会卡死事件循环），文档说明它与全 asyncio 调度器的区别（后者不在本里程碑范围） | [__init__.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/__init__.py)、[engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) | 单测：在运行中的事件循环内 `await run_pipeline_async(...)` 得到正确报告；流水线运行期间同循环的其它 asyncio 任务可推进（证明未阻塞） |
 
 **M2 完成定义（DoD）**：全部现有测试不改断言通过；新增 Executor/HandleStore/RunStore 单测；
-`--executor process` + `--resume` 各有一个端到端示例；[运行时语义](../architecture/runtime-semantics.md)
+`--executor process` + `--resume` 各有一个端到端示例；`run_pipeline_async` 有 async 宿主单测与文档示例；[运行时语义](../architecture/runtime-semantics.md)
 新增"执行器/续跑"两节。
 
 ---
 
-## 4. M3：生态与规模化（v0.4+，按需启动）
+## 5. M3：生态与规模化（v0.4+，按需启动）
 
 目标：扩大 B 类场景覆盖面；全部走"算子/extras/外围"，不动内核语义。
 
@@ -74,13 +97,15 @@
 | M3-4 | 插件入口点发现：`pyproject` 支持 `[project.entry-points."op_pipeline.ops"]`；`load_plugins(entry_points=True)` 扫描注册 | [registry.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py) | 单测：安装一个玩具插件包后 `op_pipeline ops` 列出其算子；文档新增插件包发布指南 |
 | M3-5 | 配置版本化：`spec_version` 顶层字段（缺省 `"1"`）+ 迁移器框架（`MIGRATIONS: dict[version, callable]`） | [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) `from_dict` | 单测：旧配置在新版本下仍可解析；未知更高版本报清晰错误 |
 | M3-6 | 观测性：基于 M2-7 钩子的结构化事件导出（JSON lines / 可选 OTel bridge） | 新模块 `observe.py`（extras `otel`） | 单测：一次运行导出的 JSONL 与报告一致 |
+| M3-7 | 配置组合（第一步）：顶层 `includes`——合并 params/nodes/outputs，节点 id 重复即报错，环检测在合并后进行；节点组/嵌套流水线留作后续迭代（缺口：大型配置重复度高，外部 jinja 预渲染会绕过校验层） | [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) `from_dict` | 单测：includes 合并结果与手写大配置语义一致（节点数、依赖图相同）；文件缺失/循环 include 报错清晰 |
+| M3-8 | 自定义配置格式：`PipelineSpec.register_loader(suffix, fn)` 注册表，内建 json/toml/yaml 改为注册项（缺口：`from_file` 目前是固定 if/elif 分发，第三方无法扩展 .ini 等格式） | [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) `from_file` | 单测：注册 `.fake` 后缀 loader 后正确分发；未知后缀报错并列出已注册格式 |
 
 **M3 完成定义（DoD）**：`op_pipeline ops` 算子数 ≥ 40；每个 extras 有独立的依赖声明与 README 说明；
-内核 import 路径保持零第三方依赖（extras 模块延迟导入）。
+内核 import 路径保持零第三方依赖（extras 模块延迟导入）；`examples/` 新增 includes 组合示例配置。
 
 ---
 
-## 5. 技术债映射
+## 6. 技术债映射
 
 [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口) 的 T1–T15 与本计划的对应关系：
 
@@ -99,9 +124,12 @@
 | T13 `strict=False` 预留 | 不处理（保持现状，文档已说明） | — |
 | T15 首行列假设 | M3-3 | M3 |
 
+> 通用性任务（M1.5-1…8、M2-8、M3-7/M3-8）不来自技术债清单，而来自库通用性评估，
+> 见 §3 与 [roadmap 阶段 1.5](../architecture/roadmap.md)。
+
 ---
 
-## 6. 里程碑级验收清单
+## 7. 里程碑级验收清单
 
 每个里程碑收尾时执行（也是发版前检查单）：
 
@@ -130,11 +158,11 @@ python -m op_pipeline ops
 
 ---
 
-## 7. 工程实践约定
+## 8. 工程实践约定
 
 1. **一个任务一个 PR**，PR 描述引用任务编号（如 `M1-2`），便于回溯验收标准；
 2. **语义变更先改文档再改代码**：涉及 [运行时语义](../architecture/runtime-semantics.md)
    的改动，PR 里先提交语义描述，评审通过后落实现；
 3. **测试先行**：每个任务先写失败的单测（复现问题或表达预期），再实现；
 4. **评审否决线**：PR 引入新强依赖、改默认交换格式、在算子内部直读写句柄表——三者一律否决（依据 [roadmap §7](../architecture/roadmap.md#7-明确不建议的方向)）；
-5. **发版**：M1/M2 收尾打 tag，`CHANGELOG` 按里程碑列出任务编号与影响面。
+5. **发版**：每个任务合入即发一个小版本（`0.2.x`），M1/M1.5/M2/M3 收尾打 tag，`CHANGELOG` 按任务编号列出改动与影响面。
