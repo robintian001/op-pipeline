@@ -216,7 +216,7 @@ class Executor(Protocol):
 
 ## 7. 新增能力时的回归清单
 
-1. 跑 `python -m unittest discover -s tests -v`（46 个用例）；
+1. 跑 `python -m unittest discover -s tests -v`（47 个用例）；
 2. 用 `examples/pipeline_orders.json` 做端到端（覆盖并行 fan-out、when、断言、4 种输出）；
 3. 用 `examples/pipeline_text.toml --plugin plugins/demo_ops.py`（`--plugin` 相对配置文件所在目录解析）验证插件与重试；
 4. `python -m op_pipeline validate` 与 `graph` 必须仍然可用；

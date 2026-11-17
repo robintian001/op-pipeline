@@ -115,7 +115,7 @@ def run(
     spec = PipelineSpec.from_file(config_path)
     return run_pipeline(
         spec,
-        registry=registry or default_registry,
+        registry=registry if registry is not None else default_registry,
         workdir=workdir or config_path.parent,
         overrides=overrides,
         cache_dir=cache_dir,

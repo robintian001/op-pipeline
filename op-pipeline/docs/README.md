@@ -29,6 +29,13 @@
 本目录与包源码同处一个仓库根：包源码位于 `op_pipeline/`，示例与插件位于 `examples/`，
 自测位于 `tests/test_op_pipeline.py`。文档中的源码链接统一使用 `file:///` 绝对路径，可直接跳转。
 
+示例一览：
+
+- `examples/pipeline_orders.json` / `.toml`：CLI 模式（并行 fan-out、when、断言、4 种输出）；
+- `examples/pipeline_text.toml` + `plugins/demo_ops.py`：插件加载与重试（`--plugin` 相对配置文件目录解析）；
+- `examples/embedded_lib_demo.py`：**库嵌入模式**（独立注册表 + 取消事件 + 纯内存运行三合一，
+  直接 `python examples/embedded_lib_demo.py` 运行，无需安装）。
+
 ## 文档维护原则
 
 1. 文档描述的是**实现**而非愿景；新增能力时同步更新对应章节。

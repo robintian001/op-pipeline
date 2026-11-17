@@ -462,6 +462,18 @@ class RegistryIsolationTest(unittest.TestCase):
             report, _ = run(cfg, cache_dir=None)
             self.assertTrue(report.ok)
 
+    def test_directed_op_on_empty_registry(self):
+        """空注册表（len==0 为 falsy）也必须定向成功——不能被 `or` 短路到全局表。"""
+        empty = Registry()
+
+        @op("m15.empty_only", registry=empty)
+        class _EmptyOnly(Operator):
+            def execute(self, ctx, inputs):
+                return {}
+
+        self.assertIn("m15.empty_only", empty)
+        self.assertNotIn("m15.empty_only", default_registry)
+
 
 class RegistryThreadSafetyTest(unittest.TestCase):
     """M1.5-8：注册表线程安全——并发注册/加载不竞态，失败占位可重试。"""

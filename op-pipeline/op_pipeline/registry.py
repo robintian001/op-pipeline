@@ -162,7 +162,8 @@ def op(
     """
 
     def decorator(cls: type) -> type:
-        target = registry or _ambient_registry.get() or default_registry
+        # 显式 None 判断：空注册表 len==0 为 falsy，不能用 `or` 短路
+        target = registry if registry is not None else _ambient_registry.get() or default_registry
         target.register(cls, None if isinstance(name, type) else name, aliases=aliases, replace=replace)
         return cls
 

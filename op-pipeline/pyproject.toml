@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "op-pipeline"
-version = "0.1.0"
+version = "0.2.1"
 description = "算子级、配置驱动的 Python 流水线框架（纯标准库）"
 readme = "README.md"
 requires-python = ">=3.11"
