@@ -45,8 +45,15 @@ def fingerprint(value: Any, _depth: int = 0) -> str:
 class CacheStore:
     """极简文件缓存，空目录即关闭缓存。"""
 
-    def __init__(self, directory: str | Path | None) -> None:
-        self.directory = Path(directory).expanduser() if directory else None
+    def __init__(
+        self, directory: str | Path | None, base_dir: str | Path | None = None
+    ) -> None:
+        path = Path(directory).expanduser() if directory else None
+        # 相对缓存目录以 base_dir（通常为 workdir）为基准，而非进程 CWD：
+        # 换个目录启动 CLI/库调用仍命中同一份缓存
+        if path is not None and not path.is_absolute() and base_dir is not None:
+            path = Path(base_dir).expanduser() / path
+        self.directory = path
         if self.directory:
             self.directory.mkdir(parents=True, exist_ok=True)
 

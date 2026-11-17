@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import importlib
 import importlib.util
 import itertools
@@ -228,7 +229,9 @@ def load_plugins(
                     continue
                 mod_name = f"_op_plugin_{path.stem}_{next(_plugin_seq)}"
             else:
-                mod_name = f"_op_plugin_{path.stem}"
+                # 模块名取路径摘要（M1-7）：不同目录的同名文件都能加载；
+                # 同一文件重复加载则因 sys.modules 命中而幂等跳过
+                mod_name = f"_op_plugin_{hashlib.blake2b(key.encode()).hexdigest()[:16]}"
                 if mod_name in sys.modules:
                     loaded.append(key)
                     continue

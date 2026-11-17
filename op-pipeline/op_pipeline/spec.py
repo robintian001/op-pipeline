@@ -72,6 +72,12 @@ def _warn_unknown_keys(where: str, raw: Mapping[str, Any], known: frozenset[str]
 # --------------------------------------------------------------------------- #
 # 数据模型
 # --------------------------------------------------------------------------- #
+# PipelineSpec.defaults 可设置的运行策略键（节点可逐项覆盖）
+_STRATEGY_KEYS = frozenset(
+    {"retries", "retry_delay", "timeout", "cache", "allow_failure"}
+)
+
+
 @dataclass
 class NodeSpec:
     """一个流水线节点 = 一个算子实例 + 连线 + 运行策略。"""
@@ -99,7 +105,15 @@ class NodeSpec:
     )
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any]) -> "NodeSpec":
+    def from_dict(
+        cls, raw: Mapping[str, Any], defaults: Mapping[str, Any] | None = None
+    ) -> "NodeSpec":
+        """从配置字典构造节点。
+
+        运行策略字段（retries/retry_delay/timeout/cache/allow_failure）三级优先：
+        节点显式值 > 流水线 ``defaults`` > 框架默认。合并发生在此处，
+        之后（build_plan/引擎）不再区分值的来源。
+        """
         if not isinstance(raw, Mapping):
             raise ConfigError(f"节点定义必须是对象，实际是 {type(raw).__name__}")
         node_id = raw.get("id") or raw.get("name")
@@ -112,6 +126,10 @@ class NodeSpec:
         outputs = raw.get("outputs") or {}
         if not isinstance(outputs, Mapping):
             raise ConfigError(f"节点 [{node_id}] 的 outputs 必须是映射（端口 -> 句柄名）")
+        # 三级合并：raw.get(key, defaults.get(key, 框架默认))
+        fallback = defaults or {}
+        merged = {k: raw.get(k, fallback.get(k)) for k in _STRATEGY_KEYS}
+        timeout_raw = merged["timeout"]
         return cls(
             id=str(node_id),
             op=str(op),
@@ -119,12 +137,11 @@ class NodeSpec:
             outputs={str(k): str(v) for k, v in outputs.items()},
             params=dict(raw.get("params") or {}),
             when=raw.get("when"),
-            retries=int(raw.get("retries") or 0),
-            retry_delay=float(raw.get("retry_delay") or 0.0),
-            timeout=(None if raw.get("timeout") in (None, 0) else float(raw["timeout"]))
-            if "timeout" in raw else None,
-            cache=bool(raw.get("cache") or False),
-            allow_failure=bool(raw.get("allow_failure") or False),
+            retries=int(merged["retries"] or 0),
+            retry_delay=float(merged["retry_delay"] or 0.0),
+            timeout=None if timeout_raw in (None, 0) else float(timeout_raw),
+            cache=bool(merged["cache"] or False),
+            allow_failure=bool(merged["allow_failure"] or False),
             description=str(raw.get("description") or ""),
         )
 
@@ -152,14 +169,21 @@ class PipelineSpec:
         nodes_raw = raw.get("nodes") or []
         if not isinstance(nodes_raw, list):
             raise ConfigError("nodes 必须是数组")
+        defaults = dict(raw.get("defaults") or {})
+        unknown = set(defaults) - _STRATEGY_KEYS
+        if unknown:
+            raise ConfigError(
+                f"defaults 含未知策略键：{sorted(unknown)}；"
+                f"可用键为 {sorted(_STRATEGY_KEYS)}"
+            )
         return cls(
             name=str(raw.get("name") or "pipeline"),
             description=str(raw.get("description") or ""),
             version=str(raw.get("version") or "1"),
             params=dict(raw.get("params") or {}),
-            nodes=[NodeSpec.from_dict(n) for n in nodes_raw],
+            nodes=[NodeSpec.from_dict(n, defaults=defaults) for n in nodes_raw],
             outputs={str(k): str(v) for k, v in (raw.get("outputs") or {}).items()},
-            defaults=dict(raw.get("defaults") or {}),
+            defaults=defaults,
         )
 
     # ------------------------------------------------------------------ #
@@ -339,7 +363,6 @@ class PlanNode:
     spec: NodeSpec
     operator_cls: type
     operator: Any
-    resolved_inputs: dict[str, Any]
     handles: dict[str, str]  # 端口 -> 句柄
     depends_on: list[str]
 
@@ -487,7 +510,6 @@ def build_plan(
                 spec=node,
                 operator_cls=cls,
                 operator=instance,
-                resolved_inputs={},
                 handles=handles,
                 depends_on=sorted(depends),
             )

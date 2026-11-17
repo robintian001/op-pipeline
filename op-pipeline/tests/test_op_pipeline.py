@@ -32,7 +32,8 @@ from op_pipeline import (  # noqa: E402
 )
 from op_pipeline import expression  # noqa: E402
 from op_pipeline.expression import ExpressionError  # noqa: E402
-from op_pipeline.spec import build_plan  # noqa: E402
+from op_pipeline.spec import build_plan, PlanNode  # noqa: E402
+from op_pipeline.errors import ConfigError  # noqa: E402
 from op_pipeline.cache import CacheStore  # noqa: E402
 from op_pipeline.context import RunContext  # noqa: E402
 from op_pipeline.engine import Engine  # noqa: E402
@@ -732,6 +733,397 @@ class ExpressionFunctionHookTest(unittest.TestCase):
         for bad in ("__import__('os')", "x.__class__"):
             with self.assertRaises(ExpressionError):
                 evaluate(bad, {"x": 1})
+
+
+class PortTypeWarningTest(unittest.TestCase):
+    """M1-1：端口软类型不符时进 report.warnings（状态仍 success，值照常传递）。"""
+
+    def test_type_mismatch_warns_but_succeeds(self):
+        @op("m11.bad_const", replace=True)
+        class _BadConst(Operator):
+            description = "声明 int 却返回 str（软类型告警演示）"
+
+            outputs = [("value", int)]
+
+            def run(self, ctx):
+                return "42"  # 故意类型不符
+
+        nodes = [
+            {"id": "src", "op": "m11.bad_const"},
+            {
+                "id": "dbl",
+                "op": "testkit.double",
+                "inputs": {"value": "${src.value}"},
+                "params": {"times": 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report, values = run_pipeline(
+                spec_of(nodes),
+                registry=default_registry,
+                workdir=tmp,
+                cache_dir=None,
+            )
+        self.assertEqual(report.status, "success", "软类型不符不应导致失败")
+        self.assertEqual(values["dbl.value"], "4242", "str 值应照常向下游传递")
+        joined = "\n".join(report.warnings)
+        self.assertIn("src", joined, f"应指明类型不符的节点，实际：{report.warnings}")
+        self.assertIn("声明", joined, "告警应包含声明类型与实际类型")
+
+
+class CacheDirResolutionTest(unittest.TestCase):
+    """M1-2：相对 cache_dir 以 workdir 为基准（与进程 CWD 无关）。"""
+
+    NODES = [
+        {"id": "src", "op": "control.const", "params": {"value": 21}},
+        {
+            "id": "dbl",
+            "op": "testkit.double",
+            "inputs": {"value": "${src.value}"},
+            "params": {"times": 2},
+            "cache": True,
+        },
+    ]
+
+    def test_relative_cache_dir_anchors_to_workdir(self):
+        with tempfile.TemporaryDirectory() as workdir, \
+                tempfile.TemporaryDirectory() as cwd_a, \
+                tempfile.TemporaryDirectory() as cwd_b:
+            old = os.getcwd()
+            try:
+                os.chdir(cwd_a)
+                first, _ = run_pipeline(
+                    spec_of(self.NODES),
+                    registry=default_registry,
+                    workdir=workdir,
+                    cache_dir=".pipeline_cache",
+                )
+                os.chdir(cwd_b)
+                second, _ = run_pipeline(
+                    spec_of(self.NODES),
+                    registry=default_registry,
+                    workdir=workdir,
+                    cache_dir=".pipeline_cache",
+                )
+            finally:
+                os.chdir(old)
+            self.assertFalse(
+                first.node("dbl").cached, "首次运行应真实计算"
+            )
+            self.assertTrue(
+                second.node("dbl").cached, "换 CWD 后应命中 workdir 下的同一份缓存"
+            )
+            self.assertFalse(
+                Path(cwd_a, ".pipeline_cache").exists(), "缓存不应落在进程 CWD"
+            )
+
+    def test_cli_cache_dir_anchors_to_config_dir(self):
+        with tempfile.TemporaryDirectory() as cfg_dir, \
+                tempfile.TemporaryDirectory() as cwd:
+            cfg = Path(cfg_dir) / "pipe.toml"
+            cfg.write_text(
+                "[[nodes]]\n"
+                "id = \"src\"\n"
+                "op = \"control.const\"\n"
+                "\n"
+                "[nodes.params]\n"
+                "value = 42\n",
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "PYTHONIOENCODING": "utf-8",
+                # 子进程 CWD 刻意不在仓库根（测试目的），用 PYTHONPATH 定位包
+                "PYTHONPATH": str(ROOT),
+            }
+            for _ in range(2):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "op_pipeline", "run", str(cfg)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    env=env,
+                    cwd=cwd,
+                    timeout=120,
+                )
+                self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertTrue(
+                (Path(cfg_dir) / ".pipeline_cache").exists(),
+                "CLI 缓存应落在配置文件目录（workdir 默认值）",
+            )
+            self.assertFalse(
+                Path(cwd, ".pipeline_cache").exists(), "CLI 缓存不应落在进程 CWD"
+            )
+
+
+class FailureTracebackTest(unittest.TestCase):
+    """M1-3：失败节点保留（截断的）堆栈，to_dict 带出，summary 不受影响。"""
+
+    def _run_raiser(self, message: str):
+        @op("m13.raiser", replace=True)
+        class _Raiser(Operator):
+            description = "总是抛错（堆栈演示）"
+            outputs = [("value", int)]
+
+            def run(self, ctx):
+                raise ValueError(message)
+
+        nodes = [{"id": "bad", "op": "m13.raiser"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            report, _ = run_pipeline(
+                spec_of(nodes),
+                registry=default_registry,
+                workdir=tmp,
+                cache_dir=None,
+            )
+        return report
+
+    def test_failed_node_keeps_traceback(self):
+        report = self._run_raiser("boom for traceback")
+        node = report.node("bad")
+        self.assertEqual(report.status, "failed")
+        self.assertIn("Traceback (most recent call last)", node.traceback)
+        self.assertIn("ValueError: boom for traceback", node.traceback)
+        data = node.to_dict()
+        self.assertIn("Traceback (most recent call last)", data["traceback"])
+
+    def test_traceback_truncated_to_about_2000_chars(self):
+        report = self._run_raiser("x" * 5000)
+        node = report.node("bad")
+        self.assertLessEqual(len(node.traceback), 2100, "应截断到约 2000 字符")
+        self.assertTrue(
+            node.traceback.startswith("..."), "截断应以省略标记开头"
+        )
+        self.assertIn(
+            "x" * 500, node.traceback[-600:],
+            "截断应保留末尾（超长异常消息的尾部）",
+        )
+
+    def test_successful_node_has_empty_traceback(self):
+        nodes = [{"id": "ok", "op": "control.const", "params": {"value": 1}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            report, _ = run_pipeline(
+                spec_of(nodes),
+                registry=default_registry,
+                workdir=tmp,
+                cache_dir=None,
+            )
+        self.assertEqual("", report.node("ok").traceback)
+
+
+class RunIdCollisionTest(unittest.TestCase):
+    """M1-4：同秒并发的 run_id 不碰撞（产物目录互相隔离）。"""
+
+    def test_two_creates_in_same_second_differ(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = RunContext.create(pipeline="p", params={}, workdir=tmp)
+            b = RunContext.create(pipeline="p", params={}, workdir=tmp)
+        self.assertNotEqual(a.run_id, b.run_id, "同秒两次 create 应得到不同 run_id")
+        self.assertNotEqual(a.artifacts_dir, b.artifacts_dir)
+        # 前缀仍是可读的秒级时间戳，后缀为 4 位十六进制
+        for run_id in (a.run_id, b.run_id):
+            self.assertRegex(run_id, r"^\d{8}-\d{6}-[0-9a-f]{4}$")
+
+    def test_explicit_run_id_still_respected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext.create(
+                pipeline="p", params={}, workdir=tmp, run_id="custom-id"
+            )
+        self.assertEqual("custom-id", ctx.run_id)
+
+
+class DefaultsInheritanceTest(unittest.TestCase):
+    """M1-5：PipelineSpec.defaults 作为节点运行策略缺省值（节点显式值优先）。"""
+
+    DEFAULTS = {"retries": 2, "cache": True, "timeout": 30}
+
+    def _node_spec(self, **node_overrides):
+        node = {"id": "n", "op": "control.const", "params": {"value": 1}}
+        node.update(node_overrides)
+        spec = PipelineSpec.from_dict(
+            {"defaults": self.DEFAULTS, "nodes": [node]}
+        )
+        return spec.nodes[0]
+
+    def test_unset_node_inherits_defaults(self):
+        node = self._node_spec()
+        self.assertEqual(2, node.retries, "未设置 retries 应继承 defaults")
+        self.assertTrue(node.cache, "未设置 cache 应继承 defaults")
+        self.assertEqual(30.0, node.timeout, "未设置 timeout 应继承 defaults")
+
+    def test_explicit_values_win_over_defaults(self):
+        node = self._node_spec(retries=0, cache=False)
+        self.assertEqual(0, node.retries, "显式 retries=0 应优先于 defaults")
+        self.assertFalse(node.cache, "显式 cache=false 应优先于 defaults")
+
+    def test_unknown_default_key_rejected(self):
+        with self.assertRaises(ConfigError):
+            PipelineSpec.from_dict({"defaults": {"brain": 1}, "nodes": []})
+
+
+class DeadCodeRemovalTest(unittest.TestCase):
+    """M1-6：死代码清理——残留字段与误导性导出必须移除，`__all__` 同步收缩。"""
+
+    def test_module_execution_error_removed(self):
+        import op_pipeline
+
+        self.assertFalse(
+            hasattr(op_pipeline, "ModuleExecutionError"),
+            "引擎从不抛出该类，保留导出会误导排障",
+        )
+        self.assertNotIn("ModuleExecutionError", op_pipeline.__all__)
+
+    def test_plan_node_has_no_resolved_inputs(self):
+        import dataclasses
+
+        fields = {f.name for f in dataclasses.fields(PlanNode)}
+        self.assertNotIn(
+            "resolved_inputs", fields, "恒为 {} 的残留字段应删除"
+        )
+
+
+class PluginPathDedupTest(unittest.TestCase):
+    """M1-7：文件插件按路径去重——不同目录的同名文件都能加载，同文件保持幂等。"""
+
+    OPS_A = """
+from op_pipeline import Operator, op
+
+@op("m17a.op_a")
+class OpA(Operator):
+    outputs = [("value", int)]
+
+    def run(self, ctx):
+        return 1
+"""
+
+    OPS_B = """
+from op_pipeline import Operator, op
+
+@op("m17a.op_b")
+class OpB(Operator):
+    outputs = [("value", int)]
+
+    def run(self, ctx):
+        return 2
+"""
+
+    OPS_C = """
+from op_pipeline import Operator, op
+
+@op("m17b.op_a")
+class OpC(Operator):
+    outputs = [("value", int)]
+
+    def run(self, ctx):
+        return 3
+"""
+
+    def test_same_stem_different_dirs_both_loaded(self):
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            a = Path(d1) / "my_ops.py"
+            b = Path(d2) / "my_ops.py"
+            a.write_text(self.OPS_A, encoding="utf-8")
+            b.write_text(self.OPS_B, encoding="utf-8")
+            load_plugins(paths=[a, b], package=None)
+        self.assertIn("m17a.op_a", default_registry, "第一个同名文件应被加载")
+        self.assertIn("m17a.op_b", default_registry, "第二个同名文件不应被 stem 去重静默跳过")
+
+    def test_same_file_stays_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = Path(d) / "my_ops.py"
+            c.write_text(self.OPS_C, encoding="utf-8")
+            load_plugins(paths=[c], package=None)
+            # 裸 @op 无 replace：若重复执行会抛 DuplicateOperatorError
+            load_plugins(paths=[c], package=None)
+        self.assertIn("m17b.op_a", default_registry)
+
+
+class RunModulePluginsTest(unittest.TestCase):
+    """M1-8：run() 支持模块插件——库调用方不必再自行 load_plugins。
+
+    text 示例的 read 节点按 workdir 读 data/notes.txt，因此沿用默认
+    workdir（配置文件目录），与 CLI 回归的副作用一致（.gitignore 已忽略）。
+    """
+
+    def test_run_accepts_module_plugins(self):
+        import sys
+
+        cfg = ROOT / "examples" / "pipeline_text.toml"
+        sys.path.insert(0, str(ROOT))  # examples.* 是 ROOT 下的命名空间包
+        try:
+            report, _ = run(
+                cfg,
+                cache_dir=None,
+                plugin_modules=("examples.plugins.demo_ops",),
+                registry=Registry(),  # 独立表：不依赖默认表状态，裸 @op 经 contextvar 落入
+            )
+        finally:
+            sys.path.remove(str(ROOT))
+        self.assertEqual("success", report.status)
+
+    def test_run_without_plugin_modules_unchanged(self):
+        # 守门：不传 plugin_modules 时与历史行为一致（路径插件照常工作）
+        cfg = ROOT / "examples" / "pipeline_text.toml"
+        report, _ = run(
+            cfg,
+            cache_dir=None,
+            plugins=(str(cfg.parent / "plugins" / "demo_ops.py"),),
+            registry=Registry(),
+        )
+        self.assertEqual("success", report.status)
+
+
+class DryRunNoSideEffectsTest(unittest.TestCase):
+    """M1-9：--dry-run 提前到副作用创建之前——不建产物/缓存目录；ops --json 契约核对。"""
+
+    ENV = {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(ROOT),
+    }
+
+    @staticmethod
+    def _run_cli(*cli_args: str, cwd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "op_pipeline", *cli_args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=DryRunNoSideEffectsTest.ENV,
+            cwd=cwd,
+            timeout=120,
+        )
+
+    def test_dry_run_creates_no_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "pipe.toml"
+            cfg.write_text(
+                "[[nodes]]\n"
+                "id = \"src\"\n"
+                "op = \"control.const\"\n"
+                "\n"
+                "[nodes.params]\n"
+                "value = 42\n",
+                encoding="utf-8",
+            )
+            proc = self._run_cli("run", str(cfg), "--dry-run", cwd=str(ROOT))
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertFalse((Path(tmp) / ".op_pipeline").exists(), "dry-run 不应建产物目录")
+            self.assertFalse(
+                (Path(tmp) / ".pipeline_cache").exists(), "dry-run 不应建缓存目录"
+            )
+
+    def test_ops_json_contract(self):
+        proc = self._run_cli("ops", "--json", cwd=str(ROOT))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertIsInstance(payload, list)
+        self.assertGreater(len(payload), 20)
+        names = {item["name"] for item in payload}
+        self.assertIn("control.const", names)
+        required = {"name", "description", "inputs", "outputs"}
+        for item in payload:
+            self.assertTrue(required <= set(item), f"{item.get('name')} 缺少契约字段")
 
 
 if __name__ == "__main__":

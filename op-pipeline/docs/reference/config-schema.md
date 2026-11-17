@@ -16,7 +16,7 @@
 | `params` | object | `{}` | 流水线参数；可被 `--param` 覆盖；值中可用 `${env.X}` |
 | `nodes` | array | 必填 | 节点列表，**顺序无关**（执行由引用推导的依赖决定） |
 | `outputs` | object | `{}` | 流水线对外产物：名字 → `${...}` 引用 |
-| `defaults` | object | `{}` | 预留字段，**当前不参与执行** |
+| `defaults` | object | `{}` | 节点运行策略缺省值（M1-5 起生效）：可用键 `retries/retry_delay/timeout/cache/allow_failure`，未知键报错；节点显式值优先 |
 
 ---
 
@@ -166,7 +166,7 @@ python -m op_pipeline describe <op_name>
 | --- | --- | --- |
 | 工作目录 | `--workdir`，默认配置文件所在目录 | `ctx.resolve_path()` 的相对基准 |
 | `.op_pipeline/artifacts/<run_id>/<node_id>/` | `RunContext.create()` | 惰性创建（算子首次使用产物才建目录；可用 `artifacts_dir` 参数覆盖位置） |
-| `.pipeline_cache/*.pkl` | `--cache-dir` | **相对进程 CWD**；`--no-cache` 或空目录即禁用 |
+| `.pipeline_cache/*.pkl` | `--cache-dir` / `run(cache_dir=...)` | **相对工作目录解析**（M1-2 起，与进程 CWD 无关）；绝对路径原样使用；`--no-cache` / `cache_dir=None` 即禁用 |
 | `--json PATH` | `RunReport.to_json()` | 自动创建父目录 |
 
 ---

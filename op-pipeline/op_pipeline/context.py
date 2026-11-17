@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,7 +100,8 @@ class RunContext:
         便于嵌入方把产物收敛到自己的目录约定。
         """
         workdir_path = Path(workdir).expanduser().resolve()
-        run_id = run_id or time.strftime("%Y%m%d-%H%M%S")
+        # 秒级时间戳 + 4 位随机十六进制后缀：同秒并发不会共用产物目录
+        run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
         if artifacts_dir is not None:
             custom = Path(artifacts_dir).expanduser()
             artifacts = custom if custom.is_absolute() else workdir_path / custom

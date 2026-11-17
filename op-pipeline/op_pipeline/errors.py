@@ -51,19 +51,6 @@ class SpecValidationError(ConfigError):
 # --------------------------------------------------------------------------- #
 # 执行错误（动态）
 # --------------------------------------------------------------------------- #
-class ModuleExecutionError(PipelineError):
-    """节点执行失败，保留原始异常类型与调用栈信息。"""
-
-    def __init__(self, node_id: str, op: str, cause: BaseException) -> None:
-        self.node_id = node_id
-        self.op = op
-        self.cause = cause
-        super().__init__(
-            f"节点 [{node_id}] 算子 {op} 执行失败：{type(cause).__name__}: {cause}"
-        )
-
-    def __str__(self) -> str:  # pragma: no cover - 仅影响展示
-        return super().__str__()
 
 
 class ExpressionError(PipelineError):

@@ -63,18 +63,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     overrides = _parse_overrides(args.param)
     plan = build_plan(spec, default_registry, overrides=overrides)
 
+    if args.dry_run:
+        # 在创建 RunContext/CacheStore 之前返回：不建产物目录与缓存目录
+        print(to_ascii(plan))
+        return 0
+
+    workdir = args.workdir or str(Path(args.config).expanduser().resolve().parent)
     context = RunContext.create(
         pipeline=plan.spec.name,
         params=plan.params,
-        workdir=args.workdir or str(Path(args.config).expanduser().resolve().parent),
+        workdir=workdir,
         logger=logging.getLogger("op_pipeline"),
     )
-    cache_store = CacheStore(None if args.no_cache else args.cache_dir)
+    cache_store = CacheStore(
+        None if args.no_cache else args.cache_dir, base_dir=workdir
+    )
     engine = Engine(plan, context, cache_store=cache_store, max_workers=args.workers, fail_fast=args.fail_fast)
-
-    if args.dry_run:
-        print(to_ascii(plan))
-        return 0
 
     report = engine.run()
     print(report.summary())
@@ -139,7 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
     common(run)
     run.add_argument("--workdir", default=None, help="工作目录（相对路径基准），默认取配置文件所在目录")
     run.add_argument("--workers", type=int, default=None, help="最大并发节点数")
-    run.add_argument("--cache-dir", default=".pipeline_cache", help="节点结果缓存目录")
+    run.add_argument(
+        "--cache-dir", default=".pipeline_cache",
+        help="节点结果缓存目录（相对路径按工作目录解析）",
+    )
     run.add_argument("--no-cache", action="store_true", help="关闭缓存")
     run.add_argument("--fail-fast", action="store_true", help="任一节点失败即停止调度新节点")
     run.add_argument("--dry-run", action="store_true", help="只打印执行计划不执行")

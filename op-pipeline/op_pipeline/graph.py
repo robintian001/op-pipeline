@@ -14,9 +14,6 @@ def _label(node: Any) -> str:
 def to_mermaid(plan: Plan) -> str:
     lines = ["flowchart LR"]
     for node in plan.nodes:
-        style = ""
-        if node.spec.cache:
-            style = ",cache" if not style else style
         lines.append(f'  {node.spec.id}["{_label(node)}"]')
     for node in plan.nodes:
         for dep in node.depends_on:

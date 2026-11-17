@@ -20,6 +20,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,13 +30,22 @@ from .cache import CacheStore
 from .context import RunContext
 from .errors import ConfigError, RefResolutionError
 from .expression import evaluate_condition
-from .spec import Plan, PlanNode, RefResolver
+from .spec import Plan, PlanNode, RefResolver, check_handle_types
 
 log = logging.getLogger("op_pipeline.engine")
 
 SUCCESS = "success"
 FAILED = "failed"
 SKIPPED = "skipped"
+
+_TRACEBACK_LIMIT = 2000
+
+
+def _clip_traceback(text: str, limit: int = _TRACEBACK_LIMIT) -> str:
+    """截断堆栈：保留末尾（异常抛出点最有排障价值），超出部分以省略标记提示。"""
+    if len(text) <= limit:
+        return text
+    return f"...（前 {len(text) - limit} 字符已省略）...\n{text[-limit:]}"
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +74,8 @@ class NodeResult:
     error: str | None = None
     outputs: dict[str, str] = field(default_factory=dict)
     note: str = ""
+    # 失败时的异常堆栈（截断保留末尾；成功时为空串）
+    traceback: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +88,7 @@ class NodeResult:
             "outputs": self.outputs,
             "error": self.error,
             "note": self.note,
+            "traceback": self.traceback,
         }
 
 
@@ -269,6 +282,8 @@ class Engine:
         else:
             report.status = SUCCESS
 
+        # 汇总阶段：端口软类型告警（值照常传递，只提示不符；缺失的句柄天然跳过）
+        self._warnings.extend(check_handle_types(self.plan, self.handles))
         report.warnings.extend(self._warnings)
         report.finished_at = time.time()
         self.context.logger.info(
@@ -433,9 +448,11 @@ class Engine:
         except _NodeFailure as failure:
             result.status = FAILED
             result.error = f"{type(failure.cause).__name__}: {failure.cause}"
+            result.traceback = _clip_traceback(traceback.format_exc())
         except Exception as exc:
             result.status = FAILED
             result.error = f"{type(exc).__name__}: {exc}"
+            result.traceback = _clip_traceback(traceback.format_exc())
         finally:
             result.duration = time.time() - result.started_at
             if result.status == FAILED:
@@ -483,7 +500,8 @@ class Engine:
                     node.spec.id, attempt, attempts, exc, delay,
                 )
                 time.sleep(delay)
-        raise _NodeFailure(last_error)  # type: ignore[arg-type]
+        # from 显式链接根因：traceback.format_exc() 才能带出算子内原始异常的完整帧
+        raise _NodeFailure(last_error) from last_error  # type: ignore[arg-type]
 
     def _execute_once(
         self,
@@ -556,7 +574,7 @@ def run_pipeline(
         logger=logger,
         cache=None,
     )
-    cache_store = CacheStore(cache_dir)
+    cache_store = CacheStore(cache_dir, base_dir=workdir)
     engine = Engine(plan, context, cache_store=cache_store, max_workers=max_workers,
                     fail_fast=fail_fast, cancel_event=cancel_event)
     report = engine.run()

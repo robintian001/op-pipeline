@@ -170,7 +170,7 @@ _run_node(node):
   outputs = execute_with_retry(...)
   cache.store(key, outputs)
   publish(node, outputs)
-except: status = failed, error = "Type: message"
+except: status = failed, error = "Type: message", traceback = format_exc()（截断至约 2000 字符、保留末尾）
 finally: duration = now - started_at
 ```
 
@@ -230,8 +230,11 @@ for attempt in 1..attempts:
 
 ### 3.4 异常信息的保留
 
-节点失败时 `NodeResult.error = f"{type(exc).__name__}: {exc}"`，报告与 JSON 都保留异常类型名，
-但**不保留堆栈**；堆栈只走 logger（`ctx.logger.error`）。需要完整堆栈时应开启 `-v`。
+节点失败时 `NodeResult.error = f"{type(exc).__name__}: {exc}"`；M1-3 起
+`NodeResult.traceback` 保留 `traceback.format_exc()`（**截断至约 2000 字符、保留末尾**——
+异常抛出点最有排障价值）。重试耗尽路径以 `raise _NodeFailure(last_error) from last_error`
+显式链接根因，因此堆栈含算子内原始异常的完整帧。`summary()` 不含堆栈（避免刷屏），
+完整堆栈走 `to_dict()` / `to_json()` 与 `ctx.logger.error`。
 
 ### 3.5 取消
 
@@ -314,17 +317,24 @@ status = "failed"   if hard_failures
 
 | 字段 | 含义 |
 | --- | --- |
-| `pipeline` / `version` / `run_id` | 标识，`run_id` 默认 `YYYYmmdd-HHMMSS` |
+| `pipeline` / `version` / `run_id` | 标识，`run_id` 默认 `YYYYmmdd-HHMMSS-xxxx`（4 位随机十六进制后缀防同秒碰撞） |
 | `status` | `success` / `partial` / `failed` |
 | `duration` | `finished_at - started_at` |
 | `params` | 合并后的流水线参数（含 overrides 与 env 展开） |
 | `outputs` | 流水线级输出（引用解析结果，失败则进 `warnings`） |
-| `warnings` | 输出解析告警 + 引擎告警（如取消告警） |
+| `warnings` | 输出解析告警 + 引擎告警（取消告警、端口软类型告警） |
 | `artifacts_dir` | 本次运行产物根目录 |
-| `nodes[]` | 每节点 `status / duration / attempts / cached / outputs（类型摘要）/ error / note` |
+| `nodes[]` | 每节点 `status / duration / attempts / cached / outputs（类型摘要）/ error / note / traceback（失败时截断堆栈）` |
 
 `outputs` 在节点表中是**类型摘要**（`_describe`，例如 `list[18]`、`str('...')`），
 不是完整数据；完整数据通过 `run_pipeline()` 返回的 `handles` 获取。
+
+**端口软类型告警（M1-1 起）**：`run()` 汇总阶段调用
+[check_handle_types()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L553-L580)
+对每个已产出句柄做声明类型与实际类型的核对，不符时写入 `warnings`
+（如 `节点 [src] 句柄 'src.value' 声明 int，实际 str`）。值**照常向下游传递**，
+运行状态不受影响——类型声明是文档与排障信息，不是执行门禁；缺失的句柄
+（skipped/failed 节点）天然跳过。
 
 ### 5.3 运行上下文与目录约定
 
@@ -335,7 +345,8 @@ workdir/                                  # 默认 = 配置文件所在目录
 └── <算子自己写的相对路径>                 # ctx.resolve_path() 的基准
 ```
 
-`run_id` 精度到秒，同一秒内并发两次运行会复用同一产物目录（[context.py#L94](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/context.py#L94)）。
+`run_id` 精度到秒并带 4 位随机十六进制后缀（M1-4 起），同一秒内并发两次运行
+产物目录互相隔离；显式传 `run_id` 参数时以传入值为准。
 产物位置可用 `RunContext.create(..., artifacts_dir=...)` 覆盖（相对路径按 workdir 解析），
 便于嵌入方把产物收敛到自己的目录约定。
 

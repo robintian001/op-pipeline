@@ -88,19 +88,20 @@ load_plugins(modules=["my_company.ops"], paths=["plugins/my_ops.py"], base_dir="
 ```
 
 加载顺序（[registry.py#L177-L253](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L177-L253)）：
-内置 `op_pipeline.ops` → `modules` → `paths`。文件加载的模块名是 `_op_plugin_<stem>`
-（指定 `registry` 时为 `_op_plugin_<stem>_<序号>`，跨注册表各执行一次）。
+内置 `op_pipeline.ops` → `modules` → `paths`。文件加载的模块名是
+`_op_plugin_<路径 blake2b 摘要>`（同一文件重复加载幂等跳过；指定 `registry` 时为
+`_op_plugin_<stem>_<序号>`，跨注册表各执行一次）。
 
 ### 3.2 约束与坑
 
 | 约束 | 说明 |
 | --- | --- |
 | 导入即注册 | 插件模块必须在 import 时执行 `@op`；仅定义类不注册 |
-| 同名去重 | 以 `stem` 去重，两个不同目录的同名文件只有第一个生效 |
+| 同名去重 | 按**路径**去重（模块名取路径摘要）：不同目录的同名文件都会加载；同一文件重复加载幂等跳过 |
 | 默认注册表 | 不指定 `registry` 时一切注册落到 `default_registry`；隔离方案见 §3.3 |
 | 覆盖 | 重新注册同名算子需 `replace=True`（测试中大量使用） |
 | 依赖方向 | 插件只能 import `op_pipeline` 的公开符号，不得 import `op_pipeline.engine` 内部实现 |
-| 入口限制 | `run()` 辅助函数只接受文件路径插件，不接受模块名；需要模块插件时直接调 `load_plugins()` |
+| 入口限制 | 模块插件受 Python import 幂等性限制：已导入过的模块不会重新执行；同一算子库不要同时以文件和模块两种方式加载进同一注册表（裸 `@op` 会撞重名，需 `replace=True`） |
 
 ### 3.3 独立注册表（隔离运行）
 
@@ -175,23 +176,20 @@ class Executor(Protocol):
 
 | # | 缺口 | 证据 | 影响 | 建议落点 |
 | --- | --- | --- | --- | --- |
-| T1 | 端口软类型检查未接入 | `check_handle_types()`、`port_warnings()` 无调用方 | README 宣称"类型不符仅告警"实际不发生 | `Engine.run()` 结束前调用并写入 `report.warnings` |
-| T2 | `PlanNode.resolved_inputs` 恒为 `{}` | [spec.py#L455](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L455) | 无功能影响，属于残留字段 | 删除字段或改为运行期回填 |
-| T3 | `ModuleExecutionError` 定义了但没抛 | [errors.py#L54-L67](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/errors.py#L54-L67) | 调用方无法按异常类型识别节点失败 | 引擎包装异常时改用该类，或删除 |
-| T4 | `PipelineSpec.defaults` 解析但未生效 | 只在 `from_dict/to_dict` 出现 | 用户以为能配置默认 retries/cache | 在 `build_plan` 合并 `defaults`，或删除该字段 |
-| T5 | `Engine._warnings` 无写入方 | [engine.py#L193](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L193) | 除输出解析失败外没有引擎级告警 | 配合 T1 写入 |
-| T6 | `cache-dir` 相对进程 CWD | [cli.py#L142](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cli.py#L142) | 在不同目录启动 CLI 会产生多份缓存 | 改为相对 `workdir` 解析 |
 | T7 | 缓存不感知代码变更 | key 仅含 `version` 字符串 | 忘记递增 version 会命中旧结果 | 可选：把算子源码哈希或 git rev 纳入 key |
 | T8 | 软超时无法终止算子 | [engine.py#L459-L484](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L459-L484) | 超时后线程仍可能写文件/占连接 | 换进程执行器，或文档要求算子自身支持取消 |
-| T9 | 失败不保留堆栈 | 只存 `type: message` | 线上排障依赖日志 | `NodeResult` 增加 `traceback`（截断） |
-| T10 | `run_id` 秒级精度 | [context.py#L94](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/context.py#L94) | 同秒并发会共用产物目录 | 加随机后缀或纳秒 |
-| T11 | 插件按 stem 去重 | [registry.py#L229-L233](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L229-L233) | 同名文件静默不加载 | 改用路径哈希作模块名 |
-| T12 | `run()` 不支持模块插件 | `plugins` 参数只传 `paths` | 库调用方需自行 `load_plugins` | 增加 `plugin_modules` 参数 |
 | T13 | `strict=False` 可返回残缺 Plan | [spec.py#L477-L487](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L477-L487) | 无调用方使用，属预留 | 保持现状并在文档说明 |
-| T14 | `to_mermaid` 中 `style` 死变量 | [graph.py#L16-L18](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/graph.py#L16-L18) | 无影响 | 清理 |
 | T15 | 表算子假设首行代表全表列 | 多处使用 `rows[0].keys()` | 列不全的行会丢字段或抛错 | 统一列集合并集，或要求 schema 显式声明 |
 
-> 修复建议的优先级：T1/T5（文档承诺与实现不一致）> T6（隐性正确性问题）> T8/T9（可运维性）> 其余。
+> 修复建议的优先级：T8（可运维性）> 其余。
+> 已消除：T1/T5（M1-1，软类型告警接入）、T6（M1-2，缓存目录相对 workdir 解析）、
+> T9（M1-3，`NodeResult.traceback` 截断保留堆栈，重试耗尽路径 `from last_error` 链根因）、
+> T10（M1-4，`run_id` 追加 4 位随机十六进制后缀，同秒并发产物目录隔离）、
+> T4（M1-5，`defaults` 在 `NodeSpec.from_dict` 合并为节点策略缺省，显式值优先）、
+> T2/T3/T14（M1-6，删除 `PlanNode.resolved_inputs` 残留字段、删除 `ModuleExecutionError`
+> 及其导出、清理 `to_mermaid` 死变量——属破坏性删除但无内部调用方）、
+> T11（M1-7，文件插件模块名取路径 blake2b 摘要，同名不同目录都能加载，同文件幂等）、
+> T12（M1-8，`run()` 新增 `plugin_modules` 参数，支持模块路径插件）。
 
 ---
 
@@ -216,7 +214,7 @@ class Executor(Protocol):
 
 ## 7. 新增能力时的回归清单
 
-1. 跑 `python -m unittest discover -s tests -v`（47 个用例）；
+1. 跑 `python -m unittest discover -s tests -v`（66 个用例）；
 2. 用 `examples/pipeline_orders.json` 做端到端（覆盖并行 fan-out、when、断言、4 种输出）；
 3. 用 `examples/pipeline_text.toml --plugin plugins/demo_ops.py`（`--plugin` 相对配置文件所在目录解析）验证插件与重试；
 4. `python -m op_pipeline validate` 与 `graph` 必须仍然可用；

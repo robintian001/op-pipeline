@@ -37,6 +37,28 @@
 | M1-8 | `run()` 支持模块插件：`run(..., plugin_modules: tuple[str, ...] = ())`，转发给 `load_plugins(modules=...)` | [__init__.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/__init__.py) `run()` | 单测：`run(cfg, plugin_modules=("examples.plugins.demo_ops",))` 可解析 `demo.*` 算子；消除 T12 |
 | M1-9 | CLI 冒烟与文档收口：`--dry-run` 提前到创建 `RunContext` 之前（避免无谓建产物目录）；`op_pipeline ops --json` 输出与新字段核对 | [cli.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cli.py) `cmd_run` | `--dry-run` 后无 `artifacts_dir` 产生；两个示例 + validate/graph 回归通过 |
 
+> **状态**：M1-1 ~ M1-9 已全部完成，M1 里程碑关闭（2026-11-17，TDD 红→绿各一轮，66 个用例全绿）。
+> M1-1：软类型告警接入（T1/T5 出债）。M1-2：相对 `cache_dir` 以 workdir 为基准，
+> `CacheStore` 新增 `base_dir`（T6 出债）。M1-3：`NodeResult.traceback` 截断保留堆栈
+> （约 2000 字符、保留末尾），重试耗尽路径补 `from last_error` 链根因（T9 出债）。
+> M1-4：`run_id` 追加 4 位随机十六进制后缀，同秒并发产物目录隔离（T10 出债）。
+> M1-5：`defaults` 在 `NodeSpec.from_dict` 合并为节点策略缺省（显式值 > defaults >
+> 框架默认，未知策略键报错；T4 出债）。
+> **M1-6（变更记录）**：破坏性删除——`PlanNode.resolved_inputs` 残留字段、
+> `ModuleExecutionError` 异常类及其 `__all__` 导出、`to_mermaid` 死变量（T2/T3/T14 出债；
+> 均无内部调用方，删除不会影响现有配置）。
+> M1-7：默认注册表的文件插件模块名取路径 blake2b 摘要——不同目录的同名文件都能加载，
+> 同一文件重复加载保持幂等（T11 出债）。
+> M1-8：`run()` 新增 `plugin_modules` 参数（转发 `load_plugins(modules=...)`），
+> 库调用方不再需要为模块插件自行 `load_plugins`（T12 出债）。
+> M1-9：CLI `--dry-run` 提前到 `RunContext`/`CacheStore` 创建之前（不建产物/缓存目录）；
+> `ops --json` 输出契约有测试核对（name/description/inputs/outputs 必含）。
+>
+> **M1 关闭（v0.3.0，2026-11-17）**：66 个用例全绿；含破坏性变更（删除
+> `ModuleExecutionError` 导出、相对 `cache_dir` 改按 workdir 解析），minor 升位。
+> 剩余技术债：T7（缓存不感知代码变更）、T8（软超时无法终止算子）、T13（strict=False
+> 预留）、T15（表算子首行列假设）。下一站 M2（三个抽象）。
+
 **M1 完成定义（DoD）**：测试全绿；`examples/pipeline_orders.json` 与
 `pipeline_text.toml --plugin ...` 端到端通过；`extension-points.md` §5 的 T1–T6、T9–T12、T14 标记为已解决（T13 保持"预留，不处理"，T15 移交 M3）。
 

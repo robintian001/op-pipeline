@@ -34,7 +34,6 @@ from .errors import (
     CycleError,
     DuplicateOperatorError,
     ExpressionError,
-    ModuleExecutionError,
     OperatorNotFoundError,
     ParamValidationError,
     PipelineError,
@@ -57,7 +56,6 @@ __all__ = [
     "DuplicateOperatorError",
     "Engine",
     "ExpressionError",
-    "ModuleExecutionError",
     "NodeContext",
     "NodeResult",
     "NodeSpec",
@@ -102,16 +100,25 @@ def run(
     max_workers: int | None = None,
     fail_fast: bool = False,
     plugins: tuple[str, ...] = (),
+    plugin_modules: tuple[str, ...] = (),
     registry: Registry | None = None,
     logger: logging.Logger | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。
 
-    传 ``registry`` 可获得算子集隔离的运行：插件加载进该表、内置算子自动补齐、
-    全局 ``default_registry`` 不受任何影响；不传则与历史行为完全一致。
+    - ``plugins``：文件路径插件（相对配置文件所在目录解析）；
+    - ``plugin_modules``：模块路径插件，如 ``("my_company.ops",)``；
+      受 Python import 幂等性限制，已导入过的模块不会重新执行；
+    - 传 ``registry`` 可获得算子集隔离的运行：插件加载进该表、内置算子自动补齐、
+      全局 ``default_registry`` 不受任何影响；不传则与历史行为完全一致。
     """
     config_path = Path(config).expanduser().resolve()
-    load_plugins(paths=plugins, base_dir=config_path.parent, registry=registry)
+    load_plugins(
+        modules=plugin_modules,
+        paths=plugins,
+        base_dir=config_path.parent,
+        registry=registry,
+    )
     spec = PipelineSpec.from_file(config_path)
     return run_pipeline(
         spec,

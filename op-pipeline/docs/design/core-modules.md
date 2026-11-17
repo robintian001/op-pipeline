@@ -159,11 +159,11 @@ if mod_name in sys.modules:      # 以 stem 去重，而不是按绝对路径
 | 类型 | 字段 | 说明 |
 | --- | --- | --- |
 | `NodeSpec` | `id/op/inputs/outputs/params/when/retries/retry_delay/timeout/cache/allow_failure/description` | 单节点的全部静态信息；`timeout=0` 视为未设置 |
-| `PipelineSpec` | `name/description/version/params/nodes/outputs/defaults` | `defaults` 目前仅解析并透传，**未参与执行** |
-| `PlanNode` | `spec/operator_cls/operator/resolved_inputs/handles/depends_on` | `operator` 为编译期实例（含引用时为 `None`）；`resolved_inputs` 恒为 `{}` |
+| `PipelineSpec` | `name/description/version/params/nodes/outputs/defaults` | `defaults` 在 `from_dict` 阶段合并进各节点（节点显式值优先，M1-5 起） |
+| `PlanNode` | `spec/operator_cls/operator/handles/depends_on` | `operator` 为编译期实例（含引用时为 `None`） |
 | `Plan` | `spec/params/nodes/order/handle_owner/pipeline_outputs` | 引擎唯一输入；`node(id)` 线性查找 |
 
-`defaults` 与 `resolved_inputs` 属于预留字段，当前无消费方，修改时不要假设它们有效。
+`resolved_inputs` 与 `ModuleExecutionError` 已在 M1-6 移除（恒为 `{}` 的残留字段 / 引擎从不抛出的异常类）。
 
 ### 4.2 RefResolver
 
@@ -248,7 +248,7 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 
 ```python
 RunContext.create(pipeline, params, workdir, run_id=None, logger=None, cache=None)
-  → run_id 默认 "%Y%m%d-%H%M%S"
+  → run_id 默认 "%Y%m%d-%H%M%S-xxxx"（4 位随机十六进制后缀，防同秒并发碰撞）
   → artifacts_dir = workdir/.op_pipeline/artifacts/<run_id>（惰性创建，首次使用产物才建目录）
 
 NodeContext（由 for_node 创建）
