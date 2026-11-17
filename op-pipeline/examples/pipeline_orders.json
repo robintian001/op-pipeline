@@ -1,0 +1,191 @@
+{
+  "name": "orders_daily",
+  "version": "1.0",
+  "description": "订单日汇总：清洗 -> 派生 -> 聚合 -> 关联目标 -> 排序 -> 报告",
+  "params": {
+    "input_path": "data/orders.csv",
+    "region_path": "data/regions.csv",
+    "min_amount": 20,
+    "top_n": 8,
+    "report_dir": "output"
+  },
+  "nodes": [
+    {
+      "id": "load_orders",
+      "op": "io.read_csv",
+      "cache": true,
+      "params": {"path": "${p.input_path}"}
+    },
+    {
+      "id": "load_regions",
+      "op": "io.read_csv",
+      "cache": true,
+      "params": {"path": "${p.region_path}"}
+    },
+    {
+      "id": "clean",
+      "op": "table.filter_rows",
+      "cache": true,
+      "inputs": {"table": "${load_orders.table}"},
+      "params": {"where": "status == 'paid' and amount >= ${p.min_amount}"}
+    },
+    {
+      "id": "count_clean",
+      "op": "stats.count_rows",
+      "inputs": {"table": "${clean.table}"}
+    },
+    {
+      "id": "unit_price",
+      "op": "table.derive_column",
+      "inputs": {"table": "${clean.table}"},
+      "params": {
+        "name": "unit_price",
+        "expr": "round(amount / qty, 2) if qty else 0"
+      }
+    },
+    {
+      "id": "agg",
+      "op": "stats.aggregate",
+      "inputs": {"table": "${unit_price.table}"},
+      "params": {
+        "group_by": "region",
+        "metrics": {
+          "amount": ["sum", "mean"],
+          "order_id": "count"
+        }
+      }
+    },
+    {
+      "id": "joined",
+      "op": "table.join",
+      "inputs": {
+        "left": "${agg.table}",
+        "right": "${load_regions.table}"
+      },
+      "params": {"left_key": "region", "how": "left"}
+    },
+    {
+      "id": "scored",
+      "op": "table.derive_column",
+      "inputs": {"table": "${joined.table}"},
+      "params": {
+        "name": "achieve_rate",
+        "expr": "round(amount_sum / target, 3) if target else 0"
+      }
+    },
+    {
+      "id": "ranked",
+      "op": "table.sort_rows",
+      "inputs": {"table": "${scored.table}"},
+      "params": {"by": "amount_sum", "desc": true}
+    },
+    {
+      "id": "top",
+      "op": "table.limit",
+      "inputs": {"table": "${ranked.table}"},
+      "params": {"n": "${p.top_n}"},
+      "when": "n > 0"
+    },
+    {
+      "id": "gate",
+      "op": "control.assert",
+      "inputs": {"value": "${top.table}"},
+      "params": {
+        "that": "len(value) > 0",
+        "message": "没有满足条件的订单，请检查 min_amount 过滤阈值"
+      }
+    },
+    {
+      "id": "report",
+      "op": "report.markdown",
+      "params": {
+        "title": "订单日汇总报告",
+        "meta": {"数据源": "${p.input_path}", "过滤阈值": "${p.min_amount}"},
+        "blocks": [
+          {"heading": "关键指标", "level": 2},
+          {
+            "title": "流水线指标",
+            "kv": {
+              "有效订单数": "${count_clean.count}",
+              "覆盖区域数": "${agg.groups}",
+              "被过滤订单": "${clean.dropped}"
+            }
+          },
+          {"heading": "区域表现", "level": 2},
+          {
+            "table": "${top.table}",
+            "title": "区域汇总（按销售额降序）",
+            "columns": ["region", "manager", "amount_sum", "amount_mean", "order_id_count", "target", "achieve_rate"],
+            "limit": 10
+          }
+        ]
+      }
+    },
+    {
+      "id": "html_report",
+      "op": "report.html",
+      "params": {
+        "title": "订单日汇总报告",
+        "subtitle": "参数化流水线 · ${p.input_path}",
+        "blocks": [
+          {
+            "title": "流水线指标",
+            "kv": {
+              "有效订单数": "${count_clean.count}",
+              "覆盖区域数": "${agg.groups}"
+            }
+          },
+          {
+            "table": "${top.table}",
+            "title": "区域汇总",
+            "columns": ["region", "manager", "amount_sum", "target", "achieve_rate"]
+          }
+        ]
+      }
+    },
+    {
+      "id": "write_md",
+      "op": "io.write_text",
+      "inputs": {"text": "${report.text}"},
+      "params": {"path": "${p.report_dir}/report.md"}
+    },
+    {
+      "id": "write_html",
+      "op": "io.write_text",
+      "inputs": {"text": "${html_report.text}"},
+      "params": {"path": "${p.report_dir}/report.html"}
+    },
+    {
+      "id": "write_csv",
+      "op": "io.write_csv",
+      "inputs": {"table": "${top.table}"},
+      "params": {
+        "path": "${p.report_dir}/top_regions.csv",
+        "columns": ["region", "manager", "amount_sum", "amount_mean", "order_id_count", "target", "achieve_rate"]
+      }
+    },
+    {
+      "id": "summary",
+      "op": "control.const",
+      "params": {
+        "value": {
+          "pipeline": "orders_daily",
+          "orders": "${count_clean.count}",
+          "regions": "${agg.groups}",
+          "top": "${top.table}"
+        }
+      }
+    },
+    {
+      "id": "write_json",
+      "op": "io.write_json",
+      "inputs": {"data": "${summary.value}"},
+      "params": {"path": "${p.report_dir}/summary.json", "indent": 2}
+    }
+  ],
+  "outputs": {
+    "report": "${report.text}",
+    "top_regions": "${top.table}",
+    "summary": "${summary.value}"
+  }
+}

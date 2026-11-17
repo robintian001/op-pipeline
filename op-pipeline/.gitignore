@@ -1,0 +1,38 @@
+# ---- 本项目运行时产物 ----
+.pipeline_cache/
+.op_pipeline/
+examples/output/
+
+# ---- Python 字节码 ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- 打包 / 构建 ----
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 测试 / 静态检查缓存 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.swp
+
+# ---- 操作系统 ----
+Thumbs.db
+.DS_Store

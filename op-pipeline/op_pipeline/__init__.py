@@ -1,0 +1,122 @@
+"""op_pipeline —— 算子级、配置驱动的 Python 流水线框架。
+
+最小用法::
+
+    from op_pipeline import PipelineSpec, run_pipeline, default_registry
+
+    spec = PipelineSpec.from_file("pipeline.toml")
+    report, values = run_pipeline(spec, registry=default_registry, workdir=".")
+    print(report.summary())
+
+自定义算子::
+
+    from op_pipeline import Operator, op, Param
+
+    @op("demo.double")
+    class Double(Operator):
+        inputs = [("value", int)]
+        outputs = [("value", int)]
+        params = {"times": Param(int, default=2)}
+        def run(self, ctx, value, times):
+            return {"value": value * times}
+"""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Mapping
+
+from .cache import CacheStore, fingerprint
+from .context import NodeContext, RunContext
+from .engine import Engine, NodeResult, RunReport, run_pipeline
+from .errors import (
+    ConfigError,
+    CycleError,
+    DuplicateOperatorError,
+    ExpressionError,
+    ModuleExecutionError,
+    OperatorNotFoundError,
+    ParamValidationError,
+    PipelineError,
+    RefResolutionError,
+    SpecValidationError,
+)
+from .expression import evaluate, evaluate_condition
+from .operator import Operator
+from .params import Param
+from .ports import Port, as_ports, type_label
+from .registry import Registry, default_registry, load_plugins, op
+from .spec import NodeSpec, PipelineSpec, Plan, PlanNode, RefResolver, build_plan
+
+logging.getLogger("op_pipeline").addHandler(logging.NullHandler())
+
+__all__ = [
+    "CacheStore",
+    "ConfigError",
+    "CycleError",
+    "DuplicateOperatorError",
+    "Engine",
+    "ExpressionError",
+    "ModuleExecutionError",
+    "NodeContext",
+    "NodeResult",
+    "NodeSpec",
+    "Operator",
+    "OperatorNotFoundError",
+    "Param",
+    "ParamValidationError",
+    "PipelineError",
+    "PipelineSpec",
+    "Plan",
+    "PlanNode",
+    "Port",
+    "RefResolver",
+    "Registry",
+    "RunContext",
+    "RunReport",
+    "SpecValidationError",
+    "build_plan",
+    "default_registry",
+    "evaluate",
+    "evaluate_condition",
+    "fingerprint",
+    "load_plugins",
+    "op",
+    "run_pipeline",
+    "type_label",
+]
+
+
+def load_builtin_ops() -> list[str]:
+    """加载内置算子库（导入 op_pipeline 时自动执行一次，重复调用是幂等的）。"""
+    return load_plugins(package="op_pipeline.ops")
+
+
+def run(
+    config: str | Path,
+    *,
+    workdir: str | Path | None = None,
+    overrides: Mapping[str, Any] | None = None,
+    cache_dir: str | Path | None = ".pipeline_cache",
+    max_workers: int | None = None,
+    fail_fast: bool = False,
+    plugins: tuple[str, ...] = (),
+    logger: logging.Logger | None = None,
+) -> tuple[RunReport, dict[str, Any]]:
+    """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。"""
+    config_path = Path(config).expanduser().resolve()
+    load_plugins(paths=plugins, base_dir=config_path.parent)
+    spec = PipelineSpec.from_file(config_path)
+    return run_pipeline(
+        spec,
+        registry=default_registry,
+        workdir=workdir or config_path.parent,
+        overrides=overrides,
+        cache_dir=cache_dir,
+        max_workers=max_workers,
+        fail_fast=fail_fast,
+        logger=logger,
+    )
+
+
+load_builtin_ops()

@@ -1,0 +1,94 @@
+name = "text_digest"
+version = "1.0"
+description = "文本摘要流水线：演示插件算子、重试、句柄下钻与模板渲染"
+
+[params]
+input_path = "data/notes.txt"
+out_dir = "output"
+title = "文本摘要"
+min_word_len = 3
+
+[[nodes]]
+id = "read"
+op = "io.read_text"
+cache = true
+  [nodes.params]
+  path = "${p.input_path}"
+
+[[nodes]]
+id = "lines"
+op = "text.split_lines"
+  [nodes.inputs]
+  text = "${read.text}"
+
+[[nodes]]
+id = "words"
+op = "demo.word_count"
+  [nodes.inputs]
+  text = "${read.text}"
+  [nodes.params]
+  min_len = "${p.min_word_len}"
+
+[[nodes]]
+id = "line_stats"
+op = "demo.text_stats"
+  [nodes.inputs]
+  lines = "${lines.lines}"
+
+[[nodes]]
+id = "probe"
+op = "demo.flaky_probe"
+retries = 2
+retry_delay = 0.1
+  [nodes.inputs]
+  value = "${words.total}"
+
+[[nodes]]
+id = "render"
+op = "text.template"
+  [nodes.params]
+  template = """# {{title}}
+
+- 行数：{{lines}}
+- 不同词数：{{unique}}
+- 词次总量：{{total}}
+- 最长行字符数：{{longest}}
+
+探针在第 {{attempts}} 次尝试后成功。
+"""
+  [nodes.params.values]
+  title = "${p.title}"
+  lines = "${lines.count}"
+  unique = "${words.unique}"
+  total = "${words.total}"
+  longest = "${line_stats.stats.最长行}"
+  attempts = "${probe.attempts}"
+
+[[nodes]]
+id = "report"
+op = "report.markdown"
+  [nodes.params]
+  title = "文本摘要报告"
+  meta = { "输入" = "${p.input_path}" }
+
+[[nodes.params.blocks]]
+heading = "文本指标"
+level = 2
+
+[[nodes.params.blocks]]
+title = "指标汇总"
+kv = { "行数" = "${lines.count}", "不同词数" = "${words.unique}" }
+
+[[nodes.params.blocks]]
+text = "${render.text}"
+
+[[nodes]]
+id = "write_md"
+op = "io.write_text"
+  [nodes.inputs]
+  text = "${report.text}"
+  [nodes.params]
+  path = "${p.out_dir}/digest.md"
+
+[outputs]
+digest = "${render.text}"

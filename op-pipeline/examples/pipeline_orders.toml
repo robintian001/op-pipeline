@@ -1,0 +1,118 @@
+name = "orders_daily"
+version = "1.0"
+description = "TOML 版订单汇总（与 pipeline_orders.json 主链路等价）"
+
+[params]
+input_path = "data/orders.csv"
+region_path = "data/regions.csv"
+min_amount = 20
+top_n = 8
+report_dir = "output"
+
+[[nodes]]
+id = "load_orders"
+op = "io.read_csv"
+cache = true
+  [nodes.params]
+  path = "${p.input_path}"
+
+[[nodes]]
+id = "load_regions"
+op = "io.read_csv"
+cache = true
+  [nodes.params]
+  path = "${p.region_path}"
+
+[[nodes]]
+id = "clean"
+op = "table.filter_rows"
+cache = true
+  [nodes.inputs]
+  table = "${load_orders.table}"
+  [nodes.params]
+  where = "status == 'paid' and amount >= ${p.min_amount}"
+
+[[nodes]]
+id = "unit_price"
+op = "table.derive_column"
+  [nodes.inputs]
+  table = "${clean.table}"
+  [nodes.params]
+  name = "unit_price"
+  expr = "round(amount / qty, 2) if qty else 0"
+
+[[nodes]]
+id = "agg"
+op = "stats.aggregate"
+  [nodes.inputs]
+  table = "${unit_price.table}"
+  [nodes.params]
+  group_by = "region"
+  [nodes.params.metrics]
+  amount = ["sum", "mean"]
+  order_id = "count"
+
+[[nodes]]
+id = "joined"
+op = "table.join"
+  [nodes.inputs]
+  left = "${agg.table}"
+  right = "${load_regions.table}"
+  [nodes.params]
+  left_key = "region"
+  how = "left"
+
+[[nodes]]
+id = "scored"
+op = "table.derive_column"
+  [nodes.inputs]
+  table = "${joined.table}"
+  [nodes.params]
+  name = "achieve_rate"
+  expr = "round(amount_sum / target, 3) if target else 0"
+
+[[nodes]]
+id = "ranked"
+op = "table.sort_rows"
+  [nodes.inputs]
+  table = "${scored.table}"
+  [nodes.params]
+  by = "amount_sum"
+  desc = true
+
+[[nodes]]
+id = "top"
+op = "table.limit"
+when = "n > 0"
+  [nodes.inputs]
+  table = "${ranked.table}"
+  [nodes.params]
+  n = "${p.top_n}"
+
+[[nodes]]
+id = "report"
+op = "report.markdown"
+  [nodes.params]
+  title = "订单日汇总报告"
+  meta = { "数据源" = "${p.input_path}", "过滤阈值" = "${p.min_amount}" }
+
+[[nodes.params.blocks]]
+heading = "区域表现"
+level = 2
+
+[[nodes.params.blocks]]
+title = "区域汇总（按销售额降序）"
+table = "${top.table}"
+columns = ["region", "manager", "amount_sum", "order_id_count", "target", "achieve_rate"]
+limit = 10
+
+[[nodes]]
+id = "write_md"
+op = "io.write_text"
+  [nodes.inputs]
+  text = "${report.text}"
+  [nodes.params]
+  path = "${p.report_dir}/report_toml.md"
+
+[outputs]
+report = "${report.text}"

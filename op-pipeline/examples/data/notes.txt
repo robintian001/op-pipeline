@@ -1,0 +1,6 @@
+# 文本摘要
+
+这是一段用于演示文本流水线的素材。算子级流水线 framework 支持把读写、切分、
+统计、渲染拆成独立的算子，再用配置串起来。
+
+Pipelines should stay small and composable. Each operator owns one job.

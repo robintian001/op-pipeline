@@ -1,0 +1,546 @@
+"""流水线规格（spec）：从配置文本到可校验、可执行的 DAG。
+
+配置形态（JSON / TOML / YAML 三选一，内容同构）::
+
+    name = "sales_report"
+    [params]                     # 流水线级参数，支持外部覆盖
+    input_path = "data/sales.csv"
+    threshold  = 0.5
+
+    [[nodes]]
+    id   = "load"
+    op   = "io.read_csv"
+    [nodes.params]
+    path = "${p.input_path}"
+
+    [[nodes]]
+    id    = "clean"
+    op    = "table.filter_rows"
+    [nodes.inputs]
+    table = "${load.table}"      # 上游句柄
+    [nodes.params]
+    where = "amount > 0"
+
+    [outputs]                    # 流水线对外产物
+    report = "${stat.total}"
+
+引用语法：
+    ``${<node>.<port>}`` 或 ``${<handle>}``  -> 上游数据
+    ``${p.<name>}``                          -> 流水线参数
+    ``${env.<NAME>}``                        -> 环境变量
+字符串中可混排（``"${p.dir}/${p.name}.json"``）。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping
+
+from .errors import (
+    ConfigError,
+    CycleError,
+    RefResolutionError,
+    SpecValidationError,
+)
+from .ports import Port, type_label, value_matches
+
+_REF_PATTERN = re.compile(r"\$\{([^{}]+)\}")
+
+
+# --------------------------------------------------------------------------- #
+# 数据模型
+# --------------------------------------------------------------------------- #
+@dataclass
+class NodeSpec:
+    """一个流水线节点 = 一个算子实例 + 连线 + 运行策略。"""
+
+    id: str
+    op: str
+    inputs: dict[str, Any] = field(default_factory=dict)
+    outputs: dict[str, str] = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict)
+    when: str | None = None
+    retries: int = 0
+    retry_delay: float = 0.0
+    timeout: float | None = None
+    cache: bool = False
+    allow_failure: bool = False
+    description: str = ""
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "NodeSpec":
+        if not isinstance(raw, Mapping):
+            raise ConfigError(f"节点定义必须是对象，实际是 {type(raw).__name__}")
+        node_id = raw.get("id") or raw.get("name")
+        if not node_id:
+            raise ConfigError(f"节点缺少 id：{raw!r}")
+        op = raw.get("op")
+        if not op:
+            raise ConfigError(f"节点 [{node_id}] 缺少 op")
+        outputs = raw.get("outputs") or {}
+        if not isinstance(outputs, Mapping):
+            raise ConfigError(f"节点 [{node_id}] 的 outputs 必须是映射（端口 -> 句柄名）")
+        return cls(
+            id=str(node_id),
+            op=str(op),
+            inputs=dict(raw.get("inputs") or {}),
+            outputs={str(k): str(v) for k, v in outputs.items()},
+            params=dict(raw.get("params") or {}),
+            when=raw.get("when"),
+            retries=int(raw.get("retries") or 0),
+            retry_delay=float(raw.get("retry_delay") or 0.0),
+            timeout=(None if raw.get("timeout") in (None, 0) else float(raw["timeout"]))
+            if "timeout" in raw else None,
+            cache=bool(raw.get("cache") or False),
+            allow_failure=bool(raw.get("allow_failure") or False),
+            description=str(raw.get("description") or ""),
+        )
+
+
+@dataclass
+class PipelineSpec:
+    name: str = "pipeline"
+    description: str = ""
+    version: str = "1"
+    params: dict[str, Any] = field(default_factory=dict)
+    nodes: list[NodeSpec] = field(default_factory=list)
+    outputs: dict[str, str] = field(default_factory=dict)
+    defaults: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PipelineSpec":
+        if not isinstance(raw, Mapping):
+            raise ConfigError("流水线配置根节点必须是对象")
+        nodes_raw = raw.get("nodes") or []
+        if not isinstance(nodes_raw, list):
+            raise ConfigError("nodes 必须是数组")
+        return cls(
+            name=str(raw.get("name") or "pipeline"),
+            description=str(raw.get("description") or ""),
+            version=str(raw.get("version") or "1"),
+            params=dict(raw.get("params") or {}),
+            nodes=[NodeSpec.from_dict(n) for n in nodes_raw],
+            outputs={str(k): str(v) for k, v in (raw.get("outputs") or {}).items()},
+            defaults=dict(raw.get("defaults") or {}),
+        )
+
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def from_file(cls, path: str | Path) -> "PipelineSpec":
+        path = Path(path).expanduser()
+        if not path.exists():
+            raise ConfigError(f"配置文件不存在：{path}")
+        text = path.read_text(encoding="utf-8")
+        suffix = path.suffix.lower()
+        if suffix in (".json", ""):
+            data = json.loads(text)
+        elif suffix == ".toml":
+            import tomllib
+
+            data = tomllib.loads(text)
+        elif suffix in (".yaml", ".yml"):
+            try:
+                import yaml  # type: ignore
+            except ImportError as exc:  # pragma: no cover
+                raise ConfigError(
+                    "读取 YAML 需要 PyYAML：pip install pyyaml；"
+                    "或改用 .json / .toml 配置（标准库即可）"
+                ) from exc
+            data = yaml.safe_load(text)
+        else:
+            raise ConfigError(f"不支持的配置扩展名：{path.suffix}（支持 .json/.toml/.yaml）")
+        return cls.from_dict(data or {})
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "version": self.version,
+            "params": self.params,
+            "defaults": self.defaults,
+            "outputs": self.outputs,
+            "nodes": [
+                {
+                    "id": n.id,
+                    "op": n.op,
+                    "inputs": n.inputs,
+                    "outputs": n.outputs,
+                    "params": n.params,
+                    "when": n.when,
+                    "retries": n.retries,
+                    "retry_delay": n.retry_delay,
+                    "timeout": n.timeout,
+                    "cache": n.cache,
+                    "allow_failure": n.allow_failure,
+                }
+                for n in self.nodes
+            ],
+        }
+
+
+# --------------------------------------------------------------------------- #
+# 引用解析
+# --------------------------------------------------------------------------- #
+class RefResolver:
+    """解析 ``${...}`` 引用。
+
+    ``handles`` 是"句柄 -> 值"的映射，由引擎在执行时逐节点填充；
+    校验阶段用 :meth:`static_target` 只做"目标是否存在"的静态检查。
+    """
+
+    def __init__(
+        self,
+        params: Mapping[str, Any],
+        handles: Mapping[str, Any] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
+        self.params = params
+        self.handles = handles or {}
+        self.env = os.environ if env is None else env
+
+    # ------------------------------------------------------------------ #
+    def resolve(self, value: Any) -> Any:
+        """递归解析任意配置值中的引用。"""
+        if isinstance(value, str):
+            return self._resolve_str(value)
+        if isinstance(value, list):
+            return [self.resolve(v) for v in value]
+        if isinstance(value, dict):
+            return {k: self.resolve(v) for k, v in value.items()}
+        return value
+
+    def _resolve_str(self, text: str) -> Any:
+        whole = _REF_PATTERN.fullmatch(text)
+        if whole:
+            return self._lookup(whole.group(1).strip())
+
+        def sub(match: re.Match[str]) -> str:
+            return str(self._lookup(match.group(1).strip()))
+
+        return _REF_PATTERN.sub(sub, text)
+
+    def _lookup(self, path: str) -> Any:
+        if path.startswith("p.") or path.startswith("params."):
+            key = path.split(".", 1)[1]
+            if key not in self.params:
+                raise RefResolutionError(
+                    f"引用了未定义的流水线参数 '{key}'；已定义：{', '.join(self.params) or '（无）'}"
+                )
+            return self.params[key]
+        if path.startswith("env."):
+            key = path.split(".", 1)[1]
+            if key not in self.env:
+                raise RefResolutionError(f"环境变量 '{key}' 未设置")
+            return self.env[key]
+        if path in self.handles:
+            return self.handles[path]
+        # 支持句柄下钻：${node.port.field} / ${node.port.0}
+        parts = path.split(".")
+        for end in range(len(parts) - 1, 0, -1):
+            prefix = ".".join(parts[:end])
+            if prefix in self.handles:
+                return self._traverse(self.handles[prefix], parts[end:], path)
+        raise RefResolutionError(
+            f"引用 '{path}' 无法解析：既不是已产出的句柄，也不是 p./env. 前缀参数"
+        )
+
+    @staticmethod
+    def _traverse(value: Any, segments: list[str], path: str) -> Any:
+        for segment in segments:
+            if isinstance(value, dict) and segment in value:
+                value = value[segment]
+            elif isinstance(value, (list, tuple)) and segment.lstrip("-").isdigit():
+                index = int(segment)
+                try:
+                    value = value[index]
+                except IndexError as exc:
+                    raise RefResolutionError(f"引用 '{path}' 下标越界：{segment}") from exc
+            else:
+                raise RefResolutionError(
+                    f"引用 '{path}' 的路径段 '{segment}' 无法解析（当前值类型 {type(value).__name__}）"
+                )
+        return value
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def static_target(value: Any) -> list[str]:
+        """列出配置值里出现的所有引用路径（用于静态校验）。"""
+        found: list[str] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, str):
+                found.extend(m.group(1).strip() for m in _REF_PATTERN.finditer(node))
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+            elif isinstance(node, dict):
+                for item in node.values():
+                    walk(item)
+
+        walk(value)
+        return found
+
+
+# --------------------------------------------------------------------------- #
+# 校验 + 拓扑排序
+# --------------------------------------------------------------------------- #
+def match_handle(target: str, handle_owner: Mapping[str, str]) -> str | None:
+    """把 ``node.port.field`` 这类引用匹配到已声明的句柄（最长前缀优先）。"""
+    parts = target.split(".")
+    for end in range(len(parts), 0, -1):
+        prefix = ".".join(parts[:end])
+        if prefix in handle_owner:
+            return prefix
+    return None
+
+
+@dataclass
+class PlanNode:
+    """校验通过后的可执行节点。"""
+
+    spec: NodeSpec
+    operator_cls: type
+    operator: Any
+    resolved_inputs: dict[str, Any]
+    handles: dict[str, str]  # 端口 -> 句柄
+    depends_on: list[str]
+
+
+@dataclass
+class Plan:
+    spec: PipelineSpec
+    params: dict[str, Any]
+    nodes: list[PlanNode]
+    order: list[str]
+    handle_owner: dict[str, str]
+    pipeline_outputs: dict[str, str]
+
+    def node(self, node_id: str) -> PlanNode:
+        for n in self.nodes:
+            if n.spec.id == node_id:
+                return n
+        raise ConfigError(f"计划中没有节点 '{node_id}'")
+
+
+def build_plan(
+    spec: PipelineSpec,
+    registry: Any,
+    *,
+    overrides: Mapping[str, Any] | None = None,
+    env: Mapping[str, str] | None = None,
+    strict: bool = True,
+) -> Plan:
+    """把规格编译成执行计划：校验端口/参数/引用/依赖，并给出拓扑序。"""
+    problems: list[str] = []
+
+    # 1) 流水线参数合并
+    params = dict(spec.params)
+    for key, value in (overrides or {}).items():
+        if key not in params:
+            problems.append(f"覆盖了未定义的流水线参数 '{key}'；已定义：{', '.join(params) or '（无）'}")
+            continue
+        params[key] = value
+    # 参数自身也可能引用 env
+    resolver_env = RefResolver(params, {}, env)
+    try:
+        params = resolver_env.resolve(params)
+    except RefResolutionError as exc:
+        problems.append(str(exc))
+
+    # 2) 节点 id 唯一
+    ids: dict[str, int] = {}
+    for node in spec.nodes:
+        ids[node.id] = ids.get(node.id, 0) + 1
+    for node_id, count in ids.items():
+        if count > 1:
+            problems.append(f"节点 id '{node_id}' 重复出现 {count} 次")
+
+    # 3) 算子存在 + 参数校验 + 句柄声明
+    handle_owner: dict[str, str] = {}
+    resolved_ops: dict[str, tuple[type, Any]] = {}
+    for node in spec.nodes:
+        try:
+            cls = registry.get(node.op)
+        except Exception as exc:  # OperatorNotFoundError
+            problems.append(f"节点 [{node.id}]：{exc}")
+            continue
+        if RefResolver.static_target(node.params):
+            # 参数里含上游引用，类型只能等运行期解析后再校验；
+            # 这里仍做"参数名"静态校验，避免拼写错误拖到运行时才暴露。
+            unknown = sorted(set(node.params) - set(cls.param_table))
+            if unknown:
+                problems.append(
+                    f"节点 [{node.id}] 收到未声明的参数：{', '.join(unknown)}；"
+                    f"可用：{', '.join(sorted(cls.param_table)) or '（无）'}"
+                )
+                continue
+            instance = None
+        else:
+            try:
+                instance = cls(**node.params)
+            except Exception as exc:
+                problems.append(f"节点 [{node.id}] 参数不合法：{exc}")
+                continue
+        resolved_ops[node.id] = (cls, instance)
+
+        known_ports = {p.name for p in cls.outputs}
+        for port, handle in node.outputs.items():
+            if port not in known_ports:
+                problems.append(
+                    f"节点 [{node.id}] 重命名了未声明的输出端口 '{port}'；"
+                    f"可用：{', '.join(sorted(known_ports)) or '（无）'}"
+                )
+        for port in cls.outputs:
+            handle = node.outputs.get(port.name, f"{node.id}.{port.name}")
+            if handle in handle_owner:
+                problems.append(
+                    f"句柄 '{handle}' 被节点 [{handle_owner[handle]}] 与 [{node.id}] 同时占用"
+                )
+            else:
+                handle_owner[handle] = node.id
+
+    # 4) 引用可达性 + 输入端口完备性 + 依赖推导
+    plan_nodes: list[PlanNode] = []
+    for node in spec.nodes:
+        if node.id not in resolved_ops:
+            continue
+        cls, instance = resolved_ops[node.id]
+        depends: set[str] = set()
+
+        declared_inputs = {p.name for p in cls.inputs}
+        for port in node.inputs:
+            if port not in declared_inputs:
+                problems.append(
+                    f"节点 [{node.id}] 连接了未声明的输入端口 '{port}'；"
+                    f"可用：{', '.join(sorted(declared_inputs)) or '（无）'}"
+                )
+
+        # 静态检查所有引用的目标是否会被产出 / 是否存在
+        targets = RefResolver.static_target(node.inputs) + RefResolver.static_target(node.params)
+        for target in targets:
+            if target.startswith(("p.", "params.", "env.")):
+                continue
+            matched = match_handle(target, handle_owner)
+            if matched:
+                depends.add(handle_owner[matched])
+                continue
+            problems.append(
+                f"节点 [{node.id}] 引用了未知句柄 '{target}'；"
+                f"已声明句柄：{', '.join(sorted(handle_owner)) or '（无）'}"
+            )
+
+        if node.id in depends:
+            problems.append(f"节点 [{node.id}] 直接引用了自己的输出（自环）")
+            depends.discard(node.id)
+
+        missing = [
+            p.name for p in cls.inputs
+            if not p.optional and p.name not in node.inputs
+        ]
+        if missing:
+            problems.append(
+                f"节点 [{node.id}] 缺少必填输入端口：{', '.join(missing)}"
+                f"（算子 {cls.name} 声明了 {', '.join(p.name for p in cls.inputs)}）"
+            )
+
+        handles = {p.name: node.outputs.get(p.name, f"{node.id}.{p.name}") for p in cls.outputs}
+        plan_nodes.append(
+            PlanNode(
+                spec=node,
+                operator_cls=cls,
+                operator=instance,
+                resolved_inputs={},
+                handles=handles,
+                depends_on=sorted(depends),
+            )
+        )
+
+    # 5) 流水线输出引用
+    for name, ref in spec.outputs.items():
+        for target in RefResolver.static_target(ref):
+            if target.startswith(("p.", "params.", "env.")):
+                continue
+            if match_handle(target, handle_owner) is None:
+                problems.append(f"流水线输出 '{name}' 引用了未知句柄 '{target}'")
+
+    # 6) 环检测 + 拓扑序
+    order: list[str] = []
+    if not problems:
+        try:
+            order = topological_order({n.spec.id: n.depends_on for n in plan_nodes})
+        except CycleError as exc:
+            problems.append(str(exc))
+
+    if problems and strict:
+        raise SpecValidationError(problems)
+
+    return Plan(
+        spec=spec,
+        params=params,
+        nodes=plan_nodes,
+        order=order,
+        handle_owner=handle_owner,
+        pipeline_outputs=dict(spec.outputs),
+    )
+
+
+def topological_order(graph: Mapping[str, list[str]]) -> list[str]:
+    """Kahn 拓扑排序；同层按名字排序保证输出稳定。"""
+    indegree = {node: 0 for node in graph}
+    children: dict[str, list[str]] = {node: [] for node in graph}
+    for node, deps in graph.items():
+        for dep in deps:
+            if dep not in graph:
+                raise CycleError(f"依赖 '{dep}' 不存在于图中")
+            indegree[node] += 1
+            children[dep].append(node)
+
+    ready = sorted(n for n, d in indegree.items() if d == 0)
+    order: list[str] = []
+    while ready:
+        current = ready.pop(0)
+        order.append(current)
+        for child in sorted(children[current]):
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+        ready.sort()
+
+    if len(order) != len(graph):
+        remaining = sorted(n for n in graph if n not in order)
+        raise CycleError(f"依赖图存在环，涉及节点：{', '.join(remaining)}")
+    return order
+
+
+def check_handle_types(
+    plan: Plan, values: Mapping[str, Any]
+) -> list[str]:
+    """软类型校验：句柄实际值与声明端口类型不符时给出告警。"""
+    warnings: list[str] = []
+    for node in plan.nodes:
+        cls = node.operator_cls
+        for port in cls.outputs:
+            handle = node.handles[port.name]
+            if handle not in values:
+                continue
+            value = values[handle]
+            if not value_matches(port.type, value):
+                warnings.append(
+                    f"节点 [{node.spec.id}] 句柄 '{handle}' 声明 {type_label(port.type)}，"
+                    f"实际 {type(value).__name__}"
+                )
+        for port in cls.inputs:
+            if port.name not in node.spec.inputs:
+                continue
+            ref = node.spec.inputs[port.name]
+            if isinstance(ref, str) and _REF_PATTERN.fullmatch(ref):
+                handle = _REF_PATTERN.fullmatch(ref).group(1).strip()
+                if handle in values and not value_matches(port.type, values[handle]):
+                    warnings.append(
+                        f"节点 [{node.spec.id}] 输入 '{port.name}' 期望 {type_label(port.type)}，"
+                        f"上游 '{handle}' 实际 {type(values[handle]).__name__}"
+                    )
+    return warnings
