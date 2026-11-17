@@ -43,7 +43,8 @@ def to_dot(plan: Plan) -> str:
 
 
 def to_ascii(plan: Plan) -> str:
-    widths = [max(len(n.spec.id), len(n.spec.op)) for n in plan.nodes] or [4]
+    id_w = max((len(n.spec.id) for n in plan.nodes), default=4)
+    op_w = max((len(n.spec.op) for n in plan.nodes), default=4)
     lines = []
     for index, node in enumerate(plan.nodes, 1):
         deps = ", ".join(node.depends_on) or "<入口>"
@@ -56,6 +57,6 @@ def to_ascii(plan: Plan) -> str:
             flags.append(f"when: {node.spec.when}")
         suffix = ("  [" + "; ".join(flags) + "]") if flags else ""
         lines.append(
-            f"{index:>2}. {node.spec.id:<{widths[0]}}  {node.spec.op:<{widths[1]}}  <- {deps}{suffix}"
+            f"{index:>2}. {node.spec.id:<{id_w}}  {node.spec.op:<{op_w}}  <- {deps}{suffix}"
         )
     return "\n".join(lines)

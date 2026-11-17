@@ -65,15 +65,22 @@
 
 **支持**：字面量、变量名、`+ - * / // % **`、比较（含链式）、`and/or/not`、`in/not in`、`is/is not`、
 条件表达式 `a if c else b`、列表/元组/字典/集合字面量、下标与切片、
+映射点语法（`params.n`、`inputs.table.rows`——仅对映射做键下钻，键不存在即报错）、
 函数 `len str int float bool abs min max sum sorted any all round isinstance`。
 
-**禁止**：属性访问、lambda、推导式、赋值/语句、任何非白名单函数（含 `eval`/`open`/`__import__`）。
+**扩展函数**：嵌入方可用 `register_function(name, fn)` 把领域函数（日期解析、正则辅助等）
+加进白名单，`when`/表算子行级表达式/`control.assert` 均可用；约束：必须是纯函数
+（表达式可能被多次求值）、名字须为合法标识符且**禁止覆盖内置名**、
+同名的自定义函数重复注册视为替换。
+
+**禁止**：任意对象属性访问（`x.__class__`；点语法仅限映射键下钻）、lambda、推导式、
+赋值/语句、任何非白名单函数（含 `eval`/`open`/`__import__`）。
 
 各处的环境变量：
 
 | 场景 | 可用变量 |
 | --- | --- |
-| `when` | 输入端口名、参数名、`inputs`（仅成功解析的端口）、`params`（原始配置值） |
+| `when` | 输入端口名、参数名、`inputs`（仅成功解析的端口）、`params`（解析后的值）、`raw_params`（原始配置值） |
 | 表算子行级表达式 | 行字段名（标识符形式）、`row`（整行 dict）、`i`（行号） |
 | `control.assert` | `value`、节点参数名、`value` 为 dict 时其顶层键 |
 
@@ -98,6 +105,12 @@
 ---
 
 ## 6. 校验与错误
+
+**未知键告警**：`from_dict` 对顶层与节点里不认识的键发 `logging.warning`（不报错，
+保证前向兼容），消息附带近义键建议——例如把 `params` 拼成 `param` 会看到
+`流水线配置 含未知键 'param'（将被忽略）；是否想写 'params'？`。合法键集合见
+[spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) 中 `NodeSpec._KNOWN_KEYS` 与 `PipelineSpec._KNOWN_KEYS`；
+CLI 下 WARNING 会经 stderr 直接展示（`validate` 同样可见）。
 
 编译期（`build_plan`）会一次性汇总以下问题，抛 `SpecValidationError`：
 
@@ -134,7 +147,7 @@ python -m op_pipeline describe <op_name>
 ```
 
 `run` 选项：`--workdir`、`--workers`、`--cache-dir`（默认 `.pipeline_cache`）、`--no-cache`、
-`--fail-fast`、`--dry-run`、`--json PATH`、`--plugin PATH`（可多次）、`--param KEY=VALUE`（可多次）、`-v`。
+`--fail-fast`、`--dry-run`、`--json PATH`、`--plugin PATH`（可多次，相对配置文件所在目录解析）、`--param KEY=VALUE`（可多次）、`-v`。
 
 | 退出码 | 含义 |
 | --- | --- |
@@ -152,7 +165,7 @@ python -m op_pipeline describe <op_name>
 | 路径 | 来源 | 说明 |
 | --- | --- | --- |
 | 工作目录 | `--workdir`，默认配置文件所在目录 | `ctx.resolve_path()` 的相对基准 |
-| `.op_pipeline/artifacts/<run_id>/<node_id>/` | `RunContext.create()` | 每次运行强制创建 |
+| `.op_pipeline/artifacts/<run_id>/<node_id>/` | `RunContext.create()` | 惰性创建（算子首次使用产物才建目录；可用 `artifacts_dir` 参数覆盖位置） |
 | `.pipeline_cache/*.pkl` | `--cache-dir` | **相对进程 CWD**；`--no-cache` 或空目录即禁用 |
 | `--json PATH` | `RunReport.to_json()` | 自动创建父目录 |
 

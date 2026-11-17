@@ -89,11 +89,23 @@ class RunContext:
         run_id: str | None = None,
         logger: logging.Logger | None = None,
         cache: Any = None,
+        artifacts_dir: str | Path | None = None,
     ) -> "RunContext":
+        """创建运行上下文。
+
+        产物目录惰性创建：只有算子第一次调用 ``artifact_path`` / ``save_artifact``
+        时才在磁盘建目录，纯内存运行不会在 workdir 留下 ``.op_pipeline/``。
+        ``artifacts_dir`` 可覆盖产物位置（相对路径按 workdir 解析），
+        便于嵌入方把产物收敛到自己的目录约定。
+        """
         workdir_path = Path(workdir).expanduser().resolve()
         run_id = run_id or time.strftime("%Y%m%d-%H%M%S")
-        artifacts = workdir_path / ".op_pipeline" / "artifacts" / run_id
-        artifacts.mkdir(parents=True, exist_ok=True)
+        if artifacts_dir is not None:
+            custom = Path(artifacts_dir).expanduser()
+            artifacts = custom if custom.is_absolute() else workdir_path / custom
+            artifacts = artifacts.resolve()
+        else:
+            artifacts = workdir_path / ".op_pipeline" / "artifacts" / run_id
         return cls(
             run_id=run_id,
             pipeline=pipeline,

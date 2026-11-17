@@ -62,6 +62,13 @@
 **M1.5 完成定义（DoD）**：各任务独立合入、各自可发版；收尾时在 `examples/` 新增
 "库嵌入模式"综合示例（独立注册表 + 取消事件 + 纯内存运行三合一）；现有测试与新增单测全绿。
 
+> **状态**：M1.5-1 ~ M1.5-8 全部完成（2026-11-17，TDD 红→绿各一轮，46 个用例全绿；
+> 注册表线程安全（并发加载同一文件恰好执行一次、失败占位可重试）、未知配置键告警（含近义键提示，
+> 顺手修复 `to_ascii` 单节点崩溃）、`when` 环境统一为解析值并新增 `raw_params`（点语法开放映射下钻）、
+> `register_function` 表达式扩展钩子（纯函数约束、禁覆盖内置名），
+> wheel 含 py.typed，两个示例端到端通过，文档已同步）。
+> 待收尾：DoD 的"库嵌入模式"综合示例（独立注册表 + 取消事件 + 纯内存运行三合一）。
+
 ---
 
 ## 4. M2：三个抽象（v0.3）
@@ -141,7 +148,7 @@ python -m unittest discover -s tests -v
 python -m op_pipeline run examples/pipeline_orders.json --no-cache
 
 # 3. 端到端：插件 + 重试 + 句柄下钻
-python -m op_pipeline run examples/pipeline_text.toml --plugin examples/plugins/demo_ops.py --no-cache
+python -m op_pipeline run examples/pipeline_text.toml --plugin plugins/demo_ops.py --no-cache
 
 # 4. 静态入口
 python -m op_pipeline validate examples/pipeline_orders.json

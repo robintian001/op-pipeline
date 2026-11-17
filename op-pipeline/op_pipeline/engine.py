@@ -11,6 +11,8 @@
 5. **超时**：``timeout`` 秒为软超时——到点标记失败，但底层线程无法强杀，
    这一点在 README 里作为已知限制写明。
 6. **缓存**：``cache=True`` 且算子声明确定性时，按内容指纹复用上次输出。
+7. **取消**：``cancel_event`` 置位或 :meth:`Engine.cancel` 之后，未调度节点标记
+   skipped、在跑节点自然结束，报告状态为 partial。
 """
 from __future__ import annotations
 
@@ -178,6 +180,7 @@ class Engine:
         cache_store: CacheStore | None = None,
         max_workers: int | None = None,
         fail_fast: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.plan = plan
         self.context = context
@@ -191,6 +194,19 @@ class Engine:
         self._completed: dict[str, str] = {}
         self._aborted = False
         self._warnings: list[str] = []
+        # 取消：支持共享外部事件或 Engine.cancel()，语义见模块 docstring 第 7 条
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        self._cancel_reason = "cancel_event 被置位"
+        self._cancel_announced = False
+
+    def cancel(self, reason: str = "调用方请求取消") -> None:
+        """请求取消本次运行（线程安全，可从其它线程调用）。
+
+        在跑节点自然结束；尚未调度的节点将标记为 skipped，报告状态为 partial。
+        也可在构造时传入共享的 ``cancel_event``，由宿主直接 set() 触发同样语义。
+        """
+        self._cancel_reason = reason
+        self._cancel_event.set()
 
     # ------------------------------------------------------------------ #
     def run(self) -> RunReport:
@@ -276,6 +292,16 @@ class Engine:
         pool: ThreadPoolExecutor,
     ) -> bool:
         progressed = False
+        if self._cancel_event.is_set():
+            if not self._cancel_announced:
+                self._warnings.append(
+                    f"运行被取消：{self._cancel_reason}；在跑节点自然结束，未调度节点跳过"
+                )
+                self._cancel_announced = True
+            for node_id in list(pending):
+                self._mark_skipped(node_id, f"运行已被取消：{self._cancel_reason}")
+                pending.remove(node_id)
+            return progressed
         if self._aborted:
             for node_id in list(pending):
                 self._mark_skipped(node_id, "运行已被中断（fail_fast）")
@@ -333,7 +359,10 @@ class Engine:
             except RefResolutionError:
                 continue
         env["inputs"] = {k: env[k] for k in node.spec.inputs if k in env}
-        env["params"] = dict(node.spec.params)
+        # params 命名空间与扁平参数名同语义（解析后的值，跳过解析失败的键）；
+        # 原始配置值（可能仍是 '${p.x}' 串）保留在 raw_params。
+        env["params"] = {k: env[k] for k in node.spec.params if k in env}
+        env["raw_params"] = dict(node.spec.params)
         return evaluate_condition(str(node.spec.when), env)
 
     def _collect(self, node_id: str, future: Future) -> None:
@@ -504,6 +533,7 @@ def run_pipeline(
     cache_dir: str | Path | None = None,
     max_workers: int | None = None,
     fail_fast: bool = False,
+    cancel_event: threading.Event | None = None,
     run_id: str | None = None,
     logger: logging.Logger | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
@@ -527,6 +557,7 @@ def run_pipeline(
         cache=None,
     )
     cache_store = CacheStore(cache_dir)
-    engine = Engine(plan, context, cache_store=cache_store, max_workers=max_workers, fail_fast=fail_fast)
+    engine = Engine(plan, context, cache_store=cache_store, max_workers=max_workers,
+                    fail_fast=fail_fast, cancel_event=cancel_event)
     report = engine.run()
     return report, dict(engine.handles)

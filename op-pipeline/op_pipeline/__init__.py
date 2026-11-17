@@ -41,7 +41,7 @@ from .errors import (
     RefResolutionError,
     SpecValidationError,
 )
-from .expression import evaluate, evaluate_condition
+from .expression import evaluate, evaluate_condition, register_function
 from .operator import Operator
 from .params import Param
 from .ports import Port, as_ports, type_label
@@ -82,6 +82,7 @@ __all__ = [
     "fingerprint",
     "load_plugins",
     "op",
+    "register_function",
     "run_pipeline",
     "type_label",
 ]
@@ -101,15 +102,20 @@ def run(
     max_workers: int | None = None,
     fail_fast: bool = False,
     plugins: tuple[str, ...] = (),
+    registry: Registry | None = None,
     logger: logging.Logger | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
-    """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。"""
+    """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。
+
+    传 ``registry`` 可获得算子集隔离的运行：插件加载进该表、内置算子自动补齐、
+    全局 ``default_registry`` 不受任何影响；不传则与历史行为完全一致。
+    """
     config_path = Path(config).expanduser().resolve()
-    load_plugins(paths=plugins, base_dir=config_path.parent)
+    load_plugins(paths=plugins, base_dir=config_path.parent, registry=registry)
     spec = PipelineSpec.from_file(config_path)
     return run_pipeline(
         spec,
-        registry=default_registry,
+        registry=registry or default_registry,
         workdir=workdir or config_path.parent,
         overrides=overrides,
         cache_dir=cache_dir,

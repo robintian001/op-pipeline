@@ -57,7 +57,7 @@ _ALLOWED_NODES = (
     ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
     ast.Is, ast.IsNot, ast.Name, ast.Load, ast.Constant, ast.Call, ast.keyword,
     ast.IfExp, ast.List, ast.Tuple, ast.Dict, ast.Set, ast.Subscript, ast.Slice,
-    ast.BoolOp, ast.BinOp,
+    ast.BoolOp, ast.BinOp, ast.Attribute,
 )
 
 
@@ -94,6 +94,16 @@ def _eval(node: ast.AST, env: Mapping[str, Any]) -> Any:
         target = _eval(node.value, env)
         key = _eval(node.slice, env)
         return target[key]
+    if isinstance(node, ast.Attribute):
+        # 点语法只做映射键下钻（params.n / inputs.table.rows 等），
+        # 目标不是映射或键不存在即拒绝——因此 x.__class__ 之类属性逃逸天然被挡住
+        target = _eval(node.value, env)
+        if isinstance(target, Mapping) and node.attr in target:
+            return target[node.attr]
+        raise ExpressionError(
+            f"无法下钻 '.{node.attr}'：目标"
+            f"{'不含该键' if isinstance(target, Mapping) else '不是映射（点语法仅支持映射下钻）'}"
+        )
     if isinstance(node, ast.Slice):
         return slice(
             _eval(node.lower, env) if node.lower else None,
@@ -164,3 +174,37 @@ def evaluate(expression: str, env: Mapping[str, Any]) -> Any:
 def evaluate_condition(expression: str, env: Mapping[str, Any]) -> bool:
     """把表达式结果转成布尔（``when`` 语义）。"""
     return bool(evaluate(expression, env))
+
+
+def register_function(name: str, fn: Any) -> Any:
+    """把领域函数注册进表达式白名单（全局生效，需在加载配置前调用）。
+
+    适合日期解析、正则辅助等领域谓词，让复杂条件留在配置里而不是被迫写算子。
+    约束：
+
+    - ``fn`` 必须是纯函数（同输入同输出、无副作用）——表达式可能在编译期、
+      调度期、重试期被多次求值，副作用语义不可靠；
+    - 名字必须是合法标识符，且**禁止覆盖内置名**（防止偷偷改变既有配置的含义）；
+    - 重复注册同一自定义名视为替换（便于开发迭代）。
+
+    注册后即可在 ``when`` / 表算子行级表达式 / ``control.assert`` 中使用::
+
+        from op_pipeline import register_function
+
+        register_function("parse_int", lambda s: int(str(s).replace(",", "")))
+        # 配置里：when = "parse_int(value) > 1000"
+    """
+    if name in _BUILTIN_FUNCS:
+        raise ExpressionError(
+            f"不能覆盖内置函数 '{name}'；内置：{', '.join(sorted(_BUILTIN_FUNCS))}"
+        )
+    if not isinstance(name, str) or not name.isidentifier():
+        raise ExpressionError(f"函数名必须是合法标识符：{name!r}")
+    if not callable(fn):
+        raise ExpressionError(f"注册的必须是可调用对象：{fn!r}")
+    _ALLOWED_FUNCS[name] = fn
+    return fn
+
+
+# 内置函数名快照（register_function 捉"覆盖内置"用）
+_BUILTIN_FUNCS = frozenset(_ALLOWED_FUNCS)

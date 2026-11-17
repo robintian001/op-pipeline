@@ -201,11 +201,15 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 
 **允许的语法节点**：`Expression`、`BoolOp(And/Or)`、`UnaryOp(Not/USub/UAdd)`、
 `BinOp(+, -, *, /, //, %, **)`、`Compare(Eq/NotEq/Lt/LtE/Gt/GtE/In/NotIn/Is/IsNot)`、
-`Name`、`Constant`、`Call` + `keyword`、`IfExp`、`List/Tuple/Dict/Set`、`Subscript`、`Slice`。
+`Name`、`Constant`、`Call` + `keyword`、`IfExp`、`List/Tuple/Dict/Set`、`Subscript`、`Slice`、
+`Attribute`（仅映射键下钻：`params.n` / `inputs.table.rows`，目标不是映射或键不存在即报错）。
 
-**允许的函数**：`len str int float bool abs min max sum sorted any all round isinstance`。
+**允许的函数**：`len str int float bool abs min max sum sorted any all round isinstance`；
+另可通过 `register_function(name, fn)` 注册领域函数（纯函数、合法标识符、禁止覆盖内置名，
+全局生效需在加载配置前调用，见 [expression.py#L179-L206](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/expression.py#L179-L206)）。
 
-**被明确阻断**：属性访问（`x.__class__`）、`Lambda`、推导式、`eval/open/__import__` 等任意调用、
+**被明确阻断**：任意对象属性访问（`x.__class__`——点语法只做映射下钻，无属性逃逸面）、
+`Lambda`、推导式、`eval/open/__import__` 等任意调用、
 赋值与语句（只解析 `mode="eval"`）。测试用例见
 [tests/test_op_pipeline.py#L116-L126](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/tests/test_op_pipeline.py#L116-L126)。
 
@@ -220,7 +224,7 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 
 | 使用方 | 环境变量来源 |
 | --- | --- |
-| 节点 `when` | 输入端口值、参数值、`inputs`、`params`（见 [engine.py#L322-L337](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L322-L337)） |
+| 节点 `when` | 输入端口值、参数值、`inputs`、`params`（解析后）、`raw_params`（原始值）（见 [engine.py#L348-L366](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L348-L366)） |
 | `table.*` 行级表达式 | `row_env()`：字段名（标识符形式）+ `row` + `i` |
 | `control.assert` | `value` + 节点参数 + dict 值展平 |
 
@@ -245,7 +249,7 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 ```python
 RunContext.create(pipeline, params, workdir, run_id=None, logger=None, cache=None)
   → run_id 默认 "%Y%m%d-%H%M%S"
-  → artifacts_dir = workdir/.op_pipeline/artifacts/<run_id>（强制创建）
+  → artifacts_dir = workdir/.op_pipeline/artifacts/<run_id>（惰性创建，首次使用产物才建目录）
 
 NodeContext（由 for_node 创建）
   ctx.log / ctx.artifact_path / ctx.save_artifact / ctx.resolve_path

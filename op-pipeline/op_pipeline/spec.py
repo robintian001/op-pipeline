@@ -32,7 +32,9 @@
 """
 from __future__ import annotations
 
+import difflib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -47,7 +49,24 @@ from .errors import (
 )
 from .ports import Port, type_label, value_matches
 
+logger = logging.getLogger("op_pipeline.spec")
+
 _REF_PATTERN = re.compile(r"\$\{([^{}]+)\}")
+
+
+def _warn_unknown_keys(where: str, raw: Mapping[str, Any], known: frozenset[str]) -> None:
+    """对映射中不属于 known 的键发告警。
+
+    未知键会被静默忽略——把 ``[nodes]`` 拼成 ``[Nodes]`` 会得到
+    "0 节点运行成功"的假象，因此这里必须给用户留痕（告警而非报错，
+    是为了前向兼容：新增键不破坏旧版本库调用方）。
+    """
+    for key in raw:
+        if key in known:
+            continue
+        close = difflib.get_close_matches(key, known, n=1, cutoff=0.6)
+        hint = f"；是否想写 '{close[0]}'？" if close else ""
+        logger.warning("%s 含未知键 %r（将被忽略）%s", where, key, hint)
 
 
 # --------------------------------------------------------------------------- #
@@ -70,6 +89,15 @@ class NodeSpec:
     allow_failure: bool = False
     description: str = ""
 
+    # from_dict 接受的合法键（dataclass 字段之外无类型注解，不会被当作字段）
+    _KNOWN_KEYS = frozenset(
+        {
+            "id", "name", "op", "inputs", "outputs", "params", "when",
+            "retries", "retry_delay", "timeout", "cache", "allow_failure",
+            "description",
+        }
+    )
+
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "NodeSpec":
         if not isinstance(raw, Mapping):
@@ -80,6 +108,7 @@ class NodeSpec:
         op = raw.get("op")
         if not op:
             raise ConfigError(f"节点 [{node_id}] 缺少 op")
+        _warn_unknown_keys(f"节点 [{node_id}]", raw, cls._KNOWN_KEYS)
         outputs = raw.get("outputs") or {}
         if not isinstance(outputs, Mapping):
             raise ConfigError(f"节点 [{node_id}] 的 outputs 必须是映射（端口 -> 句柄名）")
@@ -110,10 +139,16 @@ class PipelineSpec:
     outputs: dict[str, str] = field(default_factory=dict)
     defaults: dict[str, Any] = field(default_factory=dict)
 
+    # from_dict 接受的合法键（dataclass 字段之外无类型注解，不会被当作字段）
+    _KNOWN_KEYS = frozenset(
+        {"name", "description", "version", "params", "nodes", "outputs", "defaults"}
+    )
+
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "PipelineSpec":
         if not isinstance(raw, Mapping):
             raise ConfigError("流水线配置根节点必须是对象")
+        _warn_unknown_keys("流水线配置", raw, cls._KNOWN_KEYS)
         nodes_raw = raw.get("nodes") or []
         if not isinstance(nodes_raw, list):
             raise ConfigError("nodes 必须是数组")

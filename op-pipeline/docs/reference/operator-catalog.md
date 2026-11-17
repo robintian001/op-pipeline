@@ -154,7 +154,7 @@
 
 ## 7. 示例插件算子（examples/plugins/demo_ops.py）
 
-不属于内置算子，需 `--plugin examples/plugins/demo_ops.py` 后可用：
+不属于内置算子，需 `--plugin plugins/demo_ops.py`（`--plugin` 路径相对配置文件所在目录解析）后可用：
 
 | 算子 | 入 | 出 | 参数 |
 | --- | --- | --- | --- |

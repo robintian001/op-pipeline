@@ -11,6 +11,7 @@
 | --- | --- | --- | --- |
 | 新增算子 | `@op` 装饰器 + `Operator` 子类 | 只新增文件，不改框架 | 稳定 |
 | 算子插件 | 模块路径 / 文件路径加载 | 配置或调用方传参 | 稳定 |
+| 表达式函数 | `register_function(name, fn)`（纯函数、禁覆盖内置名） | 只新增调用，不改框架 | 稳定 |
 | 新配置格式 | `PipelineSpec.from_file` 的分支 | `spec.py` | 内部接口 |
 | 算子别名 | `Registry.register(aliases=...)` | 算子声明 | 稳定 |
 | 自定义缓存 | 传入 `CacheStore` 兼容对象 | `run_pipeline` / `Engine` | 弱契约（鸭子类型） |
@@ -86,8 +87,9 @@ from op_pipeline import load_plugins
 load_plugins(modules=["my_company.ops"], paths=["plugins/my_ops.py"], base_dir=".")
 ```
 
-加载顺序（[registry.py#L119-L166](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L119-L166)）：
-内置 `op_pipeline.ops` → `modules` → `paths`。文件加载的模块名是 `_op_plugin_<stem>`。
+加载顺序（[registry.py#L177-L253](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L177-L253)）：
+内置 `op_pipeline.ops` → `modules` → `paths`。文件加载的模块名是 `_op_plugin_<stem>`
+（指定 `registry` 时为 `_op_plugin_<stem>_<序号>`，跨注册表各执行一次）。
 
 ### 3.2 约束与坑
 
@@ -95,10 +97,33 @@ load_plugins(modules=["my_company.ops"], paths=["plugins/my_ops.py"], base_dir="
 | --- | --- |
 | 导入即注册 | 插件模块必须在 import 时执行 `@op`；仅定义类不注册 |
 | 同名去重 | 以 `stem` 去重，两个不同目录的同名文件只有第一个生效 |
-| 默认注册表 | 插件注册到 `default_registry`；如需隔离，用 `op(registry=...)` 自建 `Registry` |
+| 默认注册表 | 不指定 `registry` 时一切注册落到 `default_registry`；隔离方案见 §3.3 |
 | 覆盖 | 重新注册同名算子需 `replace=True`（测试中大量使用） |
 | 依赖方向 | 插件只能 import `op_pipeline` 的公开符号，不得 import `op_pipeline.engine` 内部实现 |
 | 入口限制 | `run()` 辅助函数只接受文件路径插件，不接受模块名；需要模块插件时直接调 `load_plugins()` |
+
+### 3.3 独立注册表（隔离运行）
+
+适合多流水线算子集隔离、测试隔离、同进程并发跑不同算子集的场景：
+
+```python
+from op_pipeline import Registry, load_plugins, run
+
+reg = Registry()                                        # 全新注册表
+load_plugins(paths=["plugins/my_ops.py"], registry=reg)  # 插件进 reg，内置算子自动补齐
+report, values = run("my_pipeline.toml", registry=reg)   # default_registry 全程不受影响
+```
+
+要点（[registry.py#L106-L143](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L106-L143)）：
+
+- 裸 `@op("x.y")` 写法的插件文件也能定向：`load_plugins(..., registry=...)` 加载期间
+  `@op` 落到目标表（contextvar 实现，线程/任务隔离）；
+- 内置算子自动补齐到新表（按 `op_pipeline.ops` 模块前缀识别，已存在的名字不覆盖）；
+- 同一插件文件可在多个注册表各执行一次（模块级状态互不影响）；同一注册表重复加载则跳过；
+- `Registry` 内部由 `RLock` 保护：多线程并发注册/并发 `load_plugins` 同一注册表是安全的，
+  同一插件文件并发加载恰好执行一次，**加载失败不占去重名额**（占位回滚，下次可重试）；
+- 类定义处可直接写 `@op("x.y", registry=reg)`；
+- `modules` 方式受 Python import 幂等性限制：已导入过的模块不会重新执行。
 
 ---
 
@@ -160,7 +185,7 @@ class Executor(Protocol):
 | T8 | 软超时无法终止算子 | [engine.py#L459-L484](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L459-L484) | 超时后线程仍可能写文件/占连接 | 换进程执行器，或文档要求算子自身支持取消 |
 | T9 | 失败不保留堆栈 | 只存 `type: message` | 线上排障依赖日志 | `NodeResult` 增加 `traceback`（截断） |
 | T10 | `run_id` 秒级精度 | [context.py#L94](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/context.py#L94) | 同秒并发会共用产物目录 | 加随机后缀或纳秒 |
-| T11 | 插件按 stem 去重 | [registry.py#L155-L158](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L155-L158) | 同名文件静默不加载 | 改用路径哈希作模块名 |
+| T11 | 插件按 stem 去重 | [registry.py#L229-L233](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L229-L233) | 同名文件静默不加载 | 改用路径哈希作模块名 |
 | T12 | `run()` 不支持模块插件 | `plugins` 参数只传 `paths` | 库调用方需自行 `load_plugins` | 增加 `plugin_modules` 参数 |
 | T13 | `strict=False` 可返回残缺 Plan | [spec.py#L477-L487](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L477-L487) | 无调用方使用，属预留 | 保持现状并在文档说明 |
 | T14 | `to_mermaid` 中 `style` 死变量 | [graph.py#L16-L18](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/graph.py#L16-L18) | 无影响 | 清理 |
@@ -191,9 +216,9 @@ class Executor(Protocol):
 
 ## 7. 新增能力时的回归清单
 
-1. 跑 `python -m unittest discover -s tests -v`（21 个用例）；
+1. 跑 `python -m unittest discover -s tests -v`（46 个用例）；
 2. 用 `examples/pipeline_orders.json` 做端到端（覆盖并行 fan-out、when、断言、4 种输出）；
-3. 用 `examples/pipeline_text.toml --plugin examples/plugins/demo_ops.py` 验证插件与重试；
+3. 用 `examples/pipeline_text.toml --plugin plugins/demo_ops.py`（`--plugin` 相对配置文件所在目录解析）验证插件与重试；
 4. `python -m op_pipeline validate` 与 `graph` 必须仍然可用；
 5. 若改变节点契约（字段/语义），同步更新 [配置规范](../reference/config-schema.md) 与
    [运行时语义](../architecture/runtime-semantics.md)。

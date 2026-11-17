@@ -116,17 +116,19 @@ while pending or running:
 ### 2.3 dispatch 的决策顺序
 
 对 `pending` 中的每个节点（按拓扑序）依次判断
-（[engine.py#L272-L320](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L272-L320)）：
+（[engine.py#L288-L346](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L288-L346)）：
 
-1. **fail_fast 已触发** → 全部标记 skipped，注明"运行已被中断（fail_fast）"；
-2. **依赖未全部完成** → 跳过本轮（不阻塞其他可运行节点）；
-3. **依赖中有 failed / skipped** → 本节点 skipped，注明缺失的上游；
-4. **`when` 条件**：在调度前求值，为假则 skipped，求值异常也 skipped（不失败）；
-5. **并发已满** → `break`（保留剩余节点到下一轮）；
-6. 否则 `pool.submit(self._run_node, node)`。
+1. **取消已触发**（`cancel_event` 被置位或 `Engine.cancel()` 被调用）→ 全部标记 skipped，
+   注明"运行已被取消：\<原因\>"，并向报告 `warnings` 追加一条取消告警；
+2. **fail_fast 已触发** → 全部标记 skipped，注明"运行已被中断（fail_fast）"；
+3. **依赖未全部完成** → 跳过本轮（不阻塞其他可运行节点）；
+4. **依赖中有 failed / skipped** → 本节点 skipped，注明缺失的上游；
+5. **`when` 条件**：在调度前求值，为假则 skipped，求值异常也 skipped（不失败）；
+6. **并发已满** → `break`（保留剩余节点到下一轮）；
+7. 否则 `pool.submit(self._run_node, node)`。
 
-这六步的顺序是有意义的：条件判断必须在上游完成之后、提交之前，否则 `when` 拿不到输入值；
-而并发上限放在最后，保证"能跳过的先跳过"，不占线程。
+这七步的顺序是有意义的：取消与 fail_fast 的短路必须最先；条件判断必须在上游完成之后、
+提交之前，否则 `when` 拿不到输入值；而并发上限放在最后，保证"能跳过的先跳过"，不占线程。
 
 ### 2.4 `when` 的求值环境
 
@@ -135,16 +137,18 @@ env = {
   <输入端口名>: 解析后的上游值,          # 解析失败则忽略该键
   <参数名>: 解析后的参数值,              # 同上
   "inputs": {已成功解析的输入端口名: 值},
-  "params": {原始（未解析）的参数表},
+  "params": {已成功解析的参数名: 值},     # 与扁平参数名同语义（M1.5-5 起生效）
+  "raw_params": {原始（未解析）的参数表}, # 原值逃生门：仍是 '${p.x}' 串
 }
 ```
 
-源码：[engine.py#L322-L337](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L322-L337)。
-求值走 [evaluate_condition()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/expression.py#L164-L166)，
+源码：[engine.py#L348-L366](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L348-L366)。
+求值走 [evaluate_condition()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/expression.py#L172-L174)，
 即 AST 白名单（见 [核心模块设计 §5](../design/core-modules.md#5-expressionpy安全表达式)）。
 
-> 注意 `env["params"]` 是**原始配置值**（可能仍是 `${p.x}` 字符串），
-> 这与端口解密后的标量参数不一致；写 `when` 时优先用扁平参数名而不是 `params.xxx`。
+> `when = "params.n > 0"` 与 `when = "n > 0"` 完全等价；点语法对映射做键下钻
+> （`inputs.table.rows` 这类嵌套 dict 逐层下钻），目标不是映射或键不存在即报错——
+> 因此 `x.__class__` 之类的属性逃逸天然被挡住。
 
 ### 2.5 单节点执行流水线
 
@@ -229,6 +233,17 @@ for attempt in 1..attempts:
 节点失败时 `NodeResult.error = f"{type(exc).__name__}: {exc}"`，报告与 JSON 都保留异常类型名，
 但**不保留堆栈**；堆栈只走 logger（`ctx.logger.error`）。需要完整堆栈时应开启 `-v`。
 
+### 3.5 取消
+
+宿主通过 `run_pipeline(..., cancel_event=threading.Event)` 传入共享事件（置位即触发），
+或从其它线程调用 `Engine.cancel(reason)`。取消后：
+
+- **在跑节点自然结束**（线程无法强杀，与软超时同理由），结果照常计入报告；
+- **未调度节点**在下一轮 `_dispatch` 中全部标记 skipped（note 含取消原因）；
+- 报告 `warnings` 追加一条取消告警，状态聚合为 `partial`（存在 skipped 时见 §5.1）。
+
+取消检查位于 `_dispatch` 决策顺序的第一步（§2.3），优先于 fail_fast 与依赖判断。
+
 ---
 
 ## 4. 缓存语义
@@ -304,7 +319,7 @@ status = "failed"   if hard_failures
 | `duration` | `finished_at - started_at` |
 | `params` | 合并后的流水线参数（含 overrides 与 env 展开） |
 | `outputs` | 流水线级输出（引用解析结果，失败则进 `warnings`） |
-| `warnings` | 输出解析告警 + 引擎告警（`_warnings` 目前无写入方） |
+| `warnings` | 输出解析告警 + 引擎告警（如取消告警） |
 | `artifacts_dir` | 本次运行产物根目录 |
 | `nodes[]` | 每节点 `status / duration / attempts / cached / outputs（类型摘要）/ error / note` |
 
@@ -315,12 +330,14 @@ status = "failed"   if hard_failures
 
 ```
 workdir/                                  # 默认 = 配置文件所在目录
-├── .op_pipeline/artifacts/<run_id>/      # RunContext.artifacts_dir，每次运行强制创建
-│   └── <node_id>/<artifact_name>         # ctx.artifact_path()
+├── .op_pipeline/artifacts/<run_id>/      # RunContext.artifacts_dir，惰性创建
+│   └── <node_id>/<artifact_name>         # ctx.artifact_path() 首次调用才建目录
 └── <算子自己写的相对路径>                 # ctx.resolve_path() 的基准
 ```
 
 `run_id` 精度到秒，同一秒内并发两次运行会复用同一产物目录（[context.py#L94](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/context.py#L94)）。
+产物位置可用 `RunContext.create(..., artifacts_dir=...)` 覆盖（相对路径按 workdir 解析），
+便于嵌入方把产物收敛到自己的目录约定。
 
 ### 5.4 退出码（CLI）
 
@@ -338,11 +355,12 @@ workdir/                                  # 默认 = 配置文件所在目录
 CLI/库调用
   │ from_file()               解析 JSON/TOML/YAML
   │ build_plan()              §1 全部校验，产出 Plan
-  │ RunContext.create()       建 .op_pipeline/artifacts/<run_id>
+  │ RunContext.create()       计算 artifacts_dir（惰性，首次使用才建目录）
   │ CacheStore(cache_dir)     目录为空即禁用
   ▼
 Engine.run()
-  │ dispatch  ├─ 无依赖节点并行提交（≤ max_workers）
+  │ dispatch  ├─ 取消 / fail_fast 已触发 → 全部 skipped
+  │           ├─ 无依赖节点并行提交（≤ max_workers）
   │           ├─ when 为假 / 上游失败 → skipped
   │           └─ 依赖未完成 → 留到下一轮
   │ wait(FIRST_COMPLETED)
