@@ -155,8 +155,8 @@ env = {
 ```
 _run_node(node):
   ctx = run_context.for_node(node_id, op)        # 每个节点独立 logger
-  handles_snapshot = dict(self.handles)          # 快照，避免跨节点可见性抖动
-  resolver = RefResolver(plan.params, snapshot)
+  resolver = RefResolver(plan.params, self.store) # M2-3：构造时经 store.snapshot() 拍快照，
+                                                  # 避免跨节点可见性抖动（行为同 dict 快照）
 
   inputs = {port: resolver.resolve(ref) ...}     # 解析 ${...}
   params = resolver.resolve(node.spec.params)
@@ -216,17 +216,23 @@ for attempt in 1..attempts:
 `RefResolutionError`、`CycleError`、`OperatorNotFoundError`、`DuplicateOperatorError`。
 因此"配置写错"绝不会被重试掩盖。
 
-### 3.3 软超时
+### 3.3 超时：线程软超时 / 进程硬超时
 
-`timeout` 不为空时，`_execute_once` 为本次执行**再开一个守护线程**，主线程 `join(timeout)`：
+`timeout` 不为空时，按节点执行器分两种语义（M2-2 起）：
 
-- 执行按时结束 → 取结果或抛出捕获到的异常；
-- 超时 → 抛 `TimeoutError("…（软超时，底层线程仍在运行）")`。
+- **线程执行（默认）**：`_execute_once` 为本次执行**再开一个守护线程**，
+  主线程 `join(timeout)`——超时抛 `TimeoutError("…（软超时，底层线程仍在运行）")`。
+  Python 无法强杀线程，超时只是"不再等待"，算子可能继续写文件/占用连接；
+- **进程执行（节点 `executor = "process"` 或运行级 `--executor process`）**：
+  算子在 `spawn` 子进程里执行，超时到点 `terminate()` 子进程——
+  `TimeoutError("硬超时：…已强制终止")`。真正的终止，不留残余线程。
+  载荷（算子实例 + 参数 + 输入）不可 pickle 时自动回退线程执行
+  （退化为软超时），并在 `report.warnings` 记录回退告警。
 
-源码：[engine.py#L459-L484](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L459-L484)。
+两种模式的超时失败都会进入重试逻辑，因此超时 + 重试可能导致同一算子并发多份实例执行。
 
-代价：Python 无法强杀线程，超时只是"不再等待"，算子可能继续写文件/占用连接。
-超时失败会进入重试逻辑，因此超时 + 重试可能导致同一算子并发多份实例执行。
+源码：[engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) `_execute_once` / `_execute_in_process`、
+[executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) `ProcessExecutor.wait`。
 
 ### 3.4 异常信息的保留
 

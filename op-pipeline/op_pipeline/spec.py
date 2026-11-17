@@ -47,6 +47,7 @@ from .errors import (
     RefResolutionError,
     SpecValidationError,
 )
+from .handlestore import as_mapping
 from .ports import Port, type_label, value_matches
 
 logger = logging.getLogger("op_pipeline.spec")
@@ -74,7 +75,7 @@ def _warn_unknown_keys(where: str, raw: Mapping[str, Any], known: frozenset[str]
 # --------------------------------------------------------------------------- #
 # PipelineSpec.defaults 可设置的运行策略键（节点可逐项覆盖）
 _STRATEGY_KEYS = frozenset(
-    {"retries", "retry_delay", "timeout", "cache", "allow_failure"}
+    {"retries", "retry_delay", "timeout", "cache", "allow_failure", "executor"}
 )
 
 
@@ -93,6 +94,9 @@ class NodeSpec:
     timeout: float | None = None
     cache: bool = False
     allow_failure: bool = False
+    # 执行器选择（M2-2）：""=未指定（引擎按运行级 default 或 thread），
+    # "thread"=线程（软超时），"process"=子进程（硬超时）
+    executor: str = ""
     description: str = ""
 
     # from_dict 接受的合法键（dataclass 字段之外无类型注解，不会被当作字段）
@@ -100,7 +104,7 @@ class NodeSpec:
         {
             "id", "name", "op", "inputs", "outputs", "params", "when",
             "retries", "retry_delay", "timeout", "cache", "allow_failure",
-            "description",
+            "executor", "description",
         }
     )
 
@@ -130,6 +134,11 @@ class NodeSpec:
         fallback = defaults or {}
         merged = {k: raw.get(k, fallback.get(k)) for k in _STRATEGY_KEYS}
         timeout_raw = merged["timeout"]
+        executor_raw = merged["executor"] or ""
+        if executor_raw not in ("", "thread", "process"):
+            raise ConfigError(
+                f"节点 [{node_id}] 的 executor 只能是 thread/process，实际是 {executor_raw!r}"
+            )
         return cls(
             id=str(node_id),
             op=str(op),
@@ -142,6 +151,7 @@ class NodeSpec:
             timeout=None if timeout_raw in (None, 0) else float(timeout_raw),
             cache=bool(merged["cache"] or False),
             allow_failure=bool(merged["allow_failure"] or False),
+            executor=str(executor_raw),
             description=str(raw.get("description") or ""),
         )
 
@@ -253,11 +263,13 @@ class RefResolver:
     def __init__(
         self,
         params: Mapping[str, Any],
-        handles: Mapping[str, Any] | None = None,
+        handles: Any = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
         self.params = params
-        self.handles = handles or {}
+        # M2-3：引擎收敛点传入 HandleStore（取 snapshot 查表）；
+        # 公共符号保持 Mapping 兼容（老用法 dict / {} 不变）
+        self.handles = as_mapping(handles)
         self.env = os.environ if env is None else env
 
     # ------------------------------------------------------------------ #

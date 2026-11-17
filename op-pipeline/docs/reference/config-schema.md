@@ -16,7 +16,7 @@
 | `params` | object | `{}` | 流水线参数；可被 `--param` 覆盖；值中可用 `${env.X}` |
 | `nodes` | array | 必填 | 节点列表，**顺序无关**（执行由引用推导的依赖决定） |
 | `outputs` | object | `{}` | 流水线对外产物：名字 → `${...}` 引用 |
-| `defaults` | object | `{}` | 节点运行策略缺省值（M1-5 起生效）：可用键 `retries/retry_delay/timeout/cache/allow_failure`，未知键报错；节点显式值优先 |
+| `defaults` | object | `{}` | 节点运行策略缺省值（M1-5 起生效）：可用键 `retries/retry_delay/timeout/cache/allow_failure/executor`，未知键报错；节点显式值优先 |
 
 ---
 
@@ -32,9 +32,10 @@
 | `when` | str | 无 | 布尔表达式，为假则跳过（下游连带跳过） |
 | `retries` | int | `0` | 失败重试次数（总尝试 = retries + 1） |
 | `retry_delay` | float | `0.0` | 退避基数：第 n 次重试前等待 `retry_delay * 2^(n-1)` 秒 |
-| `timeout` | float | 无（`0` 视为无） | 秒级**软超时**，到点标记失败但线程不会被强杀 |
+| `timeout` | float | 无（`0` 视为无） | 秒级超时：线程模式为**软超时**（到点标记失败、不强杀）；`executor="process"` 时为**硬超时**（terminate 子进程） |
 | `cache` | bool | `false` | 是否参与内容指纹缓存（算子须 `deterministic`） |
 | `allow_failure` | bool | `false` | 失败不视为硬失败；报告为 `partial`，下游仍因缺输入跳过 |
+| `executor` | `"thread"` / `"process"` | 无（先继承运行级，最终 `thread`） | 执行器选择（M2-2）：`process` 时算子在子进程执行（载荷须可 pickle，超时为硬超时）；未指定时沿用 `run(executor=...)` / CLI `--executor` |
 | `description` | str | `""` | 备注（不参与执行） |
 
 ---

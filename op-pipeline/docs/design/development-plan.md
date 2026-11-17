@@ -110,6 +110,38 @@
 | M2-7 | 执行事件钩子：`Engine(hooks=[Hook])`，Hook 协议 `on_node_start(node_id, op)`、`on_node_finish(node_id, status, duration, cached)`、`on_run_finish(report)` | [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) `_run_node/_collect/run` | 单测：钩子按调度顺序收到事件；失败节点也触发 `on_node_finish`；文档给出进度条示例 |
 | M2-8 | async 宿主嵌入：新增 `run_pipeline_async(...)`（以 `loop.run_in_executor` 包装同步引擎；缺口：`run_pipeline` 是同步阻塞函数，在 async 宿主内调用会卡死事件循环），文档说明它与全 asyncio 调度器的区别（后者不在本里程碑范围） | [__init__.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/__init__.py)、[engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) | 单测：在运行中的事件循环内 `await run_pipeline_async(...)` 得到正确报告；流水线运行期间同循环的其它 asyncio 任务可推进（证明未阻塞） |
 
+> **状态**：M2-1 已完成（2026-11-17，TDD 红→绿一轮，69 个用例全绿，**行为零变化**——
+> 66 个既有用例含 `test_parallel_speed` 不改断言通过，两个示例端到端正常）。
+> `Executor` 协议（`submit`/`wait(first_completed=)`/`shutdown`）与 `ThreadExecutor`
+> 落在 [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py)
+> 并从包顶层导出；主循环改经 `pool.wait(running, first_completed=True)` 收集结果；
+> [扩展设计 §4.2](extension-points.md#42-替换执行器) 已更新为稳定扩展点。
+> 下一步 M2-2：`ProcessExecutor`（硬超时，消除 T8）。
+
+> **状态**：M2-2 已完成（2026-11-17，TDD 红→绿一轮，82 个用例全绿；两示例 +
+> orders `--executor process` 端到端通过）。`ProcessExecutor` 落在
+> [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py)
+> 并从包顶层导出：每任务一个 `spawn` 子进程 + 管道回传，`submit` 先 `pickle.dumps`
+> （序列化结果直传子进程，不做二次序列化），不可 pickle 回退线程执行并记
+> `report.warnings` 告警；`wait` 内 deadline 到点 `terminate()`——**硬超时**，T8 出债。
+> **有意偏离"ProcessPoolExecutor 实现"**：它无法强杀单个任务，terminate worker 会把
+> 整池打成 `BrokenProcessPool` 殃及其它节点。节点字段 `executor` 进 `defaults` 策略键；
+> `run(..., executor=)` 与 CLI `--executor {thread,process}` 提供运行级缺省
+> （节点显式值优先）。CPU 并行验收改用"扇出 vs 串行链"对比（阈值 0.8，
+> 计算量校准至压过子进程 spawn 成本，抗杀软串行化噪声）。
+> 下一步 M2-3：HandleStore 接口。
+
+> **状态**：M2-3 已完成（2026-11-17，TDD 红→绿，87 个用例全绿，**行为零变化**——
+> 82 个既有用例不改断言通过，两示例端到端正常）。`HandleStore` 协议
+> （`get`/`put`/`snapshot`/`items`）与 `InMemoryHandleStore`（RLock + dict）落在
+> [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py)
+> 并从包顶层导出；写收敛在 `_publish → store.put`，读收敛在
+> `RefResolver._lookup`（`as_mapping` 同时接受 store 与 Mapping，公共符号向后兼容）；
+> `Engine(handle_store=...)` 支持注入自定义实现（`run_pipeline` 透传与 M2-4
+> SpillHandleStore 一起收口）。TDD 顺带纠正了两处对 `RefResolver` 查表语义
+> （`p.` 前缀整键路由、下钻仅在句柄上）的测试误写。
+> 下一步 M2-4：SpillHandleStore（超阈值落盘）。
+
 **M2 完成定义（DoD）**：全部现有测试不改断言通过；新增 Executor/HandleStore/RunStore 单测；
 `--executor process` + `--resume` 各有一个端到端示例；`run_pipeline_async` 有 async 宿主单测与文档示例；[运行时语义](../architecture/runtime-semantics.md)
 新增"执行器/续跑"两节。

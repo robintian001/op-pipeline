@@ -265,19 +265,68 @@ NodeContext（由 for_node 创建）
 
 ---
 
-## 8. graph.py / cli.py：外围
+## 8. executor.py：执行器抽象（M2-1 / M2-2）
 
-### 8.1 graph
+```python
+Executor (Protocol, runtime_checkable)
+  submit(fn, /, *args) -> Future
+  wait(futures, *, first_completed=True) -> set[Future]
+  shutdown()
+
+ThreadExecutor(max_workers=None)   # 默认实现，支持 with 语句
+ProcessExecutor(on_fallback=None)  # M2-2：每任务一个 spawn 子进程
+  submit(fn, /, *args, timeout=None)
+```
+
+- `ThreadExecutor` 平移 M2-1 之前的 `ThreadPoolExecutor + wait(FIRST_COMPLETED)` 行为，
+  `Engine` 主循环只依赖协议（经 `pool.wait(running, first_completed=True)` 收集完成节点）；
+- `wait(first_completed=True)` 的语义必须保持：主循环靠"任一节点完成即回收"事件驱动推进，
+  换成"全部完成"会让先就绪的宽依赖节点空等最慢分支；
+- `ProcessExecutor`（M2-2）实现**硬超时**：载荷先 `pickle.dumps`（序列化结果直传
+  子进程），`wait` 内 deadline 到点 `terminate()`；不可 pickle 回退线程执行
+  （软超时）并经 `on_fallback` 记告警。刻意不用 `ProcessPoolExecutor`——无法
+  强杀单个任务，terminate worker 会殃及同池其它节点（BrokenProcessPool）；
+- 自定义实现的注意点见 [扩展设计 §4.2](extension-points.md#42-替换执行器)。
+
+---
+
+## 9. handlestore.py：句柄存储抽象（M2-3）
+
+```python
+HandleStore (Protocol, runtime_checkable)
+  get(name) -> Any            # 缺失抛 KeyError（RefResolver 转成 RefResolutionError）
+  put(name, value)            # 须线程安全
+  snapshot() -> Mapping       # 一次性浅拷贝视图
+  items() -> list[tuple]
+
+InMemoryHandleStore()        # 默认实现：RLock + dict（平移原 Engine.handles 行为）
+as_mapping(store_or_mapping) # 归一辅助：store 取 snapshot，Mapping 原样返回
+```
+
+- 写收敛在 `Engine._publish` → `store.put`；读收敛在 `RefResolver._lookup`
+  （构造时经 `as_mapping` 拍快照；公共符号保持 Mapping 兼容）；
+- 快照语义与原 `dict(self.handles)` 等价：节点开始时固定可见句柄集，
+  避免解析期间读到并发发布的新句柄；
+- 自定义实现（M2-4 将提供超阈值落盘的 `SpillHandleStore`）注意三点：
+  `snapshot()` 返回一次性视图、`put()` 线程安全、`get()` 缺失抛 KeyError；
+  引擎经 `Engine(handle_store=...)` 注入。
+
+---
+
+## 10. graph.py / cli.py：外围
+
+### 10.1 graph
 
 三种渲染：`to_mermaid`（`flowchart LR`，缓存节点加 class）、`to_dot`（Graphviz）、
 `to_ascii`（编号 + 依赖 + 运行策略标记）。
-`to_mermaid` 中 `style` 变量只写不读（[graph.py#L15-L22](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/graph.py#L15-L22)），属于无害死代码。
+`to_mermaid` 的 `style` 死变量已在 M1-6 一并清除。
 
-### 8.2 cli
+### 10.2 cli
 
 ```
 op_pipeline run      <config> [--workdir] [--workers] [--cache-dir] [--no-cache]
-                              [--fail-fast] [--dry-run] [--json PATH] [--plugin P] [--param K=V]
+                              [--fail-fast] [--dry-run] [--executor thread|process]
+                              [--json PATH] [--plugin P] [--param K=V]
 op_pipeline validate <config>
 op_pipeline graph    <config> --format mermaid|dot|ascii
 op_pipeline ops      [--json]
@@ -286,12 +335,14 @@ op_pipeline describe <op_name>
 
 - `--param` 取值先尝试 `json.loads`，失败再判断 `true/false`，否则按字符串
   （因此 `--param n=3` 得到 int，`--param name=abc` 得到 str）；
-- `--dry-run` 打印 ASCII 计划后返回 0，不执行任何节点（注意：运行上下文与产物目录在此之前已创建）；
+- `--dry-run` 打印 ASCII 计划后返回 0，不执行任何节点、不建产物与缓存目录（M1-9 起提前分支）；
+- `--executor process`（M2-2）为运行级执行器缺省：未显式指定 `executor` 的节点
+  在子进程执行（硬超时）；节点显式值优先；
 - 插件在**解析配置之后、编译之前**加载，因此插件注册的算子可被编译期识别。
 
 ---
 
-## 9. ops/：内置算子库的组织约定
+## 11. ops/：内置算子库的组织约定
 
 | 文件 | 分组 | 算子数 |
 | --- | --- | --- |

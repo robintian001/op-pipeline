@@ -78,7 +78,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     cache_store = CacheStore(
         None if args.no_cache else args.cache_dir, base_dir=workdir
     )
-    engine = Engine(plan, context, cache_store=cache_store, max_workers=args.workers, fail_fast=args.fail_fast)
+    engine = Engine(plan, context, cache_store=cache_store, max_workers=args.workers,
+                    fail_fast=args.fail_fast, executor=args.executor)
 
     report = engine.run()
     print(report.summary())
@@ -149,6 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--no-cache", action="store_true", help="关闭缓存")
     run.add_argument("--fail-fast", action="store_true", help="任一节点失败即停止调度新节点")
+    run.add_argument(
+        "--executor", choices=("thread", "process"), default=None,
+        help="运行级执行器：process 时未显式指定的节点在子进程执行（硬超时）",
+    )
     run.add_argument("--dry-run", action="store_true", help="只打印执行计划不执行")
     run.add_argument("--json", default=None, help="把运行报告写成 JSON")
     run.set_defaults(func=cmd_run)

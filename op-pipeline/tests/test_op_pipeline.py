@@ -1126,5 +1126,536 @@ class DryRunNoSideEffectsTest(unittest.TestCase):
             self.assertTrue(required <= set(item), f"{item.get('name')} 缺少契约字段")
 
 
+class ExecutorContractTest(unittest.TestCase):
+    """M2-1：Executor 接口契约——Engine 的执行器扩展点。"""
+
+    def test_thread_executor_satisfies_protocol(self):
+        from op_pipeline.executor import Executor, ThreadExecutor
+
+        ex = ThreadExecutor(max_workers=2)
+        with ex:  # __enter__/__exit__ 必须可用（Engine 用 with 驱动）
+            self.assertIsInstance(ex, Executor, "ThreadExecutor 应满足 Executor 协议")
+
+    def test_submit_wait_first_completed(self):
+        import time as _time
+
+        from op_pipeline.executor import ThreadExecutor
+
+        with ThreadExecutor(max_workers=4) as ex:
+            started = _time.monotonic()
+            futures = {ex.submit(_time.sleep, 0.05) for _ in range(4)}
+            # first_completed=True 时 wait 应在约 0.05s 返回（不是等全部）
+            done = ex.wait(futures, first_completed=True)
+            elapsed = _time.monotonic() - started
+            self.assertLess(elapsed, 0.15, "first_completed 应在首个完成即返回")
+            self.assertTrue(done)
+            rest = futures - done
+            if rest:
+                all_done = ex.wait(rest, first_completed=False)
+                self.assertEqual(rest, all_done, "first_completed=False 应等到全部")
+
+    def test_shutdown_rejects_new_submits(self):
+        from op_pipeline.executor import ThreadExecutor
+
+        ex = ThreadExecutor(max_workers=1)
+        ex.shutdown()
+        with self.assertRaises(RuntimeError):
+            ex.submit(sum, [1, 2])
+
+
+# --------------------------------------------------------------------------- #
+# M2-2：进程执行器测试（算子与辅助函数必须模块级——子进程按引用反序列化）
+# --------------------------------------------------------------------------- #
+@op("testkit.pid", replace=True)
+class PidOp(Operator):
+    inputs = [("value", object)]
+    outputs = [("value", int)]
+
+    def run(self, ctx, value):
+        return {"value": os.getpid()}
+
+
+@op("testkit.spin", replace=True)
+class SpinOp(Operator):
+    inputs = [("value", object)]
+    outputs = [("value", object)]
+    params = {"seconds": Param(float, default=30.0, minimum=0.0)}
+
+    def run(self, ctx, value, seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:  # 忙等：硬超时的靶子
+            pass
+        return {"value": value}
+
+
+@op("testkit.cpu_burn", replace=True)
+class CpuBurnOp(Operator):
+    inputs = [("value", object)]
+    outputs = [("value", int)]
+
+    def run(self, ctx, value):
+        # 计算量须显著大于子进程 spawn 成本（Windows 上约 1s），
+        # 否则 spawn 串行化会淹没并行收益（见 M2-2 测试注记）
+        return {"value": sum(i * i for i in range(16_000_000))}
+
+
+@op("testkit.echo", replace=True)
+class EchoOp(Operator):
+    inputs = [("value", object)]
+    outputs = [("value", object)]
+
+    def run(self, ctx, value):
+        return {"value": value}
+
+
+@op("testkit.make_lambda", replace=True)
+class LambdaOutOp(Operator):
+    outputs = [("value", object)]
+
+    def run(self, ctx):
+        return {"value": lambda x: x + 1}
+
+
+def _spin(seconds: float) -> str:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        pass
+    return "done"
+
+
+def _add(a, b):
+    return a + b
+
+
+def _boom():
+    raise ValueError("child-boom")
+
+
+class ProcessExecutorContractTest(unittest.TestCase):
+    """M2-2：ProcessExecutor——每任务一进程、硬超时 terminate、不可 pickle 回退线程。"""
+
+    def _executor(self, **kw):
+        from op_pipeline.executor import ProcessExecutor
+
+        return ProcessExecutor(**kw)
+
+    def test_satisfies_protocol(self):
+        from op_pipeline.executor import Executor
+
+        ex = self._executor()
+        try:
+            self.assertIsInstance(ex, Executor, "ProcessExecutor 应满足 Executor 协议")
+        finally:
+            ex.shutdown()
+
+    def test_roundtrip_and_first_completed(self):
+        with self._executor() as ex:
+            slow = ex.submit(_spin, 0.3)
+            fast = ex.submit(_add, 1, 2)
+            done = ex.wait({slow, fast}, first_completed=True)
+            self.assertEqual({fast}, done, "first_completed 应只返回先完成的快任务")
+            self.assertEqual(fast.result(), 3)
+            self.assertEqual(ex.wait({slow}, first_completed=False), {slow})
+            self.assertEqual(slow.result(), "done")
+
+    def test_hard_timeout_terminates_child(self):
+        with self._executor() as ex:
+            started = time.monotonic()
+            task = ex.submit(_spin, 30.0, timeout=0.5)
+            done = ex.wait({task}, first_completed=False)
+            elapsed = time.monotonic() - started
+            self.assertIn(task, done)
+            self.assertLess(elapsed, 3.0, "到点必须 terminate 子进程，而不是等它跑满 30s")
+            exc = task.exception()
+            self.assertIsNotNone(exc)
+            self.assertIn("硬超时", str(exc))
+
+    def test_child_exception_roundtrips(self):
+        with self._executor() as ex:
+            task = ex.submit(_boom)
+            ex.wait({task}, first_completed=False)
+            exc = task.exception()
+            self.assertIsNotNone(exc)
+            self.assertIn("child-boom", str(exc))
+
+    def test_unpicklable_falls_back_with_warning(self):
+        notes: list[str] = []
+        with self._executor(on_fallback=notes.append) as ex:
+            task = ex.submit(lambda: "via-thread")
+            ex.wait({task}, first_completed=False)
+            self.assertEqual(task.result(), "via-thread")
+        self.assertTrue(notes, "不可 pickle 应触发 on_fallback 告警")
+        self.assertIn("pickle", notes[0])
+
+
+class ProcessNodeTest(unittest.TestCase):
+    """M2-2：节点级/运行级 executor="process" 的引擎语义。"""
+
+    def _run(self, nodes, params=None, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            return run_pipeline(
+                spec_of(nodes, params=params), registry=default_registry,
+                workdir=tmp, cache_dir=None, max_workers=kw.pop("max_workers", 4), **kw,
+            )
+
+    def test_node_executor_process_runs_in_child(self):
+        report, values = self._run([
+            {"id": "src", "op": "control.const", "params": {"value": 1}},
+            {"id": "pid", "op": "testkit.pid", "inputs": {"value": "${src.value}"},
+             "executor": "process"},
+        ])
+        self.assertEqual(report.status, "success")
+        self.assertNotEqual(values["pid.value"], os.getpid(), "节点应运行在子进程")
+
+    def test_run_level_executor_process(self):
+        report, values = self._run([
+            {"id": "src", "op": "control.const", "params": {"value": 1}},
+            {"id": "pid", "op": "testkit.pid", "inputs": {"value": "${src.value}"}},
+        ], executor="process")
+        self.assertEqual(report.status, "success")
+        self.assertNotEqual(values["pid.value"], os.getpid(), "运行级 --executor 应作用于未显式指定的节点")
+
+    def test_hard_timeout_node_fails_fast(self):
+        report, _ = self._run([
+            {"id": "src", "op": "control.const", "params": {"value": 1}},
+            {"id": "spin", "op": "testkit.spin", "inputs": {"value": "${src.value}"},
+             "executor": "process", "timeout": 0.5},
+        ])
+        self.assertEqual(report.node("spin").status, "failed")
+        self.assertIn("硬超时", report.node("spin").error)
+        self.assertLess(report.duration, 3.0, "死循环节点应被 terminate 而非拖满 30s")
+        self.assertEqual(report.status, "failed")
+
+    def test_cpu_parallel_speed(self):
+        src = {"id": "src", "op": "control.const", "params": {"value": 1}}
+        fan = [src] + [
+            {"id": f"b{i}", "op": "testkit.cpu_burn",
+             "inputs": {"value": "${src.value}"}, "executor": "process"}
+            for i in range(4)
+        ]
+        chain = [dict(src)]
+        prev = "src"
+        for i in range(4):
+            chain.append({"id": f"c{i}", "op": "testkit.cpu_burn",
+                          "inputs": {"value": f"${{{prev}.value}}"}, "executor": "process"})
+            prev = f"c{i}"
+        report_fan, _ = self._run(fan)
+        report_chain, _ = self._run(chain)
+        self.assertEqual(report_fan.status, "success")
+        self.assertEqual(report_chain.status, "success")
+        # 串行链与扇出各自承担相同的 spawn 成本；差异只来自计算并行度。
+        # 阈值 0.8：即便 spawn 被环境（杀软扫描）串行化拉长，计算收益也应兑现。
+        self.assertLess(
+            report_fan.duration, report_chain.duration * 0.8,
+            f"4 并行进程节点({report_fan.duration:.2f}s)应显著低于串行链({report_chain.duration:.2f}s)",
+        )
+
+    def test_unpicklable_fallback_warns(self):
+        report, _ = self._run([
+            {"id": "src", "op": "testkit.make_lambda"},
+            {"id": "echo", "op": "testkit.echo", "inputs": {"value": "${src.value}"},
+             "executor": "process"},
+        ])
+        self.assertEqual(report.status, "success", "不可 pickle 应回退线程执行，节点不失败")
+        self.assertTrue(any("回退" in w for w in report.warnings),
+                        f"应记录回退告警：{report.warnings}")
+
+    def test_executor_field_validation(self):
+        with self.assertRaises(ConfigError):
+            spec_of([{"id": "x", "op": "control.const", "executor": "oops"}])
+
+    def test_defaults_executor_merge(self):
+        spec = PipelineSpec.from_dict({
+            "name": "t",
+            "defaults": {"executor": "process"},
+            "nodes": [
+                {"id": "x", "op": "control.const", "params": {"value": 1}},
+                {"id": "y", "op": "control.const", "executor": "thread",
+                 "params": {"value": 2}},
+            ],
+        })
+        self.assertEqual(spec.nodes[0].executor, "process", "未显式指定应继承 defaults")
+        self.assertEqual(spec.nodes[1].executor, "thread", "节点显式值优先")
+
+    def test_cli_executor_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "mini.json"
+            cfg.write_text(json.dumps({
+                "name": "mini",
+                "nodes": [{"id": "n", "op": "control.const", "params": {"value": 1}}],
+            }), encoding="utf-8")
+            proc = DryRunNoSideEffectsTest._run_cli(
+                "run", str(cfg), "--executor", "process", "--no-cache", cwd=str(ROOT)
+            )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("success", proc.stdout)
+
+
+# --------------------------------------------------------------------------- #
+# M2-3：句柄存取抽象
+# --------------------------------------------------------------------------- #
+class HandleStoreTest(unittest.TestCase):
+    """M2-3：HandleStore 协议契约 + InMemoryHandleStore 平移行为 + 引擎注入。"""
+
+    def _store(self):
+        from op_pipeline.handlestore import InMemoryHandleStore
+
+        return InMemoryHandleStore()
+
+    def test_protocol_and_roundtrip(self):
+        from op_pipeline.handlestore import HandleStore
+        from op_pipeline import HandleStore as Exported, InMemoryHandleStore
+
+        store = self._store()
+        self.assertIsInstance(store, HandleStore, "InMemoryHandleStore 应满足协议")
+        self.assertIs(Exported, HandleStore, "协议应从包顶层导出")
+        store.put("a.value", 1)
+        self.assertEqual(store.get("a.value"), 1)
+        with self.assertRaises(KeyError):
+            store.get("missing")
+
+    def test_snapshot_isolates_concurrent_writes(self):
+        store = self._store()
+        store.put("a", [1, 2])
+        snap = store.snapshot()
+        store.put("b", 3)
+        self.assertEqual(snap, {"a": [1, 2]}, "已取快照不受后续写入影响")
+        self.assertEqual(dict(store.snapshot()), {"a": [1, 2], "b": 3})
+        self.assertEqual(store.items(), [("a", [1, 2]), ("b", 3)])
+
+    def test_thread_safety(self):
+        store = self._store()
+        errors: list[Exception] = []
+
+        def writer(prefix: str):
+            try:
+                for i in range(100):
+                    store.put(f"{prefix}{i}", i)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(f"t{t}.",)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertFalse(errors)
+        self.assertEqual(len(store.items()), 400)
+
+    def test_ref_resolver_accepts_store(self):
+        from op_pipeline.spec import RefResolver
+
+        store = self._store()
+        store.put("src.value", {"x": 10})
+        resolver = RefResolver({"n": 5}, store)
+        self.assertEqual(resolver.resolve("${p.n}"), 5, "p. 前缀应查 params['n']")
+        self.assertEqual(resolver.resolve("${src.value.x}"), 10, "store 应支持句柄下钻解析")
+        mirror = RefResolver({"n": 5}, {"src.value": {"x": 10}})
+        self.assertEqual(mirror.resolve("${src.value.x}"), 10, "Mapping 用法保持兼容")
+
+    def test_engine_accepts_custom_store(self):
+        from op_pipeline.handlestore import InMemoryHandleStore
+
+        store = InMemoryHandleStore()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = build_plan(
+                spec_of([{"id": "src", "op": "control.const", "params": {"value": 42}}]),
+                default_registry,
+            )
+            context = RunContext.create(pipeline="t", params={}, workdir=tmp)
+            engine = Engine(plan, context, handle_store=store)
+            report = engine.run()
+        self.assertEqual(report.status, "success")
+        self.assertEqual(store.get("src.value"), 42, "节点输出应写入注入的 store")
+
+
+# --------------------------------------------------------------------------- #
+# M2-4：超阈值落盘的句柄存储（SpillHandleStore）
+# --------------------------------------------------------------------------- #
+@op("m24.big_table")
+class M24BigTableOp(Operator):
+    """产出大表（list[int]）的测试算子；n 够大时输出会超过落盘阈值。"""
+
+    outputs = [("rows", list)]
+    params = {"n": Param(int, default=10)}
+
+    def run(self, ctx, n):
+        return {"rows": list(range(n))}
+
+
+@op("m24.sum_two")
+class M24SumTwoOp(Operator):
+    """把两张表求和，验证落盘句柄能被下游整键引用并按需加载。"""
+
+    inputs = [("a", list), ("b", list)]
+    outputs = [("total", int)]
+
+    def run(self, ctx, a, b):
+        return sum(a) + sum(b)
+
+
+class SpillHandleStoreTest(unittest.TestCase):
+    """M2-4：SpillHandleStore 超阈值落盘、按需加载、引擎注入与收口。"""
+
+    def _store(self, **kwargs):
+        from op_pipeline.handlestore import SpillHandleStore
+
+        return SpillHandleStore(**kwargs)
+
+    @staticmethod
+    def _spill_files(store):
+        return list(store.spill_dir.glob("*.pkl")) if store.spill_dir else []
+
+    def test_protocol_and_export(self):
+        from op_pipeline.handlestore import HandleStore, SpillHandleStore as ModuleSpill
+        from op_pipeline import HandleStore as ExportedStore, SpillHandleStore
+
+        store = self._store()
+        self.assertIsInstance(store, HandleStore, "SpillHandleStore 应满足协议")
+        self.assertIs(ExportedStore, HandleStore, "HandleStore 应从包顶层导出")
+        self.assertIs(SpillHandleStore, ModuleSpill, "SpillHandleStore 应从包顶层导出")
+
+    def test_small_values_stay_in_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(threshold=1_000_000, spill_dir=tmp)
+            store.put("a.value", {"x": 1})
+            store.put("b", "小字符串")
+            self.assertEqual(self._spill_files(store), [], "小值不应产生落盘文件")
+            self.assertEqual(store.get("a.value"), {"x": 1})
+            self.assertEqual(store.get("b"), "小字符串")
+            self.assertEqual(dict(store.snapshot()), {"a.value": {"x": 1}, "b": "小字符串"})
+
+    def test_large_value_spills_to_disk(self):
+        big = list(range(2000))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(threshold=64, spill_dir=tmp)
+            store.put("big.rows", big)
+            files = self._spill_files(store)
+            self.assertEqual(len(files), 1, "超阈值值应落盘为单个 pkl 文件")
+            self.assertEqual(store.get("big.rows"), big, "落盘值按需加载应还原等值对象")
+            snap = store.snapshot()
+            self.assertEqual(snap["big.rows"], big, "快照按键访问应加载等值对象")
+            self.assertEqual(store.items(), [("big.rows", big)])
+            with self.assertRaises(KeyError):
+                store.get("missing")
+
+    def test_snapshot_membership_skips_disk(self):
+        # 惰性快照的核心承诺：`in` / len / 迭代 不触发磁盘加载
+        big = list(range(2000))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(threshold=64, spill_dir=tmp)
+            store.put("big.rows", big)
+            snap = store.snapshot()
+            for path in self._spill_files(store):
+                path.unlink()
+            self.assertIn("big.rows", snap, "成员检查不应读盘（文件已删仍应为真）")
+            self.assertEqual(len(snap), 1)
+            self.assertEqual(list(snap), ["big.rows"])
+            with self.assertRaises(FileNotFoundError):
+                snap["big.rows"]  # noqa: B018  按键访问应触发读盘并如实报错
+
+    def test_unpickleable_value_falls_back_to_memory(self):
+        sentinel = lambda: None  # noqa: E731  lambda 不可 pickle
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(threshold=64, spill_dir=tmp)
+            with self.assertLogs("op_pipeline", level="WARNING") as caught:
+                store.put("fn", sentinel)
+            self.assertIn("不可 pickle", "\n".join(caught.output))
+            self.assertIs(store.get("fn"), sentinel, "不可 pickle 值应原对象留在内存")
+            self.assertEqual(self._spill_files(store), [])
+
+    def test_large_value_without_dir_falls_back_to_memory(self):
+        big = list(range(2000))
+        store = self._store(threshold=64)
+        with self.assertLogs("op_pipeline", level="WARNING") as caught:
+            store.put("big.rows", big)
+        self.assertIn("落盘目录", "\n".join(caught.output))
+        self.assertEqual(store.get("big.rows"), big, "无目录时应退化为内存保留")
+        self.assertEqual(dict(store.snapshot()), {"big.rows": big})
+
+    def test_engine_attaches_spill_dir_to_artifacts(self):
+        store = self._store(threshold=64)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = build_plan(
+                spec_of([{"id": "src", "op": "m24.big_table", "params": {"n": 2000}}]),
+                default_registry,
+            )
+            context = RunContext.create(pipeline="t", params={}, workdir=tmp)
+            engine = Engine(plan, context, handle_store=store)
+            report = engine.run()
+            self.assertEqual(report.status, "success")
+            self.assertEqual(
+                store.spill_dir, context.artifacts_dir / "spill",
+                "未显式指定目录时应挂到本次运行的 artifacts_dir 下",
+            )
+            self.assertEqual(len(self._spill_files(store)), 1, "大表输出应落盘")
+            self.assertEqual(store.get("src.rows")[:3], [0, 1, 2])
+
+    def test_two_large_tables_pipeline_end_to_end(self):
+        # 验收：两个大表节点 + 汇总节点，落盘与整键引用下结果一致；可复跑
+        spec = spec_of(
+            [
+                {"id": "big1", "op": "m24.big_table", "params": {"n": 5000}},
+                {"id": "big2", "op": "m24.big_table", "params": {"n": 4000}},
+                {
+                    "id": "join",
+                    "op": "m24.sum_two",
+                    "inputs": {"a": "${big1.rows}", "b": "${big2.rows}"},
+                },
+            ],
+            outputs={"total": "${join.total}"},
+        )
+        expected = 5000 * 4999 // 2 + 4000 * 3999 // 2
+        with tempfile.TemporaryDirectory() as tmp:
+            for _round in (1, 2):  # 可复跑：同一 workdir 两次运行各自成功
+                store = self._store(threshold=100)
+                report, values = run_pipeline(
+                    spec, registry=default_registry, workdir=tmp, handle_store=store
+                )
+                self.assertEqual(report.status, "success")
+                self.assertEqual(values["join.total"], expected, "落盘句柄经下游求和应与内存一致")
+                self.assertEqual(values["big1.rows"][:3], [0, 1, 2])
+                self.assertGreaterEqual(
+                    len(self._spill_files(store)), 2, "两个大表句柄都应落盘"
+                )
+
+    def test_run_toplevel_passes_handle_store(self):
+        store = self._store()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "pipeline.toml"
+            cfg.write_text(
+                'name = "m24"\n'
+                "[[nodes]]\n"
+                'id = "src"\n'
+                'op = "control.const"\n'
+                "[nodes.params]\n"
+                "value = 7\n",
+                encoding="utf-8",
+            )
+            _report, values = run(str(cfg), handle_store=store)
+        self.assertEqual(values["src.value"], 7, "顶层 run() 应透传 handle_store")
+
+    def test_concurrent_puts(self):
+        errors: list[Exception] = []
+
+        def writer(tid: int):
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    store = self._store(threshold=64, spill_dir=tmp)
+                    for i in range(50):
+                        store.put(f"t{tid}.r{i}", list(range(100)))
+                    for i in range(50):
+                        assert store.get(f"t{tid}.r{i}") == list(range(100))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], "并发写读不应有异常")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

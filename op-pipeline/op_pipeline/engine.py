@@ -21,7 +21,7 @@ import os
 import threading
 import time
 import traceback
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -29,7 +29,9 @@ from typing import Any, Mapping
 from .cache import CacheStore
 from .context import RunContext
 from .errors import ConfigError, RefResolutionError
+from .executor import Executor, ProcessExecutor, ThreadExecutor, _child_run_op
 from .expression import evaluate_condition
+from .handlestore import HandleStore, InMemoryHandleStore
 from .spec import Plan, PlanNode, RefResolver, check_handle_types
 
 log = logging.getLogger("op_pipeline.engine")
@@ -181,7 +183,7 @@ class RunReport:
 class Engine:
     """执行一个 :class:`~op_pipeline.spec.Plan`。
 
-    一个 Engine 实例只负责一次运行（句柄表挂在实例上），
+    一个 Engine 实例只负责一次运行（句柄存储挂在实例上），
     需要重跑请新建 Engine，否则会复用上一次的中间结果。
     """
 
@@ -194,14 +196,19 @@ class Engine:
         max_workers: int | None = None,
         fail_fast: bool = False,
         cancel_event: threading.Event | None = None,
+        executor: str | None = None,
+        handle_store: HandleStore | None = None,
     ) -> None:
+        if executor not in (None, "thread", "process"):
+            raise ConfigError(f"executor 只能是 thread/process，实际是 {executor!r}")
         self.plan = plan
         self.context = context
         self.cache = cache_store or CacheStore(None)
         self.max_workers = max_workers or min(8, max(1, (os.cpu_count() or 2)))
         self.fail_fast = fail_fast
 
-        self.handles: dict[str, Any] = {}
+        # M2-3：句柄存储抽象——写收敛在 _publish(put)，读收敛在 RefResolver(snapshot)
+        self.store: HandleStore = handle_store or InMemoryHandleStore()
         self._lock = threading.Lock()
         self._results: dict[str, NodeResult] = {}
         self._completed: dict[str, str] = {}
@@ -211,6 +218,20 @@ class Engine:
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._cancel_reason = "cancel_event 被置位"
         self._cancel_announced = False
+        # 运行级执行器缺省（M2-2）：节点显式 executor 优先，其次运行级，最后 thread。
+        # 进程池只在"有进程节点"时创建：纯线程运行保持零进程开销与行为零变化。
+        self.default_executor = executor
+        need_process = executor == "process" or any(
+            node.spec.executor == "process" for node in plan.nodes
+        )
+        self._process_pool = (
+            ProcessExecutor(on_fallback=self._warnings.append) if need_process else None
+        )
+        # M2-4：落盘型句柄存储（如 SpillHandleStore）实现 attach(context) 时，
+        # 由引擎把落盘目录挂到本次运行的 artifacts_dir 下；普通实现无此钩子。
+        attach = getattr(self.store, "attach", None)
+        if callable(attach):
+            attach(context)
 
     def cancel(self, reason: str = "调用方请求取消") -> None:
         """请求取消本次运行（线程安全，可从其它线程调用）。
@@ -244,11 +265,11 @@ class Engine:
         pending = list(self.plan.order)
         running: dict[Future, str] = {}
 
-        with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="op") as pool:
+        with ThreadExecutor(max_workers=self.max_workers) as pool:
             while pending or running:
                 progressed = self._dispatch(pending, running, pool)
                 if running:
-                    done, _ = wait(list(running), return_when=FIRST_COMPLETED)
+                    done = pool.wait(running, first_completed=True)
                     for future in done:
                         node_id = running.pop(future)
                         self._collect(node_id, future)
@@ -260,6 +281,9 @@ class Engine:
                         self._mark_skipped(node_id, "依赖无法满足（上游未执行或已跳过）")
                     pending.clear()
 
+        if self._process_pool is not None:
+            self._process_pool.shutdown()
+
         # 汇总
         for node_id in self.plan.order:
             if node_id in self._results:
@@ -267,7 +291,7 @@ class Engine:
 
         for name, ref in self.plan.pipeline_outputs.items():
             try:
-                report.outputs[name] = RefResolver(self.plan.params, self.handles).resolve(ref)
+                report.outputs[name] = RefResolver(self.plan.params, self.store).resolve(ref)
             except RefResolutionError as exc:
                 report.warnings.append(f"输出 '{name}' 无法解析：{exc}")
 
@@ -283,7 +307,7 @@ class Engine:
             report.status = SUCCESS
 
         # 汇总阶段：端口软类型告警（值照常传递，只提示不符；缺失的句柄天然跳过）
-        self._warnings.extend(check_handle_types(self.plan, self.handles))
+        self._warnings.extend(check_handle_types(self.plan, self.store.snapshot()))
         report.warnings.extend(self._warnings)
         report.finished_at = time.time()
         self.context.logger.info(
@@ -304,7 +328,7 @@ class Engine:
         self,
         pending: list[str],
         running: dict[Future, str],
-        pool: ThreadPoolExecutor,
+        pool: Executor,
     ) -> bool:
         progressed = False
         if self._cancel_event.is_set():
@@ -361,7 +385,7 @@ class Engine:
         return progressed
 
     def _eval_when(self, node: PlanNode) -> bool:
-        resolver = RefResolver(self.plan.params, self.handles)
+        resolver = RefResolver(self.plan.params, self.store)
         env: dict[str, Any] = {}
         for port, ref in node.spec.inputs.items():
             try:
@@ -405,8 +429,9 @@ class Engine:
     def _run_node(self, node: PlanNode) -> NodeResult:
         ctx = self.context.for_node(node.spec.id, node.spec.op)
         result = NodeResult(node_id=node.spec.id, op=node.spec.op, started_at=time.time())
-        handles_snapshot = dict(self.handles)
-        resolver = RefResolver(self.plan.params, handles_snapshot)
+        # M2-3：RefResolver 构造时经 store.snapshot() 拍快照，
+        # 与原 dict(self.handles) 行为等价（节点开始时的可见句柄集）
+        resolver = RefResolver(self.plan.params, self.store)
 
         try:
             inputs = {
@@ -467,11 +492,11 @@ class Engine:
         return result
 
     def _publish(self, node: PlanNode, outputs: Mapping[str, Any]) -> None:
-        with self._lock:
-            for port, value in outputs.items():
-                handle = node.handles.get(port)
-                if handle:
-                    self.handles[handle] = value
+        # M2-3：写收敛点——句柄写入走 HandleStore（store 自带锁，跨节点并发发布安全）
+        for port, value in outputs.items():
+            handle = node.handles.get(port)
+            if handle:
+                self.store.put(handle, value)
 
     def _execute_with_retry(
         self,
@@ -486,7 +511,9 @@ class Engine:
         for attempt in range(1, attempts + 1):
             result.attempts = attempt
             try:
-                return self._execute_once(instance, ctx, inputs, node.spec.timeout)
+                return self._execute_once(
+                    instance, ctx, inputs, node.spec.timeout, self._executor_kind(node)
+                )
             except ConfigError as exc:
                 # 配置/契约错误重试也没意义，直接抛
                 raise _NodeFailure(exc) from exc
@@ -503,13 +530,43 @@ class Engine:
         # from 显式链接根因：traceback.format_exc() 才能带出算子内原始异常的完整帧
         raise _NodeFailure(last_error) from last_error  # type: ignore[arg-type]
 
-    def _execute_once(
+    def _executor_kind(self, node: PlanNode) -> str:
+        return node.spec.executor or self.default_executor or "thread"
+
+    def _execute_in_process(
         self,
         instance: Any,
         ctx: Any,
         inputs: Mapping[str, Any],
         timeout: float | None,
     ) -> dict[str, Any]:
+        """进程模式（M2-2）：算子在子进程执行，timeout 由 ProcessExecutor 强制（硬超时）。"""
+        run = ctx.run
+        ctx_data = (
+            ctx.node_id,
+            run.run_id,
+            run.pipeline,
+            dict(ctx.params),
+            str(run.workdir),
+            str(run.artifacts_dir),
+        )
+        assert self._process_pool is not None  # 仅在 kind=="process" 且池存在时进入
+        task = self._process_pool.submit(
+            _child_run_op, instance, ctx_data, dict(inputs), timeout=timeout
+        )
+        self._process_pool.wait((task,), first_completed=False)
+        return task.result()
+
+    def _execute_once(
+        self,
+        instance: Any,
+        ctx: Any,
+        inputs: Mapping[str, Any],
+        timeout: float | None,
+        kind: str = "thread",
+    ) -> dict[str, Any]:
+        if kind == "process" and self._process_pool is not None:
+            return self._execute_in_process(instance, ctx, inputs, timeout)
         if not timeout:
             return instance.execute(ctx, inputs)
 
@@ -552,10 +609,16 @@ def run_pipeline(
     max_workers: int | None = None,
     fail_fast: bool = False,
     cancel_event: threading.Event | None = None,
+    executor: str | None = None,
+    handle_store: HandleStore | None = None,
     run_id: str | None = None,
     logger: logging.Logger | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """编译 + 执行一步到位，返回值与句柄表。
+
+    ``handle_store`` 可注入自定义句柄存储（如
+    ``SpillHandleStore(threshold=...)``，超阈值落盘）；
+    返回的句柄表是全量物化后的 dict（落盘项在此时加载回内存）。
 
     典型的库内调用::
 
@@ -576,6 +639,7 @@ def run_pipeline(
     )
     cache_store = CacheStore(cache_dir, base_dir=workdir)
     engine = Engine(plan, context, cache_store=cache_store, max_workers=max_workers,
-                    fail_fast=fail_fast, cancel_event=cancel_event)
+                    fail_fast=fail_fast, cancel_event=cancel_event, executor=executor,
+                    handle_store=handle_store)
     report = engine.run()
-    return report, dict(engine.handles)
+    return report, dict(engine.store.snapshot())

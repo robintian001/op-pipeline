@@ -24,7 +24,7 @@
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │ Plan（已校验的可执行图）
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 编排层  (engine.py + cache.py + context.py)                                 │
+│ 编排层  (engine.py + executor.py + handlestore.py + cache.py + context.py)      │
 │   职责：依赖就绪调度、线程池并行、重试与退避、软超时、失败传播、              │
 │         句柄发布、内容指纹缓存、运行报告聚合、运行上下文与产物目录           │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -52,6 +52,8 @@
 | --- | --- | --- | --- |
 | [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) | `NodeSpec` `PipelineSpec` `RefResolver` `PlanNode` `Plan` `build_plan` `topological_order` | 配置解析、引用解析、静态校验、依赖推导与拓扑排序 | 不做实际执行、不加载算子实现 |
 | [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) | `Engine` `NodeResult` `RunReport` `run_pipeline` | 调度、并行、重试、超时、失败传播、缓存接入、报告 | 不解析配置、不做参数声明校验 |
+| [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py) | `HandleStore` `InMemoryHandleStore` | 句柄存取抽象（get/put/snapshot/items）与线程安全内存实现（M2-3） | 不做引用解析（RefResolver 的事）、不感知节点语义 |
+| [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) | `Executor` `ThreadExecutor` `ProcessExecutor` | 执行器抽象（`submit`/`wait`/`shutdown` 协议）、线程池默认实现与硬超时进程执行器（M2-2） | 不做调度决策、不做重试/缓存（仍属 engine） |
 | [operator.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/operator.py) | `Operator` `normalize_operator_class` | 算子声明归一化、输入/输出运行时校验、异步支持 | 不关心 DAG 与调度 |
 | [ports.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/ports.py) | `Port` `as_ports` `value_matches` `port_warnings` | 端口声明归一化、软类型检查 | 不阻断执行（软校验） |
 | [params.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/params.py) | `Param` `as_params` `coerce` `validate_params` | 参数声明、类型归一、范围/枚举校验 | 不做深层结构校验 |
@@ -68,7 +70,7 @@
 ### 4.1 句柄（handle）是唯一的数据交换介质
 
 - 每个输出端口默认映射到句柄 `"<node_id>.<port>"`，可在节点 `outputs` 中改名。
-- 引擎在节点成功后把输出写入句柄表 `Engine.handles`（[engine.py#L423-L428](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L423-L428)）。
+- 引擎在节点成功后把输出写入句柄存储 `Engine.store`（`HandleStore.put`，M2-3 起可注入自定义实现）。
 - 下游只能通过 `${...}` 引用取数，**算子之间没有直接调用**，因此任意两个算子之间都可以替换、旁路或并行。
 
 不变量：一个句柄在全图中只能有一个生产者。冲突在编译期由 `handle_owner` 检查并报错。

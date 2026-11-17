@@ -40,6 +40,8 @@ from .errors import (
     RefResolutionError,
     SpecValidationError,
 )
+from .executor import Executor, ProcessExecutor, ThreadExecutor
+from .handlestore import HandleStore, InMemoryHandleStore, SpillHandleStore
 from .expression import evaluate, evaluate_condition, register_function
 from .operator import Operator
 from .params import Param
@@ -56,6 +58,9 @@ __all__ = [
     "DuplicateOperatorError",
     "Engine",
     "ExpressionError",
+    "Executor",
+    "HandleStore",
+    "InMemoryHandleStore",
     "NodeContext",
     "NodeResult",
     "NodeSpec",
@@ -68,11 +73,14 @@ __all__ = [
     "Plan",
     "PlanNode",
     "Port",
+    "ProcessExecutor",
     "RefResolver",
     "Registry",
     "RunContext",
     "RunReport",
     "SpecValidationError",
+    "SpillHandleStore",
+    "ThreadExecutor",
     "build_plan",
     "default_registry",
     "evaluate",
@@ -103,6 +111,8 @@ def run(
     plugin_modules: tuple[str, ...] = (),
     registry: Registry | None = None,
     logger: logging.Logger | None = None,
+    executor: str | None = None,
+    handle_store: Any = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。
 
@@ -110,7 +120,9 @@ def run(
     - ``plugin_modules``：模块路径插件，如 ``("my_company.ops",)``；
       受 Python import 幂等性限制，已导入过的模块不会重新执行；
     - 传 ``registry`` 可获得算子集隔离的运行：插件加载进该表、内置算子自动补齐、
-      全局 ``default_registry`` 不受任何影响；不传则与历史行为完全一致。
+      全局 ``default_registry`` 不受任何影响；不传则与历史行为完全一致；
+    - ``handle_store``：自定义句柄存储（如 ``SpillHandleStore``），透传给
+      ``run_pipeline``。
     """
     config_path = Path(config).expanduser().resolve()
     load_plugins(
@@ -129,6 +141,8 @@ def run(
         max_workers=max_workers,
         fail_fast=fail_fast,
         logger=logger,
+        executor=executor,
+        handle_store=handle_store,
     )
 
 

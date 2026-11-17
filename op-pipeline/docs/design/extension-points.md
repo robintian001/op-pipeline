@@ -15,7 +15,8 @@
 | 新配置格式 | `PipelineSpec.from_file` 的分支 | `spec.py` | 内部接口 |
 | 算子别名 | `Registry.register(aliases=...)` | 算子声明 | 稳定 |
 | 自定义缓存 | 传入 `CacheStore` 兼容对象 | `run_pipeline` / `Engine` | 弱契约（鸭子类型） |
-| 替换执行器 | 目前无 `Executor` 抽象 | 需先抽接口 | **未实现** |
+| 替换执行器 | 实现 `Executor` 协议（submit/wait/shutdown）；内置 `ThreadExecutor`（默认）与 `ProcessExecutor`（硬超时，M2-2） | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) | 稳定（M2-1） |
+| 替换句柄存储 | 实现 `HandleStore` 协议（get/put/snapshot/items）；内置 `InMemoryHandleStore`（默认） | [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py) | 稳定（M2-3） |
 | 新渲染格式 | `graph.py` 增加函数 + CLI choices | `graph.py` / `cli.py` | 内部接口 |
 
 ---
@@ -145,23 +146,35 @@ class CacheStore:
 因此可以把 `CacheStore` 换成 Redis/S3 实现，只要保持四个成员。
 注意 `Engine.__init__` 用 `cache_store or CacheStore(None)` 判定，空实现的布尔值为真即可（普通对象默认为真）。
 
-### 4.2 执行器（尚未抽象）
+### 4.2 执行器
 
-当前执行器写死在 `Engine`：`ThreadPoolExecutor` + `wait(FIRST_COMPLETED)` + `_run_node`。
-若要接进程池、队列或集群，需要先抽出如下接口（建议放在 `engine.py` 或新 `executor.py`）：
+引擎已抽象出 `Executor` 协议（[executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py)，M2-1），
+默认 `ThreadExecutor` 平移原线程池行为：
 
 ```python
 class Executor(Protocol):
-    def submit(self, plan_node, inputs) -> Future   # 返回可 wait 的句柄
-    def wait(self, futures, first_completed=True) -> set[Future]
+    def submit(self, fn, /, *args) -> Future
+    def wait(self, futures, *, first_completed: bool = True) -> set[Future]
+    def shutdown(self) -> None
 ```
 
-需要一起调整的点：
+实现进程池、队列或集群执行器时需要注意：
 
-1. `_run_node` 里依赖 `self.handles` 快照与 `ctx`，跨进程时句柄必须可序列化或改为引用传递；
+1. `_run_node` 依赖 `Engine.store`（HandleStore）快照与 `NodeContext`，跨进程时句柄必须可序列化或改为引用传递；
 2. `NodeContext` 需要能序列化（logger 不可序列化，要换成日志转发）；
-3. 超时策略从"线程 join"改为"进程终止/任务取消"；
-4. `_publish` 的锁需要换成协调层（队列/共享存储）。
+3. 超时策略从"线程 join"改为"进程终止/任务取消"（内置 `ProcessExecutor` 已按此实现，见下）；
+4. `_publish` 的锁需要换成协调层（队列/共享存储）；
+5. `wait(first_completed=True)` 的"首个完成即返回"语义被主循环依赖，自定义实现必须保持。
+
+内置 `ProcessExecutor`（M2-2）即按上述约束实现：每任务一个 `spawn` 子进程，
+载荷（算子实例 + 运行数据 + 输入）先 `pickle.dumps`——该序列化结果直接传给
+子进程，不做二次序列化；不可 pickle 时回退线程执行（软超时）并经
+`on_fallback` 回调记入 `report.warnings`；`submit(..., timeout=)` 携带节点
+超时，`wait` 内到点 `terminate()` 子进程——**硬超时**。刻意不用
+`ProcessPoolExecutor`：它无法强杀单个任务，terminate worker 会把整个池打成
+`BrokenProcessPool`、殃及同时在跑的其它节点。跨进程载荷要求算子类、参数、
+输入全部可 pickle 且子进程能按模块名 import 其定义（插件文件里的算子
+需要注意子进程的可见性）。
 
 ### 4.3 报告
 
@@ -177,11 +190,10 @@ class Executor(Protocol):
 | # | 缺口 | 证据 | 影响 | 建议落点 |
 | --- | --- | --- | --- | --- |
 | T7 | 缓存不感知代码变更 | key 仅含 `version` 字符串 | 忘记递增 version 会命中旧结果 | 可选：把算子源码哈希或 git rev 纳入 key |
-| T8 | 软超时无法终止算子 | [engine.py#L459-L484](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L459-L484) | 超时后线程仍可能写文件/占连接 | 换进程执行器，或文档要求算子自身支持取消 |
 | T13 | `strict=False` 可返回残缺 Plan | [spec.py#L477-L487](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L477-L487) | 无调用方使用，属预留 | 保持现状并在文档说明 |
 | T15 | 表算子假设首行代表全表列 | 多处使用 `rows[0].keys()` | 列不全的行会丢字段或抛错 | 统一列集合并集，或要求 schema 显式声明 |
 
-> 修复建议的优先级：T8（可运维性）> 其余。
+> 剩余按需处理；T13 保持"预留，不处理"。
 > 已消除：T1/T5（M1-1，软类型告警接入）、T6（M1-2，缓存目录相对 workdir 解析）、
 > T9（M1-3，`NodeResult.traceback` 截断保留堆栈，重试耗尽路径 `from last_error` 链根因）、
 > T10（M1-4，`run_id` 追加 4 位随机十六进制后缀，同秒并发产物目录隔离）、
@@ -189,7 +201,9 @@ class Executor(Protocol):
 > T2/T3/T14（M1-6，删除 `PlanNode.resolved_inputs` 残留字段、删除 `ModuleExecutionError`
 > 及其导出、清理 `to_mermaid` 死变量——属破坏性删除但无内部调用方）、
 > T11（M1-7，文件插件模块名取路径 blake2b 摘要，同名不同目录都能加载，同文件幂等）、
-> T12（M1-8，`run()` 新增 `plugin_modules` 参数，支持模块路径插件）。
+> T12（M1-8，`run()` 新增 `plugin_modules` 参数，支持模块路径插件）、
+> **T8（M2-2，`ProcessExecutor` 硬超时——节点 `executor="process"` 或运行级
+> `--executor process` 时，`timeout` 到点 terminate 子进程；线程模式仍为软超时）**。
 
 ---
 
@@ -199,7 +213,7 @@ class Executor(Protocol):
 
 | 演进方向 | 具体设计 | 落点 |
 | --- | --- | --- |
-| 硬超时 | 引入进程池执行器；`timeout` 到点 `terminate()`；返回码 + 序列化结果/异常 | 新 `executor.py`；`Engine._execute_once` |
+| 硬超时 | **已实现（M2-2）**：`ProcessExecutor` 每任务一子进程，`timeout` 到点 `terminate()`；结果/异常经管道序列化回传；不可 pickle 回退线程 | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py)；`Engine._execute_in_process` |
 | asyncio 调度 | 算子支持 `async def run`（已有）；调度器改为任务集合 + `asyncio.wait(FIRST_COMPLETED)`；线程池仅用于同步算子 | `Engine.run/_dispatch` |
 | 持久化元数据 | SQLite 表 `runs / nodes`，记录 status/attempts/error/时间；据此实现断点续跑 | 新 `store.py`；`Engine.run` 汇总处 |
 | 可选 schema | 端口支持 `dataclass`/`pydantic` 类型；在 `_prepare_inputs` 前做深校验 | `ports.value_matches` + `Operator._prepare_inputs` |
@@ -207,14 +221,16 @@ class Executor(Protocol):
 | 大对象 | 句柄表存引用而非值；`RefResolver` 解析时按需加载 | `Engine._publish` / `RefResolver` |
 
 这些演进有一个共同前置条件：**句柄访问必须收敛到少数几个函数**。
-目前是 `Engine._publish`（写）与 `RefResolver._lookup`（读）两处，改造时应保持这一点，
+M2-3 起收敛点已落在 `HandleStore` 接口（[handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py)）：
+写 = `Engine._publish` → `store.put`，读 = `RefResolver._lookup` → `store.snapshot()` 后查表
+（引擎经 `Engine(handle_store=...)` 注入自定义实现即可）。
 不要在算子内部直接读写句柄表。
 
 ---
 
 ## 7. 新增能力时的回归清单
 
-1. 跑 `python -m unittest discover -s tests -v`（66 个用例）；
+1. 跑 `python -m unittest discover -s tests -v`（87 个用例）；
 2. 用 `examples/pipeline_orders.json` 做端到端（覆盖并行 fan-out、when、断言、4 种输出）；
 3. 用 `examples/pipeline_text.toml --plugin plugins/demo_ops.py`（`--plugin` 相对配置文件所在目录解析）验证插件与重试；
 4. `python -m op_pipeline validate` 与 `graph` 必须仍然可用；
