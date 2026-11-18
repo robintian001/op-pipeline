@@ -14,6 +14,7 @@ from .engine import Engine
 from .graph import to_ascii, to_dot, to_mermaid
 from .registry import default_registry, load_plugins
 from .spec import PipelineSpec, build_plan
+from .store import RunStore
 
 log = logging.getLogger("op_pipeline.cli")
 
@@ -78,10 +79,25 @@ def cmd_run(args: argparse.Namespace) -> int:
     cache_store = CacheStore(
         None if args.no_cache else args.cache_dir, base_dir=workdir
     )
+    # M2-5：--runs <db> 开关，默认关闭 = 零副作用（不产生任何记录文件）
+    run_store = None
+    if args.runs:
+        runs_path = Path(args.runs).expanduser()
+        if not runs_path.is_absolute():
+            runs_path = Path(workdir) / runs_path
+        runs_path.parent.mkdir(parents=True, exist_ok=True)
+        run_store = RunStore(runs_path)
+    # M2-6：--resume <run_id> 必须配合 --runs（参考库），否则无从比对
+    if args.resume and run_store is None:
+        print("--resume 需要同时指定 --runs <db>（参考运行记录库）", file=sys.stderr)
+        return 2
     engine = Engine(plan, context, cache_store=cache_store, max_workers=args.workers,
-                    fail_fast=args.fail_fast, executor=args.executor)
+                    fail_fast=args.fail_fast, executor=args.executor, run_store=run_store,
+                    resume_run_id=args.resume)
 
     report = engine.run()
+    if run_store is not None:
+        run_store.close()
     print(report.summary())
     if args.json:
         path = report.to_json(args.json)
@@ -155,6 +171,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="运行级执行器：process 时未显式指定的节点在子进程执行（硬超时）",
     )
     run.add_argument("--dry-run", action="store_true", help="只打印执行计划不执行")
+    run.add_argument(
+        "--runs", default=None,
+        help="SQLite 运行记录库路径（相对路径按工作目录解析；默认关闭，不产生任何文件）",
+    )
+    run.add_argument(
+        "--resume", default=None,
+        help="M2-6 断点续跑：参考 run_id 的 nodes 记录与本次 cache_key 比对，"
+             "成功段复用缓存并标记 [resumed]（需同时指定 --runs）",
+    )
     run.add_argument("--json", default=None, help="把运行报告写成 JSON")
     run.set_defaults(func=cmd_run)
 

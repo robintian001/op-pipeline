@@ -142,6 +142,69 @@
 > （`p.` 前缀整键路由、下钻仅在句柄上）的测试误写。
 > 下一步 M2-4：SpillHandleStore（超阈值落盘）。
 
+> **状态**：M2-4 已完成（2026-11-18，TDD 红→绿，97 个用例全绿——87 个既有用例
+> 不改断言通过，两示例端到端正常）。`SpillHandleStore`（默认阈值 1MB，按
+> `pickle.dumps` 后字节量判定）落在
+> [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py)：
+> 超阈值值写盘为 `<句柄名>.<blake2b 8 字节摘要>.pkl`（防 Windows 大小写不敏感
+> 文件系统名碰撞），表内只存 `_SpilledRef(path, size)` 占位；`snapshot()` 返回
+> 惰性视图 `_LazySnapshot`（成员检查 / len / 迭代零 IO——引用解析高频走 `in` 与
+> 迭代，仅按键访问读盘）。三层退化保证"落盘是内存优化、不承担正确性"：值不可
+> pickle / 未指定落盘目录 → 回退内存并记 warning。目录默认挂 `artifacts_dir/spill`，
+> 引擎在构造末尾经 `attach(context)` 钩子注入（普通实现无此钩子，零影响）；
+> `run_pipeline(handle_store=...)` 与顶层 `run(handle_store=...)` 透传收口（M2-3 遗留）。
+> 下一步 M2-5：RunStore + SQLite。
+
+> **状态**：M2-5 已完成（2026-11-18，TDD 红→绿一轮，104 个用例全绿——97 个既有用例
+> 不改断言通过，两示例端到端 + `--runs` 落库可查询正常）。`RunStore`（`record_run`
+> /`record_node`/`query`，`runs`/`nodes` 两表惰性建表，连接 `close`/`with`）落在
+> [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/store.py)
+> 并从包顶层导出；`Engine(run_store=...)` 在 `_collect`（含缓存命中早退）与
+> `_mark_skipped` 写入节点记录（nodes 表与 `RunReport` 节点列表一致，跳过节点也入
+> 库），运行末尾写入 runs 记录；CLI 新增 `--runs <db>`（相对路径按工作目录解析），
+> **默认关闭 = 零副作用**（不传开关不产生任何文件，`test_no_run_store_creates_no_db_file`
+> 与 CLI 双跑验证）。**T7 出债**：`CacheStore(include_source=True)` 可选地把算子类
+> 源码 blake2b 摘要纳入 cache_key（`compute_key` 新增可选 `source` 参数，默认关闭
+> 保持旧行为，引擎 `_run_node` 经 `inspect.getsource` 取源码），`NodeResult` 新增
+> `cache_key` 字段供 nodes 表记录与 M2-6 比对。
+> 下一步 M2-6：断点续跑（`--resume`，依赖 M2-5 的 cache_key 记录）。
+
+> **状态**：M2-6 已完成（2026-11-18，TDD 红→绿一轮，108 个用例全绿——104 个既有用例
+> 不改断言通过，两示例端到端 + `--runs`+`--resume` 续跑验证 `[resumed]` 标记正常）。
+> CLI 新增 `--resume <run_id>`（必须配合 `--runs`，否则 exit 2 提示）；引擎
+> `Engine(resume_run_id=...)` 在构造时把参考 run 的 nodes 记录（node_id/status/cache_key）
+> 一次预载进内存 `_resume_map`（**SQLite 连接有线程亲和性，不能在 worker 线程查询**，
+> 这是首轮绿灯踩到的坑），`_run_node` 缓存命中处比对：参考记录为 success 且 cache_key
+> 与本次一致 → 复用缓存并标记 `NodeResult.resumed`，报告/日志显示 `[resumed]`；参考段
+> 失败或缓存缺失则照常重跑（失败段与下游不受影响）。不带 resume 的普通重跑只标记
+> `[cache]` 不标记 `[resumed]`；未知 run_id 退化为普通运行（均有用例覆盖）。
+> `RunStore.prev_node(run_id, node_id)` 作为公共 helper 一并提供（引擎用内存 map，不依赖它）。
+> 下一步 M2-7：执行钩子。
+
+> **状态**：M2-7 已完成（2026-11-18，TDD 红→绿一轮，113 个用例全绿——108 个既有用例
+> 不改断言通过，两示例端到端正常）。执行事件钩子：`Engine(hooks=[Hook])` /
+> `run_pipeline(hooks=[...])` / 顶层 `run(hooks=[...])`，`Hook` 协议（engine.py，
+> 包顶层导出）含 `on_node_start(node_id, op)`（`_run_node` 开头）、
+> `on_node_finish(node_id, status, duration, cached)`（`_run_node` finally，成功/
+> 失败/缓存命中都触发；缓存命中提前 return 也经 finally 发 finish）、
+> `on_run_finish(report)`（`run()` 末尾，总在最后）。被跳过的节点（when 为假 /
+> 上游失败 / 取消）从不触发。钩子异常只记入报告告警、不影响流水线；节点并行时
+> 钩子可能被并发调用（文档示例用锁）。进度条示例见
+> [runtime-semantics §6.2](../architecture/runtime-semantics.md#62-执行事件钩子m2-7)。
+> 下一步 M2-8（按计划表待办项续写）。
+
+> **状态**：M2-8 已完成（2026-11-18，TDD 红→绿一轮，115 个用例全绿——113 个既有用例
+> 不改断言通过，两示例端到端正常）。`run_pipeline_async(...)`（engine.py，包顶层导出）
+> 以 `loop.run_in_executor(None, functools.partial(run_pipeline, ...))` 包装同步引擎，
+> 参数与返回值与 `run_pipeline` 完全一致；async 宿主内 `await` 不阻塞事件循环
+> （`AsyncHostTest`：运行中的事件循环内 await 得到正确报告；流水线运行期间同循环的
+> ticker 任务持续推进 ≥3 次，证明未卡死循环）。取消语义不变（`asyncio.CancelledError`
+> 只放弃 await，中途止损仍用 `cancel_event`）。这是"嵌入 async 宿主"的桥接，
+> **不是全 asyncio 调度器**（引擎内 `asyncio.wait(FIRST_COMPLETED)` 不在本里程碑范围），
+> 见 [runtime-semantics §6.3](../architecture/runtime-semantics.md#63-async-宿主嵌入m2-8)。
+> M2 DoD 已全部满足（执行器/续跑两节 + async 宿主单测与文档示例已落地）。
+> 下一步：进入下一里程碑（M3，按需启动）。
+
 **M2 完成定义（DoD）**：全部现有测试不改断言通过；新增 Executor/HandleStore/RunStore 单测；
 `--executor process` + `--resume` 各有一个端到端示例；`run_pipeline_async` 有 async 宿主单测与文档示例；[运行时语义](../architecture/runtime-semantics.md)
 新增"执行器/续跑"两节。
@@ -178,7 +241,7 @@
 | T2 `resolved_inputs` 残留 / T3 `ModuleExecutionError` 未用 / T14 死变量 | M1-6 | M1 |
 | T4 `defaults` 未生效 | M1-5 | M1 |
 | T6 缓存目录相对 CWD | M1-2 | M1 |
-| T7 缓存不感知代码变更 | M2-5（可选开关） | M2 |
+| T7 缓存不感知代码变更 | M2-5（可选开关，**已出债**：`CacheStore(include_source=True)`） | M2 |
 | T8 软超时不可强杀 | M2-2 | M2 |
 | T9 失败无堆栈 | M1-3 | M1 |
 | T10 `run_id` 秒级精度 | M1-4 | M1 |

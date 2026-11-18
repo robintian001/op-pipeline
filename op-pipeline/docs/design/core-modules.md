@@ -224,7 +224,7 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 
 | 使用方 | 环境变量来源 |
 | --- | --- |
-| 节点 `when` | 输入端口值、参数值、`inputs`、`params`（解析后）、`raw_params`（原始值）（见 [engine.py#L348-L366](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L348-L366)） |
+| 节点 `when` | 输入端口值、参数值、`inputs`、`params`（解析后）、`raw_params`（原始值）（见 [engine.py#L404-L422](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L404-L422)） |
 | `table.*` 行级表达式 | `row_env()`：字段名（标识符形式）+ `row` + `i` |
 | `control.assert` | `value` + 节点参数 + dict 值展平 |
 
@@ -240,7 +240,10 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 - 递归深度上限 6（`_depth > 6` 直接 `repr` 截断 200 字符），防止环状/超深结构爆栈；
 - 集合排序后再指纹，保证 `set` 顺序无关；
 - 字典按 `str(key)` 排序，保证跨进程稳定；
-- 写入用 `tmp + os.replace`，读取异常降级为未命中。
+- 写入用 `tmp + os.replace`，读取异常降级为未命中；
+- `CacheStore(include_source=True)`（M2-5，T7 出债）：`compute_key` 新增可选
+  `source` 参数，开启时把算子类源码 blake2b 摘要纳入 key——源码变化即缓存失效；
+  默认关闭保持旧行为（key 只含版本字符串）。
 
 ---
 
@@ -300,6 +303,7 @@ HandleStore (Protocol, runtime_checkable)
   items() -> list[tuple]
 
 InMemoryHandleStore()        # 默认实现：RLock + dict（平移原 Engine.handles 行为）
+SpillHandleStore(threshold=1_000_000, spill_dir=None)  # M2-4：超阈值 pickle 落盘、读取按需加载
 as_mapping(store_or_mapping) # 归一辅助：store 取 snapshot，Mapping 原样返回
 ```
 
@@ -307,26 +311,60 @@ as_mapping(store_or_mapping) # 归一辅助：store 取 snapshot，Mapping 原�
   （构造时经 `as_mapping` 拍快照；公共符号保持 Mapping 兼容）；
 - 快照语义与原 `dict(self.handles)` 等价：节点开始时固定可见句柄集，
   避免解析期间读到并发发布的新句柄；
-- 自定义实现（M2-4 将提供超阈值落盘的 `SpillHandleStore`）注意三点：
-  `snapshot()` 返回一次性视图、`put()` 线程安全、`get()` 缺失抛 KeyError；
-  引擎经 `Engine(handle_store=...)` 注入。
+- 自定义实现注意三点：`snapshot()` 返回一次性视图、`put()` 线程安全、
+  `get()` 缺失抛 KeyError；引擎经 `Engine(handle_store=...)` /
+  `run_pipeline(handle_store=...)` 注入（顶层 `run()` 亦透传）。
+- `SpillHandleStore`（M2-4）：`put` 时按 `pickle.dumps` 结果量大小，超过
+  `threshold`（字节，默认 1MB）写盘（目录默认 `artifacts_dir/spill`，经
+  `attach(context)` 钩子注入，显式 `spill_dir` 优先），表内只存
+  `_SpilledRef(path, size)` 占位；`snapshot()` 返回惰性视图 `_LazySnapshot`——
+  成员检查 / len / 迭代零 IO（引用解析高频走 `in` 与迭代），仅按键访问触发读盘。
+  三层退化保证"落盘是内存优化、不承担正确性"：值不可 pickle / 未指定落盘目录 →
+  回退内存并记 warning，绝不断流水线。
 
 ---
 
-## 10. graph.py / cli.py：外围
+## 10. store.py：运行记录存储（M2-5）
 
-### 10.1 graph
+```python
+RunStore(db_path)                # SQLite 运行记录库
+  record_run(run_id, pipeline, version, status, started_at, finished_at, params)
+  record_node(run_id, node_id, op, status, attempts, cached, error, cache_key, finished_at)
+  query(sql, params=())          # 原始行查询
+  close() / with                 # 连接生命周期由调用方管理
+```
+
+表结构（首次写入时惰性建表）：
+
+| 表 | 字段 |
+| --- | --- |
+| `runs` | `run_id`(PK), `pipeline`, `version`, `status`, `started_at`, `finished_at`, `params_json` |
+| `nodes` | `run_id`+`node_id`(PK), `op`, `status`, `attempts`, `cached`, `error`, `cache_key`, `finished_at` |
+
+- **默认关闭、零副作用**：不传 `--runs` / `run_store=None` 时引擎完全不触碰
+  SQLite（`test_no_run_store_creates_no_db_file` 与 CLI 双跑验证不产生任何文件）；
+- 写入点：`Engine._collect`（真实执行收口，含缓存命中早退）与 `_mark_skipped`
+  （跳过节点也入库），nodes 表与 `RunReport` 节点列表保持一致；
+  运行末尾写一条 `runs`（`INSERT OR REPLACE`，同 `run_id` 重跑可覆盖）；
+- `NodeResult.cache_key`（M2-5 新增）记录命中缓存时算出的 key，供 M2-6 断点续跑比对；
+- 依赖：标准库 `sqlite3`（零第三方依赖）；`params` 以 JSON 文本存储。
+
+---
+
+## 11. graph.py / cli.py：外围
+
+### 11.1 graph
 
 三种渲染：`to_mermaid`（`flowchart LR`，缓存节点加 class）、`to_dot`（Graphviz）、
 `to_ascii`（编号 + 依赖 + 运行策略标记）。
 `to_mermaid` 的 `style` 死变量已在 M1-6 一并清除。
 
-### 10.2 cli
+### 11.2 cli
 
 ```
 op_pipeline run      <config> [--workdir] [--workers] [--cache-dir] [--no-cache]
                               [--fail-fast] [--dry-run] [--executor thread|process]
-                              [--json PATH] [--plugin P] [--param K=V]
+                              [--runs DB] [--json PATH] [--plugin P] [--param K=V]
 op_pipeline validate <config>
 op_pipeline graph    <config> --format mermaid|dot|ascii
 op_pipeline ops      [--json]
@@ -338,11 +376,13 @@ op_pipeline describe <op_name>
 - `--dry-run` 打印 ASCII 计划后返回 0，不执行任何节点、不建产物与缓存目录（M1-9 起提前分支）；
 - `--executor process`（M2-2）为运行级执行器缺省：未显式指定 `executor` 的节点
   在子进程执行（硬超时）；节点显式值优先；
+- `--runs <db>`（M2-5）：把本次运行与节点状态写入 SQLite（相对路径按工作目录
+  解析），**默认关闭 = 不产生任何文件**；连 `--dry-run` 都不建库；
 - 插件在**解析配置之后、编译之前**加载，因此插件注册的算子可被编译期识别。
 
 ---
 
-## 11. ops/：内置算子库的组织约定
+## 12. ops/：内置算子库的组织约定
 
 | 文件 | 分组 | 算子数 |
 | --- | --- | --- |

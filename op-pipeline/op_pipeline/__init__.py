@@ -28,7 +28,14 @@ from typing import Any, Mapping
 
 from .cache import CacheStore, fingerprint
 from .context import NodeContext, RunContext
-from .engine import Engine, NodeResult, RunReport, run_pipeline
+from .engine import (
+    Engine,
+    Hook,
+    NodeResult,
+    RunReport,
+    run_pipeline,
+    run_pipeline_async,
+)
 from .errors import (
     ConfigError,
     CycleError,
@@ -48,6 +55,7 @@ from .params import Param
 from .ports import Port, as_ports, type_label
 from .registry import Registry, default_registry, load_plugins, op
 from .spec import NodeSpec, PipelineSpec, Plan, PlanNode, RefResolver, build_plan
+from .store import RunStore
 
 logging.getLogger("op_pipeline").addHandler(logging.NullHandler())
 
@@ -60,6 +68,7 @@ __all__ = [
     "ExpressionError",
     "Executor",
     "HandleStore",
+    "Hook",
     "InMemoryHandleStore",
     "NodeContext",
     "NodeResult",
@@ -78,6 +87,7 @@ __all__ = [
     "Registry",
     "RunContext",
     "RunReport",
+    "RunStore",
     "SpecValidationError",
     "SpillHandleStore",
     "ThreadExecutor",
@@ -90,6 +100,7 @@ __all__ = [
     "op",
     "register_function",
     "run_pipeline",
+    "run_pipeline_async",
     "type_label",
 ]
 
@@ -113,6 +124,9 @@ def run(
     logger: logging.Logger | None = None,
     executor: str | None = None,
     handle_store: Any = None,
+    run_store: Any = None,
+    resume_run_id: str | None = None,
+    hooks: list[Any] | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。
 
@@ -122,7 +136,15 @@ def run(
     - 传 ``registry`` 可获得算子集隔离的运行：插件加载进该表、内置算子自动补齐、
       全局 ``default_registry`` 不受任何影响；不传则与历史行为完全一致；
     - ``handle_store``：自定义句柄存储（如 ``SpillHandleStore``），透传给
-      ``run_pipeline``。
+      ``run_pipeline``；
+    - ``run_store``：SQLite 运行记录（``RunStore``），透传给 ``run_pipeline``，
+      默认 None = 不落库（连接生命周期由调用方管理）；
+    - ``resume_run_id``（M2-6）：断点续跑——配合 ``run_store`` 参考该 run 的
+      nodes 记录，节点 cache_key 一致且缓存可命中时复用并标记 [resumed]，
+      失败段与下游照常重跑；默认 None = 普通运行。
+    - ``hooks``（M2-7）：执行事件钩子列表（on_node_start / on_node_finish /
+      on_run_finish），节点并行时可能被并发调用，异常只记告警不影响流水线；
+      默认 None = 无钩子。
     """
     config_path = Path(config).expanduser().resolve()
     load_plugins(
@@ -143,6 +165,9 @@ def run(
         logger=logger,
         executor=executor,
         handle_store=handle_store,
+        run_store=run_store,
+        resume_run_id=resume_run_id,
+        hooks=hooks,
     )
 
 

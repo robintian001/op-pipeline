@@ -46,7 +46,10 @@ class CacheStore:
     """极简文件缓存，空目录即关闭缓存。"""
 
     def __init__(
-        self, directory: str | Path | None, base_dir: str | Path | None = None
+        self,
+        directory: str | Path | None,
+        base_dir: str | Path | None = None,
+        include_source: bool = False,
     ) -> None:
         path = Path(directory).expanduser() if directory else None
         # 相对缓存目录以 base_dir（通常为 workdir）为基准，而非进程 CWD：
@@ -54,6 +57,9 @@ class CacheStore:
         if path is not None and not path.is_absolute() and base_dir is not None:
             path = Path(base_dir).expanduser() / path
         self.directory = path
+        # M2-5（T7 出债）：开启后 compute_key 纳入算子源码摘要——
+        # 源码变化即缓存失效；默认关闭保持旧行为
+        self.include_source = include_source
         if self.directory:
             self.directory.mkdir(parents=True, exist_ok=True)
 
@@ -67,6 +73,7 @@ class CacheStore:
         op_version: str,
         params: dict[str, Any],
         inputs: dict[str, Any],
+        source: str | None = None,
     ) -> str:
         payload = {
             "op": op_name,
@@ -74,6 +81,10 @@ class CacheStore:
             "params": fingerprint(params),
             "inputs": {k: fingerprint(v) for k, v in inputs.items()},
         }
+        if self.include_source and source is not None:
+            payload["source"] = hashlib.blake2b(
+                source.encode("utf-8", "replace"), digest_size=16
+            ).hexdigest()
         return hashlib.blake2b(
             json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"),
             digest_size=20,

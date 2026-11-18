@@ -27,8 +27,8 @@
 | --- | --- | --- |
 | 数据处理 | `list[dict]` 行表 + 34 个算子，覆盖文件→清洗→聚合→报告 | 文件型、批式、中等数据量最顺手 |
 | 数据规模 | 句柄全内存驻留，缓存走 pickle 文件 | 适合 MB～几百 MB 级；GB 级以上不适合 |
-| 计算模型 | 同步算子 + 线程池（默认 `min(8, CPU)`）；`async def` 仅包一层 `asyncio.run` | IO 并行有效，CPU 密集无收益 |
-| 可靠性 | 重试/退避、`allow_failure`、`fail_fast` 完整；无元数据持久化、无断点续跑 | 可接受"失败重跑"，不可接受"必须续跑" |
+| 计算模型 | 同步算子 + 线程池（默认 `min(8, CPU)`）；async 宿主经 `run_pipeline_async` 桥接（M2-8，`run_in_executor`） | IO 并行有效，CPU 密集无收益；桥接保证事件循环不被阻塞 |
+| 可靠性 | 重试/退避、`allow_failure`、`fail_fast` 完整；元数据持久化与断点续跑（M2-5/M2-6，`--runs` + `--resume`）可选开启 | 可接受"失败重跑"，也可 `--resume` 只重跑失败段 |
 | 容错 | 软超时（线程不可强杀）、失败不保留堆栈 | 不适合强实时、强隔离任务 |
 | 安全 | 表达式 AST 白名单；插件是任意代码执行、缓存是 pickle 反序列化 | 信任边界=本机可信用户；不能接多租户/不可信配置 |
 | 可嵌入性 | 零依赖、一行调用、算子可单测 | 最难被替代的优势 |
@@ -134,6 +134,14 @@
    直接支撑**断点续跑**（跳过已成功且 cache_key 一致的节点）与历史查询。
 4. **执行事件钩子**（`on_node_start/finish`、`on_run_finish`）：进度条、日志聚合、
    OpenTelemetry、未来 UI 都从这里取数，成本极低但别晚做。
+
+> 进度（2026-11-18）：1–4 已在 M2 里程碑落地——`Executor`（M2-1/M2-2）、
+> `HandleStore`（M2-3/M2-4）、`RunStore`+`--runs` 落库（M2-5）与
+> `--resume` 断点续跑（M2-6）、执行事件钩子 `Hook`（M2-7，含进度条示例，
+> 见 [runtime-semantics §6.2](../architecture/runtime-semantics.md#62-执行事件钩子m2-7)）。
+> 库通用性轨道 `run_pipeline_async`（M2-8）也已落地（见
+> [runtime-semantics §6.3](../architecture/runtime-semantics.md#63-async-宿主嵌入m2-8)）；
+> 全 asyncio 调度器仍明确不在范围。
 
 ### 阶段 3：生态与规模化（对应版本 0.4+，按需触发）
 

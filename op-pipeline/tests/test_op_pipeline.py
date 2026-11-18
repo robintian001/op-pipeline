@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -1655,6 +1656,561 @@ class SpillHandleStoreTest(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [], "并发写读不应有异常")
+
+
+# --------------------------------------------------------------------------- #
+# M2-5：RunStore + SQLite 运行记录 + cache_key 可选源码摘要（T7 出债）
+# --------------------------------------------------------------------------- #
+@op("m25.const")
+class M25ConstOp(Operator):
+    """产出常量，验证运行记录与 RunReport 一致。"""
+
+    outputs = [("value", int)]
+    params = {"value": Param(int, default=1)}
+
+    def run(self, ctx, value):
+        return {"value": value}
+
+
+class RunStoreTest(unittest.TestCase):
+    """M2-5：跑完后 SQLite 可查询到与 RunReport 一致的节点状态/attempts；不传开关零副作用。"""
+
+    def test_record_query_roundtrip(self):
+        from op_pipeline.store import RunStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunStore(Path(tmp) / "p.db")
+            store.record_run("r1", "demo", "1.2.0", "partial", 100.0, 200.0, {"n": 5})
+            store.record_node("r1", "a", "control.const", "success", 1, False, None, "key-abc", 150.0)
+            runs = store.query("SELECT run_id, params_json, status FROM runs")
+            nodes = store.query("SELECT node_id, attempts, cache_key FROM nodes")
+            store.close()
+            self.assertEqual(runs[0][0], "r1")
+            self.assertEqual(runs[0][1], '{"n": 5}', "params 应序列化为 JSON 存表")
+            self.assertEqual(runs[0][2], "partial")
+            self.assertEqual(nodes[0][0], "a")
+            self.assertEqual(nodes[0][1], 1)
+            self.assertEqual(nodes[0][2], "key-abc")
+
+    def test_recorded_rows_match_report(self):
+        from op_pipeline.store import RunStore
+
+        spec = spec_of(
+            [
+                {"id": "src", "op": "m25.const", "params": {"value": 3}},
+                {
+                    "id": "retry",
+                    "op": "testkit.flaky",
+                    "params": {"fail_times": 1},
+                    "inputs": {"value": "${src.value}"},
+                    "retries": 1,
+                    "retry_delay": 0.01,
+                },
+            ],
+            outputs={"v": "${retry.value}"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunStore(Path(tmp) / "runs.db")
+            report, values = run_pipeline(
+                spec, registry=default_registry, workdir=tmp, run_store=store
+            )
+            runs = store.query("SELECT run_id, pipeline, version, status FROM runs")
+            nodes = store.query(
+                "SELECT node_id, op, status, attempts FROM nodes ORDER BY node_id"
+            )
+            store.close()
+
+            self.assertEqual(len(runs), 1, "每次运行应写入一条 runs 记录")
+            run_row = runs[0]
+            self.assertEqual(run_row[0], report.run_id)
+            self.assertEqual(run_row[1], report.pipeline)
+            self.assertEqual(run_row[2], report.version)
+            self.assertEqual(run_row[3], report.status)
+
+            self.assertEqual(len(nodes), 2, "每个节点应写入一条 nodes 记录")
+            by_node = {row[0]: row for row in nodes}
+            for result in report.nodes:
+                row = by_node[result.node_id]
+                self.assertEqual(row[1], result.op, "op 应与报告一致")
+                self.assertEqual(row[2], result.status, "状态应与报告一致")
+                self.assertEqual(row[3], result.attempts, "attempts 应与报告一致")
+            self.assertEqual(values["retry.value"], 3, "重试节点最终应成功产出")
+
+    def test_no_run_store_creates_no_db_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = spec_of([{"id": "src", "op": "m25.const", "params": {"value": 1}}])
+            _report, _values = run_pipeline(spec, registry=default_registry, workdir=tmp)
+            self.assertEqual(
+                list(Path(tmp).glob("*.db")), [], "不传 run_store 不应产生任何 db 文件"
+            )
+
+    def test_cli_runs_switch_writes_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "pipe.toml"
+            cfg.write_text(
+                'name = "m25"\n'
+                "[[nodes]]\n"
+                'id = "src"\n'
+                'op = "control.const"\n'
+                "[nodes.params]\n"
+                "value = 9\n",
+                encoding="utf-8",
+            )
+            db = Path(tmp) / "runs.db"
+            proc = DryRunNoSideEffectsTest._run_cli(
+                "run", str(cfg), "--runs", str(db), "--no-cache", cwd=str(ROOT)
+            )
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertTrue(db.exists(), "--runs 开关应写出 SQLite 文件")
+            import sqlite3
+            conn = sqlite3.connect(db)
+            rows = conn.execute("SELECT pipeline, status FROM runs").fetchall()
+            conn.close()
+            self.assertEqual(rows, [("m25", "success")], "runs 表应含本次运行记录")
+
+            proc2 = DryRunNoSideEffectsTest._run_cli(
+                "run", str(cfg), "--no-cache", cwd=str(ROOT)
+            )
+            self.assertEqual(0, proc2.returncode, proc2.stderr)
+            self.assertEqual(
+                sorted(p.name for p in Path(tmp).glob("*.db")),
+                ["runs.db"],
+                "不传 --runs 不应新增任何 db 文件",
+            )
+
+    def test_compute_key_source_hash_opt_in(self):
+        from op_pipeline.cache import CacheStore
+
+        default_cache = CacheStore(None)
+        optin_cache = CacheStore(None, include_source=True)
+        src_a = "class A:\n    pass\n"
+        src_b = "class B:\n    pass\n"
+        self.assertEqual(
+            default_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_a),
+            default_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_b),
+            "默认关闭源码摘要时 source 不应影响 key",
+        )
+        k1 = optin_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_a)
+        k2 = optin_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_b)
+        self.assertNotEqual(k1, k2, "开启源码摘要后不同源码应得到不同 key")
+        self.assertEqual(
+            optin_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_a),
+            k1,
+            "相同源码应稳定复现同一 key",
+        )
+
+    def test_engine_feeds_source_when_opted_in(self):
+        from op_pipeline.cache import CacheStore
+
+        seen: list[str | None] = []
+
+        class SpyCache(CacheStore):
+            def compute_key(self, op_name, op_version, params, inputs, source=None):
+                seen.append(source)
+                return super().compute_key(op_name, op_version, params, inputs, source=source)
+
+        spec = spec_of([{"id": "src", "op": "m25.const", "params": {"value": 5}, "cache": True}])
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = build_plan(spec, default_registry)
+            context = RunContext.create(pipeline="t", params={}, workdir=tmp)
+            engine = Engine(plan, context, cache_store=SpyCache(tmp, include_source=True))
+            engine.run()
+        self.assertTrue(seen, "有缓存节点应计算 cache_key")
+        self.assertTrue(
+            all(isinstance(s, str) and "M25ConstOp" in s for s in seen),
+            "开启 include_source 后应把算子源码传入 compute_key",
+        )
+
+    def test_engine_omits_source_by_default(self):
+        from op_pipeline.cache import CacheStore
+
+        seen: list[str | None] = []
+
+        class SpyCache(CacheStore):
+            def compute_key(self, op_name, op_version, params, inputs, source=None):
+                seen.append(source)
+                return super().compute_key(op_name, op_version, params, inputs, source=source)
+
+        spec = spec_of([{"id": "src", "op": "m25.const", "params": {"value": 5}, "cache": True}])
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = build_plan(spec, default_registry)
+            context = RunContext.create(pipeline="t", params={}, workdir=tmp)
+            engine = Engine(plan, context, cache_store=SpyCache(tmp))
+            engine.run()
+        self.assertTrue(seen)
+        self.assertEqual(seen, [None], "默认关闭源码摘要时 source 应为 None")
+
+
+# --------------------------------------------------------------------------- #
+# M2-6：断点续跑（--resume <run_id>）——失败段与下游重跑，成功段 [resumed]
+# --------------------------------------------------------------------------- #
+@op("m26.stage1")
+class M26Stage1(Operator):
+    """首段：纯计算，产出常量（确定性，可缓存，续跑时复用）。"""
+
+    outputs = [("value", int)]
+    params = {"value": Param(int, default=5)}
+
+    def run(self, ctx, value):
+        return {"value": value}
+
+
+@op("m26.stage2")
+class M26Stage2(Operator):
+    """第二段：门限校验，输入小于门限即失败（模拟"数据校验不过"）。"""
+
+    inputs = [("data", int)]
+    outputs = [("value", int)]
+    params = {"threshold": Param(int, default=100)}
+
+    def run(self, ctx, data, threshold):
+        if data < threshold:
+            raise ValueError(f"校验失败：{data} < {threshold}")
+        return {"value": data}
+
+
+@op("m26.sink")
+class M26Sink(Operator):
+    """第三段：下游，依赖第二段产出。"""
+
+    inputs = [("data", int)]
+    outputs = [("value", int)]
+
+    def run(self, ctx, data):
+        return {"value": data}
+
+
+def _resume_spec():
+    """三段流水线：s1 → s2（门限校验）→ s3；门限以流水线参数控制。"""
+    return spec_of(
+        [
+            {"id": "s1", "op": "m26.stage1", "cache": True},
+            {
+                "id": "s2",
+                "op": "m26.stage2",
+                "params": {"threshold": "${p.threshold}"},
+                "inputs": {"data": "${s1.value}"},
+                "cache": True,
+            },
+            {"id": "s3", "op": "m26.sink", "inputs": {"data": "${s2.value}"}, "cache": True},
+        ],
+        params={"threshold": 100},
+        outputs={"v": "${s3.value}"},
+    )
+
+
+class ResumeTest(unittest.TestCase):
+    """M2-6：--resume 只重跑上次失败段与下游；成功段以 [resumed] 复用缓存不重跑。"""
+
+    def test_resume_skips_succeeded_segment(self):
+        from op_pipeline.store import RunStore
+
+        spec = _resume_spec()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunStore(Path(tmp) / "runs.db")
+            cache_dir = str(Path(tmp) / "cache")
+            try:
+                # 首跑：s2 门限 100 校验失败 → 报告 failed，s3 跳过
+                report1, _values1 = run_pipeline(
+                    spec, registry=default_registry, workdir=tmp,
+                    cache_dir=cache_dir, run_store=store,
+                )
+                self.assertEqual(report1.status, "failed")
+                self.assertEqual(report1.node("s1").status, "success")
+                self.assertEqual(report1.node("s2").status, "failed")
+                self.assertEqual(report1.node("s3").status, "skipped")
+                run_id1 = report1.run_id
+
+                # 修数据（门限降到 4）后以 --resume 语义续跑
+                report2, values2 = run_pipeline(
+                    spec, registry=default_registry, workdir=tmp,
+                    cache_dir=cache_dir, run_store=store,
+                    overrides={"threshold": 4}, resume_run_id=run_id1,
+                )
+                self.assertEqual(report2.status, "success")
+                self.assertTrue(report2.node("s1").resumed, "首段应标记 [resumed]")
+                self.assertTrue(report2.node("s1").cached, "首段应复用缓存不重跑")
+                self.assertEqual(report2.node("s2").status, "success", "失败段应重跑")
+                self.assertEqual(report2.node("s3").status, "success", "下游应重跑")
+                self.assertEqual(values2["s3.value"], 5)
+
+                # 不带 resume 的普通重跑：缓存命中但不标记 resumed
+                report3, _values3 = run_pipeline(
+                    spec, registry=default_registry, workdir=tmp,
+                    cache_dir=cache_dir, run_store=store,
+                    overrides={"threshold": 4},
+                )
+                self.assertTrue(report3.node("s1").cached, "普通重跑仍应命中缓存")
+                self.assertFalse(report3.node("s1").resumed, "未指定 resume 不应标记 [resumed]")
+            finally:
+                store.close()
+
+    def test_resume_unknown_run_id_runs_normally(self):
+        from op_pipeline.store import RunStore
+
+        spec = _resume_spec()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunStore(Path(tmp) / "runs.db")
+            cache_dir = str(Path(tmp) / "cache")
+            try:
+                report1, _v = run_pipeline(
+                    spec, registry=default_registry, workdir=tmp,
+                    cache_dir=cache_dir, run_store=store,
+                )
+                self.assertEqual(report1.status, "failed")
+                report2, _v = run_pipeline(
+                    spec, registry=default_registry, workdir=tmp,
+                    cache_dir=cache_dir, run_store=store,
+                    overrides={"threshold": 4}, resume_run_id="no-such-run",
+                )
+                self.assertEqual(report2.status, "success")
+                self.assertFalse(
+                    report2.node("s1").resumed,
+                    "找不到参考 run_id 时应退化为普通运行，不标记 [resumed]",
+                )
+                self.assertTrue(report2.node("s1").cached, "缓存命中仍是普通缓存语义")
+            finally:
+                store.close()
+
+    def test_resume_requires_cache_entry(self):
+        from op_pipeline.store import RunStore
+
+        spec = _resume_spec()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunStore(Path(tmp) / "runs.db")
+            try:
+                cache_dir1 = str(Path(tmp) / "cache1")
+                report1, _v = run_pipeline(
+                    spec, registry=default_registry, workdir=tmp,
+                    cache_dir=cache_dir1, run_store=store,
+                )
+                self.assertEqual(report1.status, "failed")
+                run_id1 = report1.run_id
+                # 缓存目录更换（模拟缓存被清理）：key 一致但无缓存条目 → 不能 resume，必须重跑
+                cache_dir2 = str(Path(tmp) / "cache2")
+                report2, _v = run_pipeline(
+                    spec, registry=default_registry, workdir=tmp,
+                    cache_dir=cache_dir2, run_store=store,
+                    overrides={"threshold": 4}, resume_run_id=run_id1,
+                )
+                self.assertEqual(report2.status, "success")
+                self.assertFalse(report2.node("s1").resumed, "无缓存条目时不能 resume")
+                self.assertFalse(report2.node("s1").cached, "缓存缺失时应重跑")
+            finally:
+                store.close()
+
+    def test_cli_resume_requires_runs_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "pipe.toml"
+            cfg.write_text(
+                'name = "m26"\n'
+                "[[nodes]]\n"
+                'id = "s1"\n'
+                'op = "control.const"\n'
+                "[nodes.params]\n"
+                "value = 1\n",
+                encoding="utf-8",
+            )
+            proc = DryRunNoSideEffectsTest._run_cli(
+                "run", str(cfg), "--resume", "some-run-id", "--no-cache", cwd=str(ROOT)
+            )
+            self.assertNotEqual(0, proc.returncode, "--resume 不配合 --runs 应报错退出")
+            self.assertIn("--runs", proc.stderr)
+
+
+class _RecordingHook:
+    """M2-7 测试钩子：按顺序收集事件序列。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+
+    def on_node_start(self, node_id, op):
+        self.events.append(("start", node_id, op))
+
+    def on_node_finish(self, node_id, status, duration, cached):
+        self.events.append(("finish", node_id, status, cached))
+
+    def on_run_finish(self, report):
+        self.events.append(("run_finish", report.status))
+
+
+class HookTest(unittest.TestCase):
+    """M2-7：Engine(hooks=[...]) 执行事件钩子。"""
+
+    def _linear_spec(self):
+        return spec_of(
+            [
+                {"id": "src", "op": "control.const", "params": {"value": 1}},
+                {"id": "h1", "op": "testkit.double", "params": {"times": 2},
+                 "inputs": {"value": "${src.value}"}},
+                {"id": "h2", "op": "testkit.double", "params": {"times": 3},
+                 "inputs": {"value": "${h1.value}"}},
+                {"id": "h3", "op": "testkit.double", "params": {"times": 4},
+                 "inputs": {"value": "${h2.value}"}},
+            ],
+            outputs={"v": "${h3.value}"},
+        )
+
+    def test_hooks_follow_schedule_order(self):
+        hook = _RecordingHook()
+        report, values = run_pipeline(
+            self._linear_spec(), registry=default_registry, hooks=[hook]
+        )
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["h3.value"], 24)
+        events = hook.events
+        # on_run_finish 总是最后一个事件
+        self.assertEqual(events[-1][0], "run_finish")
+        self.assertEqual(events[-1][1], "success")
+        # 每个真实执行的节点：start 先于 finish，且各恰好一次
+        for node_id in ("src", "h1", "h2", "h3"):
+            starts = [i for i, e in enumerate(events) if e[0] == "start" and e[1] == node_id]
+            finishes = [i for i, e in enumerate(events) if e[0] == "finish" and e[1] == node_id]
+            self.assertEqual(len(starts), 1, f"{node_id} 应恰好一次 start")
+            self.assertEqual(len(finishes), 1, f"{node_id} 应恰好一次 finish")
+            self.assertLess(starts[0], finishes[0], f"{node_id} 的 start 应先于 finish")
+        # 调度顺序：上游 finish 先于下游 start（线性链 src→h1→h2→h3）
+        for up, down in (("src", "h1"), ("h1", "h2"), ("h2", "h3")):
+            up_finish = next(i for i, e in enumerate(events) if e[0] == "finish" and e[1] == up)
+            down_start = next(i for i, e in enumerate(events) if e[0] == "start" and e[1] == down)
+            self.assertLess(up_finish, down_start, f"{up} 的 finish 应先于 {down} 的 start")
+
+    def test_hook_on_node_finish_fires_on_failure(self):
+        hook = _RecordingHook()
+        spec = spec_of(
+            [
+                {"id": "src", "op": "control.const", "params": {"value": 1}},
+                {"id": "h1", "op": "testkit.boom", "inputs": {"value": "${src.value}"}},
+                {"id": "h2", "op": "testkit.double", "params": {"times": 2},
+                 "inputs": {"value": "${h1.value}"}},
+            ],
+            outputs={"v": "${h2.value}"},
+        )
+        report, _v = run_pipeline(spec, registry=default_registry, hooks=[hook])
+        self.assertEqual(report.status, "failed")
+        # 失败节点也触发 on_node_finish（status=failed）
+        self.assertIn(("finish", "h1", "failed", False), hook.events)
+        # 被跳过的下游不触发任何钩子（它从未开始执行）
+        self.assertNotIn(("start", "h2", "testkit.double"), hook.events)
+        self.assertNotIn(("finish", "h2", "skipped", False), hook.events)
+        # 运行级事件仍在最后，且状态为 failed
+        self.assertEqual(hook.events[-1][0], "run_finish")
+        self.assertEqual(hook.events[-1][1], "failed")
+
+    def test_hook_cached_node_reports_cached(self):
+        hook = _RecordingHook()
+        spec = spec_of(
+            [
+                {"id": "src", "op": "control.const", "params": {"value": 1}},
+                {"id": "h1", "op": "testkit.double", "params": {"times": 2},
+                 "inputs": {"value": "${src.value}"}, "cache": True},
+            ],
+            outputs={"v": "${h1.value}"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            run_pipeline(spec, registry=default_registry, workdir=tmp,
+                         cache_dir=str(Path(tmp) / "cache"), hooks=[hook])
+            report, _v = run_pipeline(spec, registry=default_registry, workdir=tmp,
+                                      cache_dir=str(Path(tmp) / "cache"), hooks=[hook])
+        self.assertEqual(report.status, "success")
+        self.assertTrue(report.node("h1").cached, "第二次运行应命中缓存")
+        # 同一 hook 跨两次运行复用，取最后一次 finish（即第二次运行的）
+        finish = [e for e in hook.events if e[0] == "finish" and e[1] == "h1"][-1]
+        self.assertEqual(finish[2], "success")
+        self.assertTrue(finish[3], "命中缓存的节点 on_node_finish 应带 cached=True")
+
+    def test_hook_exception_does_not_break_pipeline(self):
+        class BadHook:
+            def on_node_finish(self, node_id, status, duration, cached):
+                raise RuntimeError("钩子炸了")
+
+        report, values = run_pipeline(
+            self._linear_spec(), registry=default_registry, hooks=[BadHook()]
+        )
+        self.assertEqual(report.status, "success", "钩子异常不应影响流水线")
+        self.assertEqual(values["h3.value"], 24)
+        self.assertTrue(
+            any("钩子炸了" in w for w in report.warnings),
+            "钩子异常应记入报告告警",
+        )
+
+    def test_top_level_run_accepts_hooks(self):
+        hook = _RecordingHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "pipe.toml"
+            cfg.write_text(
+                'name = "m27"\n'
+                "[[nodes]]\n"
+                'id = "s1"\n'
+                'op = "control.const"\n'
+                "[nodes.params]\n"
+                "value = 7\n",
+                encoding="utf-8",
+            )
+            report, values = run(str(cfg), hooks=[hook])
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["s1.value"], 7)
+        self.assertIn(("run_finish", "success"), hook.events)
+
+
+class AsyncHostTest(unittest.TestCase):
+    """M2-8：run_pipeline_async 在 async 宿主内 await，且不阻塞事件循环。"""
+
+    @staticmethod
+    def _slow_spec():
+        return spec_of(
+            [
+                {"id": "src", "op": "control.const", "params": {"value": 1}},
+                {"id": "slow", "op": "testkit.sleep", "params": {"seconds": 0.3},
+                 "inputs": {"value": "${src.value}"}},
+                {"id": "out", "op": "testkit.double", "params": {"times": 24},
+                 "inputs": {"value": "${slow.value}"}},
+            ],
+            outputs={"v": "${out.value}"},
+        )
+
+    def test_await_in_running_loop_returns_report(self):
+        from op_pipeline import run_pipeline_async
+
+        async def main():
+            report, values = await run_pipeline_async(
+                self._slow_spec(), registry=default_registry
+            )
+            return report, values
+
+        report, values = asyncio.run(main())
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["out.value"], 24)
+        self.assertEqual(report.outputs["v"], 24)
+
+    def test_other_async_tasks_advance_while_pipeline_runs(self):
+        from op_pipeline import run_pipeline_async
+
+        async def main():
+            ticks = 0
+
+            async def ticker():
+                nonlocal ticks
+                while True:
+                    await asyncio.sleep(0.01)
+                    ticks += 1
+
+            task = asyncio.create_task(ticker())
+            try:
+                report, _v = await run_pipeline_async(
+                    self._slow_spec(), registry=default_registry
+                )
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            return report, ticks
+
+        report, ticks = asyncio.run(main())
+        self.assertEqual(report.status, "success")
+        self.assertGreaterEqual(ticks, 3, "流水线运行期间事件循环应持续推进")
 
 
 if __name__ == "__main__":

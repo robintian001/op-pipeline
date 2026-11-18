@@ -16,6 +16,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+import functools
+import inspect
 import logging
 import os
 import threading
@@ -24,7 +27,7 @@ import traceback
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from .cache import CacheStore
 from .context import RunContext
@@ -78,6 +81,10 @@ class NodeResult:
     note: str = ""
     # 失败时的异常堆栈（截断保留末尾；成功时为空串）
     traceback: str = ""
+    # M2-5：命中缓存计算出的 cache_key（供 RunStore 记录与 M2-6 断点续跑比对）
+    cache_key: str = ""
+    # M2-6：断点续跑命中（缓存条目 + 参考 run 的成功记录 + key 一致）时为 True
+    resumed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +94,7 @@ class NodeResult:
             "duration": round(self.duration, 4),
             "attempts": self.attempts,
             "cached": self.cached,
+            "resumed": self.resumed,
             "outputs": self.outputs,
             "error": self.error,
             "note": self.note,
@@ -156,7 +164,7 @@ class RunReport:
         ]
         for node in self.nodes:
             mark = icon.get(node.status, "?")
-            flag = " [cache]" if node.cached else ""
+            flag = " [resumed]" if node.resumed else (" [cache]" if node.cached else "")
             lines.append(
                 f"{node.node_id:<20}{mark} {node.status:<8}{node.duration:>8.2f}s{node.attempts:>6}  {node.op}{flag}"
             )
@@ -175,6 +183,30 @@ class RunReport:
             for warning in self.warnings:
                 lines.append(f"  - {warning}")
         return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# 执行事件钩子（M2-7）
+# --------------------------------------------------------------------------- #
+class Hook(Protocol):
+    """执行事件钩子协议（M2-7）：实现其中任意一个或多个方法即可挂到
+    ``Engine(hooks=[...])`` / ``run_pipeline(hooks=[...])``。
+
+    - ``on_node_start(node_id, op)``：节点开始执行（含命中缓存提前返回前）；
+    - ``on_node_finish(node_id, status, duration, cached)``：节点结果确定——
+      成功、失败、缓存命中都触发；被跳过的节点（when 为假 / 上游失败 /
+      取消）从未开始执行，不触发任何钩子；
+    - ``on_run_finish(report)``：运行汇总完毕（报告状态已定），总在最后。
+
+    节点并行执行时钩子可能被多个线程并发调用，实现需自带同步
+    （文档进度条示例即用锁）；钩子抛出的异常只记入报告告警，不影响流水线。
+    """
+
+    def on_node_start(self, node_id: str, op: str) -> None: ...
+
+    def on_node_finish(self, node_id: str, status: str, duration: float, cached: bool) -> None: ...
+
+    def on_run_finish(self, report: RunReport) -> None: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -198,6 +230,9 @@ class Engine:
         cancel_event: threading.Event | None = None,
         executor: str | None = None,
         handle_store: HandleStore | None = None,
+        run_store: Any = None,
+        resume_run_id: str | None = None,
+        hooks: list[Any] | None = None,
     ) -> None:
         if executor not in (None, "thread", "process"):
             raise ConfigError(f"executor 只能是 thread/process，实际是 {executor!r}")
@@ -232,6 +267,32 @@ class Engine:
         attach = getattr(self.store, "attach", None)
         if callable(attach):
             attach(context)
+        # M2-5：可选的 SQLite 运行记录（RunStore）；默认 None = 完全不触碰 SQLite
+        self.run_store = run_store
+        # M2-6：断点续跑——仅当同时给定了 run_store 与 resume_run_id 才生效；
+        # 语义：节点 cache_key 与参考 run 的成功记录一致且缓存可命中时标记 resumed。
+        # 参考 run 的节点记录在构造时一次预载进内存（SQLite 连接有线程亲和性，
+        # 不能在工作线程里查），worker 线程只读内存 map。
+        self.resume_run_id = resume_run_id
+        self._resume_map: dict[str, tuple[str, str | None]] = {}
+        if self.resume_run_id is not None and self.run_store is not None:
+            for row in self.run_store.query(
+                "SELECT node_id, status, cache_key FROM nodes WHERE run_id = ?",
+                (self.resume_run_id,),
+            ):
+                self._resume_map[row[0]] = (row[1], row[2])
+        # M2-7：执行事件钩子——广播给全部钩子，异常只记告警
+        self.hooks = list(hooks or [])
+
+    def _emit(self, event: str, *args: Any) -> None:
+        """M2-7：把事件广播给全部钩子；钩子异常只记告警，不影响流水线。"""
+        for hook in self.hooks:
+            fn = getattr(hook, event, None)
+            if callable(fn):
+                try:
+                    fn(*args)
+                except Exception as exc:  # noqa: BLE001 钩子是旁观者，异常必须隔离
+                    self._warnings.append(f"hook {event} 异常：{type(exc).__name__}: {exc}")
 
     def cancel(self, reason: str = "调用方请求取消") -> None:
         """请求取消本次运行（线程安全，可从其它线程调用）。
@@ -310,12 +371,25 @@ class Engine:
         self._warnings.extend(check_handle_types(self.plan, self.store.snapshot()))
         report.warnings.extend(self._warnings)
         report.finished_at = time.time()
+        # M2-5：运行级记录落库（run_id 主键，可覆盖同 run_id 的重跑记录）
+        if self.run_store is not None:
+            self.run_store.record_run(
+                report.run_id,
+                report.pipeline,
+                report.version,
+                report.status,
+                report.started_at,
+                report.finished_at,
+                report.params,
+            )
         self.context.logger.info(
             "运行结束 %s：%s，耗时 %.2fs",
             report.run_id,
             report.status,
             report.duration,
         )
+        # M2-7：运行汇总完毕（报告状态已定），广播 on_run_finish——总在最后
+        self._emit("on_run_finish", report)
         return report
 
     # ------------------------------------------------------------------ #
@@ -413,14 +487,35 @@ class Engine:
         self._results[node_id] = result
         self._completed[node_id] = result.status
 
+        # M2-5：节点级记录落库（_collect 是真实执行节点的收口点）
+        if self.run_store is not None:
+            self._record_node(result)
+
         if result.status == FAILED and not self._allowed_failure(node_id) and self.fail_fast:
             self._aborted = True
+
+    def _record_node(self, result: NodeResult) -> None:
+        """把单个节点结果写入 RunStore（成功/失败/跳过都记录，nodes 表与报告一致）。"""
+        self.run_store.record_node(
+            self.context.run_id,
+            result.node_id,
+            result.op,
+            result.status,
+            result.attempts,
+            result.cached,
+            result.error,
+            result.cache_key or None,
+            result.started_at + result.duration,
+        )
 
     def _mark_skipped(self, node_id: str, note: str) -> None:
         node = self.plan.node(node_id)
         result = NodeResult(node_id=node_id, op=node.spec.op, status=SKIPPED, note=note)
         self._results[node_id] = result
         self._completed[node_id] = SKIPPED
+        # M2-5：跳过节点同样入库（保证 nodes 表与 RunReport 的节点列表一致）
+        if self.run_store is not None:
+            self._record_node(result)
         self.context.logger.info("节点 %s 跳过：%s", node_id, note)
 
     # ------------------------------------------------------------------ #
@@ -429,6 +524,8 @@ class Engine:
     def _run_node(self, node: PlanNode) -> NodeResult:
         ctx = self.context.for_node(node.spec.id, node.spec.op)
         result = NodeResult(node_id=node.spec.id, op=node.spec.op, started_at=time.time())
+        # M2-7：节点开始执行（worker 线程调用，钩子需自行加锁）
+        self._emit("on_node_start", node.spec.id, node.spec.op)
         # M2-3：RefResolver 构造时经 store.snapshot() 拍快照，
         # 与原 dict(self.handles) 行为等价（节点开始时的可见句柄集）
         resolver = RefResolver(self.plan.params, self.store)
@@ -448,20 +545,39 @@ class Engine:
                 and self.cache.enabled
                 and getattr(instance, "deterministic", True)
             ):
+                # M2-5（T7 出债）：可选地把算子类源码摘要纳入 key——
+                # 源码变化即缓存失效；默认关闭（include_source=False）保持旧行为
+                source = None
+                if getattr(self.cache, "include_source", False):
+                    try:
+                        source = inspect.getsource(type(instance))
+                    except (OSError, TypeError):  # pragma: no cover - 动态类拿不到源码
+                        source = None
                 cache_key = self.cache.compute_key(
-                    node.spec.op, instance.version, params, inputs
+                    node.spec.op, instance.version, params, inputs, source=source
                 )
                 cached = self.cache.load(cache_key)
                 if cached is not None:
                     outputs = cached
                     result.cached = True
+                    result.cache_key = cache_key
                     result.status = SUCCESS
                     result.duration = time.time() - result.started_at
                     result.outputs = {k: _describe(v) for k, v in outputs.items()}
+                    # M2-6：断点续跑——参考 run 里该节点成功且 cache_key 一致才算续跑命中；
+                    # 只复用缓存/句柄（产出已在缓存里），不重跑算子
+                    prev = self._resume_map.get(node.spec.id)
+                    if prev is not None and prev[0] == SUCCESS and prev[1] == cache_key:
+                        result.resumed = True
                     self._publish(node, outputs)
-                    self.context.logger.info("节点 %s 命中缓存", node.spec.id)
+                    self.context.logger.info(
+                        "节点 %s 命中缓存%s",
+                        node.spec.id,
+                        f"，续跑自 {self.resume_run_id}" if result.resumed else "",
+                    )
                     return result
 
+            result.cache_key = cache_key or ""
             outputs = self._execute_with_retry(instance, ctx, inputs, node, result)
             result.status = SUCCESS
             result.outputs = {k: _describe(v) for k, v in outputs.items()}
@@ -487,8 +603,17 @@ class Engine:
                     "节点 %s 完成（%.2fs%s）",
                     node.spec.id,
                     result.duration,
-                    "，缓存" if result.cached else "",
+                    "，续跑" if result.resumed else ("，缓存" if result.cached else ""),
                 )
+            # M2-7：节点结果确定（成功/失败/缓存命中都触发；finally 保证
+            # 缓存命中提前 return 也会发 finish）
+            self._emit(
+                "on_node_finish",
+                node.spec.id,
+                result.status,
+                result.duration,
+                result.cached,
+            )
         return result
 
     def _publish(self, node: PlanNode, outputs: Mapping[str, Any]) -> None:
@@ -611,6 +736,9 @@ def run_pipeline(
     cancel_event: threading.Event | None = None,
     executor: str | None = None,
     handle_store: HandleStore | None = None,
+    run_store: Any = None,
+    resume_run_id: str | None = None,
+    hooks: list[Any] | None = None,
     run_id: str | None = None,
     logger: logging.Logger | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
@@ -619,6 +747,12 @@ def run_pipeline(
     ``handle_store`` 可注入自定义句柄存储（如
     ``SpillHandleStore(threshold=...)``，超阈值落盘）；
     返回的句柄表是全量物化后的 dict（落盘项在此时加载回内存）。
+    ``run_store`` 可注入 :class:`~op_pipeline.store.RunStore`（SQLite 运行记录，
+    默认 None = 不落库；连接生命周期由调用方管理）。
+    ``resume_run_id``（M2-6）配合 ``run_store`` 使用：参考该 run 的 nodes 记录，
+    与本次 cache_key 比对，成功段复用缓存并标记 [resumed]，失败段与下游照常重跑。
+    ``hooks``（M2-7）执行事件钩子列表：on_node_start / on_node_finish /
+    on_run_finish，节点并行时可能被并发调用，异常只记告警不影响流水线。
 
     典型的库内调用::
 
@@ -640,6 +774,68 @@ def run_pipeline(
     cache_store = CacheStore(cache_dir, base_dir=workdir)
     engine = Engine(plan, context, cache_store=cache_store, max_workers=max_workers,
                     fail_fast=fail_fast, cancel_event=cancel_event, executor=executor,
-                    handle_store=handle_store)
+                    handle_store=handle_store, run_store=run_store,
+                    resume_run_id=resume_run_id, hooks=hooks)
     report = engine.run()
     return report, dict(engine.store.snapshot())
+
+
+async def run_pipeline_async(
+    spec: Any,
+    *,
+    registry: Any,
+    workdir: str | Path = ".",
+    overrides: Mapping[str, Any] | None = None,
+    cache_dir: str | Path | None = None,
+    max_workers: int | None = None,
+    fail_fast: bool = False,
+    cancel_event: threading.Event | None = None,
+    executor: str | None = None,
+    handle_store: HandleStore | None = None,
+    run_store: Any = None,
+    resume_run_id: str | None = None,
+    hooks: list[Any] | None = None,
+    run_id: str | None = None,
+    logger: logging.Logger | None = None,
+) -> tuple[RunReport, dict[str, Any]]:
+    """async 宿主嵌入（M2-8）：把同步引擎抛到事件循环的默认执行器里跑。
+
+    ``await run_pipeline_async(...)`` 与 :func:`run_pipeline` 的参数、
+    返回值完全一致；区别在于不会阻塞事件循环——流水线在
+    ``loop.run_in_executor`` 的线程里执行，await 期间同循环的其它
+    asyncio 任务照常推进。
+
+    这是"嵌入 async 宿主"的桥接，不是全 asyncio 调度器：调度仍发生在
+    线程池内，取消/超时语义与同步版本相同（``asyncio.CancelledError``
+    只会放弃 await，不会中途终止正在跑的流水线；需要中途止损仍应使用
+    ``cancel_event``）。全 asyncio 调度器不在本里程碑范围。
+
+    典型用法::
+
+        async def main():
+            report, values = await run_pipeline_async(
+                spec, registry=default_registry, workdir="."
+            )
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        functools.partial(
+            run_pipeline,
+            spec,
+            registry=registry,
+            workdir=workdir,
+            overrides=overrides,
+            cache_dir=cache_dir,
+            max_workers=max_workers,
+            fail_fast=fail_fast,
+            cancel_event=cancel_event,
+            executor=executor,
+            handle_store=handle_store,
+            run_store=run_store,
+            resume_run_id=resume_run_id,
+            hooks=hooks,
+            run_id=run_id,
+            logger=logger,
+        ),
+    )

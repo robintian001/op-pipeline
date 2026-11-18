@@ -24,7 +24,7 @@
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │ Plan（已校验的可执行图）
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 编排层  (engine.py + executor.py + handlestore.py + cache.py + context.py)      │
+│ 编排层  (engine / executor / handlestore / store / cache / context.py)   │
 │   职责：依赖就绪调度、线程池并行、重试与退避、软超时、失败传播、              │
 │         句柄发布、内容指纹缓存、运行报告聚合、运行上下文与产物目录           │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -51,8 +51,9 @@
 | 模块 | 主要符号 | 职责 | 不负责 |
 | --- | --- | --- | --- |
 | [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) | `NodeSpec` `PipelineSpec` `RefResolver` `PlanNode` `Plan` `build_plan` `topological_order` | 配置解析、引用解析、静态校验、依赖推导与拓扑排序 | 不做实际执行、不加载算子实现 |
-| [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) | `Engine` `NodeResult` `RunReport` `run_pipeline` | 调度、并行、重试、超时、失败传播、缓存接入、报告 | 不解析配置、不做参数声明校验 |
-| [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py) | `HandleStore` `InMemoryHandleStore` | 句柄存取抽象（get/put/snapshot/items）与线程安全内存实现（M2-3） | 不做引用解析（RefResolver 的事）、不感知节点语义 |
+| [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) | `Engine` `NodeResult` `RunReport` `run_pipeline` `run_pipeline_async` `Hook` | 调度、并行、重试、超时、失败传播、缓存接入、断点续跑、执行事件钩子（M2-7）、async 宿主桥接（M2-8）、报告 | 不解析配置、不做参数声明校验 |
+| [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py) | `HandleStore` `InMemoryHandleStore` `SpillHandleStore` | 句柄存取抽象（get/put/snapshot/items）、线程安全内存实现（M2-3）与超阈值 pickle 落盘、按需加载（M2-4） | 不做引用解析（RefResolver 的事）、不感知节点语义 |
+| [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/store.py) | `RunStore` | 可选 SQLite 运行记录（`record_run`/`record_node`/`query`/`prev_node`，runs/nodes 两表，M2-5），默认关闭零副作用；M2-6 供断点续跑比对 | 不决定调度/重试，只记录 |
 | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) | `Executor` `ThreadExecutor` `ProcessExecutor` | 执行器抽象（`submit`/`wait`/`shutdown` 协议）、线程池默认实现与硬超时进程执行器（M2-2） | 不做调度决策、不做重试/缓存（仍属 engine） |
 | [operator.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/operator.py) | `Operator` `normalize_operator_class` | 算子声明归一化、输入/输出运行时校验、异步支持 | 不关心 DAG 与调度 |
 | [ports.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/ports.py) | `Port` `as_ports` `value_matches` `port_warnings` | 端口声明归一化、软类型检查 | 不阻断执行（软校验） |
@@ -108,7 +109,7 @@
 | D6 | 内容指纹缓存（pickle 文件） | 零依赖、天然按上下游自动失效 | 仅单机、无淘汰策略、pickle 只可读可信目录 |
 | D7 | 零第三方依赖 | 便于嵌入到任意项目与受限环境 | YAML 支持是可选依赖；无 DataFrame 原生支持 |
 | D8 | 失败只向下游传播，独立分支继续 | 配置化流水线的默认预期行为 | 需要 `fail_fast` 才能快速止损 |
-| D9 | 报告是返回值 + 可选 JSON，不做持久化 | 保持"库"的形态 | 无断点续跑、无历史查询能力 |
+| D9 | 报告是返回值 + 可选 JSON，不做持久化 | 保持"库"的形态；M2-5/M2-6 起运行元数据可选落 SQLite 供续跑 | 无内建历史查询 UI；元数据持久化默认关闭，需显式 `--runs` |
 
 ## 6. 一次运行的对象协作
 
@@ -116,13 +117,17 @@
 调用方
   │  PipelineSpec.from_file()          配置 → 规格
   │  build_plan(spec, registry)        规格 → Plan（含校验/依赖/拓扑序）
+  │  await run_pipeline_async(...)     M2-8：run_in_executor → 同步引擎（事件循环不被阻塞）
   │  RunContext.create(...)            运行上下文 + 产物目录
   │  CacheStore(dir)                   缓存开关
+  │  RunStore(db)                      仅 --runs / run_store 时构造（否则零副作用）
   ▼
 Engine.run()
+  ├─ 构造时（--resume）：预载参考 run 的 nodes(status/cache_key) → _resume_map
   ├─ 调度循环：dispatch → wait(FIRST_COMPLETED) → collect
-  ├─ 每节点：解析引用 → 实例化/复用算子 → 缓存查询 → 执行(重试/超时) → 发布句柄
-  └─ 汇总：RunReport（状态、耗时、尝试次数、缓存标记、告警）
+  ├─ 每节点：解析引用 → 实例化/复用算子 → 缓存查询(命中且续跑匹配→[resumed]) → 执行(重试/超时) → 发布句柄
+  ├─ 钩子（hooks=[...]，M2-7）：on_node_start / on_node_finish(成功/失败/缓存命中) / on_run_finish(最后)
+  └─ 汇总：RunReport（状态、耗时、尝试次数、缓存/续跑标记、告警）
   ▼
 (RunReport, handles)
 ```

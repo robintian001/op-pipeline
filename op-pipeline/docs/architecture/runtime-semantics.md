@@ -13,7 +13,7 @@
 ```
 
 编译入口见 [build_plan()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L328-L487)，
-执行入口见 [Engine.run()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L196-L264)。
+执行入口见 [Engine.run()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L252-L336)。
 
 ---
 
@@ -93,7 +93,7 @@ pending ──┬─► running ──► success ──► 下游可调度
 ```
 
 引擎内部用两个并发字典跟踪：`_results[node_id] = NodeResult`、`_completed[node_id] = status`
-（[engine.py#L188-L193](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L188-L193)）。
+（[engine.py#L217-L218](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L217-L218)）。
 
 ### 2.2 主循环
 
@@ -111,12 +111,12 @@ while pending or running:
         mark_all_pending_skipped("依赖无法满足")
 ```
 
-源码：[engine.py#L215-L233](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L215-L233)。
+源码：[engine.py#L275-L288](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L275-L288)。
 
 ### 2.3 dispatch 的决策顺序
 
 对 `pending` 中的每个节点（按拓扑序）依次判断
-（[engine.py#L288-L346](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L288-L346)）：
+（[engine.py#L344-L402](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L344-L402)）：
 
 1. **取消已触发**（`cancel_event` 被置位或 `Engine.cancel()` 被调用）→ 全部标记 skipped，
    注明"运行已被取消：\<原因\>"，并向报告 `warnings` 追加一条取消告警；
@@ -142,7 +142,7 @@ env = {
 }
 ```
 
-源码：[engine.py#L348-L366](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L348-L366)。
+源码：[engine.py#L404-L422](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L404-L422)。
 求值走 [evaluate_condition()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/expression.py#L172-L174)，
 即 AST 白名单（见 [核心模块设计 §5](../design/core-modules.md#5-expressionpy安全表达式)）。
 
@@ -174,8 +174,13 @@ except: status = failed, error = "Type: message", traceback = format_exc()（截
 finally: duration = now - started_at
 ```
 
-源码：[engine.py#L361-L421](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L361-L421)。
-`_publish` 在锁内写共享句柄表（[engine.py#L423-L428](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L423-L428)）。
+源码：[engine.py#L467-L540](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L467-L540)。
+`_publish` 在锁内写共享句柄表（[engine.py#L542-L547](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L542-L547)）。
+
+> M2-4 `SpillHandleStore` 的落盘语义：`put` 时按 `pickle.dumps` 结果量大小，
+> 超过阈值（默认 1MB）的值写盘（目录默认 `artifacts_dir/spill`，引擎在构造时经
+> `attach(context)` 钩子注入），表内只存路径占位；读收敛点不变——`get` /
+> 快照按键访问按需 `pickle.loads`，成员检查与迭代经惰性快照零 IO。
 
 > 并发正确性说明：节点只能引用其 `depends_on` 中已完成的句柄，而 dispatch 要求依赖全部
 > `_completed` 才提交，所以在"只引用声明依赖"的前提下，快照读是安全的。
@@ -196,7 +201,7 @@ finally: duration = now - started_at
 | `fail_fast=true` 且出现硬失败 | failed | skipped | **停止调度** | `failed` |
 
 硬失败判定：`status == failed && not allow_failure`
-（[engine.py#L245-L254](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L245-L254)）。
+（[engine.py#L341-L343](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L341-L343)）。
 
 ### 3.2 重试与退避
 
@@ -210,7 +215,7 @@ for attempt in 1..attempts:
         sleep(max(0, retry_delay) * 2 ** (attempt - 1))
 ```
 
-源码：[engine.py#L430-L457](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L430-L457)。
+源码：[engine.py#L549-L580](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L549-L580)。
 
 `ConfigError` 覆盖其全部子类：`SpecValidationError`、`ParamValidationError`、
 `RefResolutionError`、`CycleError`、`OperatorNotFoundError`、`DuplicateOperatorError`。
@@ -264,23 +269,26 @@ key = blake2b(20 bytes, json.dumps({
   "op": <算子注册名（配置里写的那个）>,
   "version": <算子 version 类属性，默认 "1">,
   "params": fingerprint(解析后的参数),
-  "inputs": {端口名: fingerprint(上游值)}
+  "inputs": {端口名: fingerprint(上游值)},
+  "source": blake2b(算子类源码)   ← 仅 CacheStore(include_source=True) 时（M2-5）
 }, sort_keys=True))
 ```
 
-源码：[cache.py#L57-L73](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cache.py#L57-L73)，
+源码：[cache.py#L70-L91](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cache.py#L70-L91)，
 指纹算法见 [fingerprint()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cache.py#L19-L42)：
 标量用 `类型:repr`，容器递归并按 key 排序，类 DataFrame 对象用 `shape + to_json()[:2000]`，其余退化为 `repr`。
 
-由此得到两个期望性质：
+由此得到三个期望性质：
 
 - **上游数据变化 ⇒ 自动失效**（inputs 指纹变）；
-- **下游逻辑变化 ⇒ 不影响上游复用**（上游 key 不含下游信息）。
+- **下游逻辑变化 ⇒ 不影响上游复用**（上游 key 不含下游信息）；
+- **源码变化 ⇒ 失效（可选）**：`CacheStore(include_source=True)` 把算子类源码
+  blake2b 摘要纳入 key（M2-5/T7 出债）；默认关闭保持 key 只含版本字符串。
 
 ### 4.2 生效条件
 
 只有同时满足以下三点才读写缓存
-（[engine.py#L376-L401](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L376-L401)）：
+（[engine.py#L483-L513](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L483-L513)）：
 
 1. 节点 `cache = true`；
 2. `CacheStore.enabled`（目录非空）；
@@ -366,33 +374,160 @@ workdir/                                  # 默认 = 配置文件所在目录
 
 ---
 
-## 6. 一次完整运行时序
+## 6. 运行记录（M2-5）：SQLite 落库
+
+可选的运行元数据持久化：CLI 传 `--runs <db>`、库调用传 `run_store=RunStore(path)`。
+
+- **默认关闭、零副作用**：不传开关时引擎完全不触碰 SQLite，不产生任何文件；
+- 表结构（首次写入惰性建表，标准库 `sqlite3`）：
+
+  | 表 | 字段 |
+  | --- | --- |
+  | `runs` | `run_id`(PK), `pipeline`, `version`, `status`, `started_at`, `finished_at`, `params_json` |
+  | `nodes` | `run_id`+`node_id`(PK), `op`, `status`, `attempts`, `cached`, `error`, `cache_key`, `finished_at` |
+
+- 写入点：
+  - 节点：`Engine._collect`（真实执行收口，**含缓存命中早退**）与 `_mark_skipped`
+    （跳过节点也入库）——nodes 表与 `RunReport` 节点列表一一对应；
+  - 运行：`run()` 末尾一条 `runs`（`INSERT OR REPLACE`，同 `run_id` 重跑可覆盖）；
+- `NodeResult.cache_key`：命中缓存时记录算出的 key；未启用缓存或未命中为
+  `NULL`。这是 M2-6 断点续跑比对"上次成功节点是否可复用"的依据；
+- 连接生命周期由调用方管理（`close()` / `with`）；`query(sql)` 返回原始行；
+- `params` 以 `json.dumps(default=str)` 存 JSON 文本。
+
+### 6.1 断点续跑（M2-6）：`--resume <run_id>`
+
+依赖 M2-5 的 nodes 记录（尤其 `cache_key`）。语义与边界：
+
+- **开关**：CLI `run --runs <db> --resume <run_id>`；库调用
+  `run_pipeline(..., run_store=..., resume_run_id=...)`。`--resume` 必须配合
+  `--runs`（参考库），否则 CLI 报错 exit 2；
+- **机制**：引擎构造时把参考 run 的全部 `(node_id, status, cache_key)` 一次预载进
+  内存 `_resume_map`（**SQLite 连接有线程亲和性——不能在 worker 线程里查询**，
+  预载避免了跨线程访问）；`_run_node` 在缓存命中处比对：
+  参考记录 `status == success` 且 `cache_key` 与本次一致 → 复用缓存并标记
+  `NodeResult.resumed`，报告与日志显示 `[resumed]`；
+- **不会 resume 的情形**：参考段失败/skipped/无记录 → 照常重跑（失败段与下游
+  因此被完整修复）；缓存条目缺失（如被清理）→ 必须重跑，不标 `[resumed]`；
+  未知 `run_id` → 退化为普通运行；不带 resume 的普通重跑只标 `[cache]`
+  （三者均有单测覆盖）；
+- **报告**：`[resumed]` 与 `[cache]` 互斥展示（resumed 优先），
+  `RunReport.to_dict()`/`to_json()` 含 `resumed` 布尔字段。
+
+### 6.2 执行事件钩子（M2-7）：`Engine(hooks=[Hook])`
+
+进度条、日志聚合、OpenTelemetry、未来 UI 都从这里取数。协议与语义：
+
+- **协议**（`Hook`，包顶层导出）：`on_node_start(node_id, op)`、
+  `on_node_finish(node_id, status, duration, cached)`、
+  `on_run_finish(report)`；实现任意一个或多个方法即可；
+- **触发点**：`on_node_start` 在 `_run_node` 开头（节点开始执行）；
+  `on_node_finish` 在 `_run_node` 的 `finally`（成功/失败/缓存命中都触发，
+  缓存命中提前 `return` 也会经 finally 发 finish，cached=True 一并传入）；
+  `on_run_finish` 在 `run()` 汇总完毕（报告状态已定），总在最后；
+- **被跳过的节点不触发**：when 为假 / 上游失败 / 取消的节点从未开始执行，
+  不产生任何钩子事件；
+- **并发与容错**：节点并行执行时钩子可能被多个线程并发调用，实现需自带
+  同步（进度条示例即用锁）；钩子抛出的异常只记入报告告警，不影响流水线；
+- **进度条示例**（线程安全，节点数来自 `plan.nodes`）：
+
+```python
+import sys
+import threading
+
+from op_pipeline import Hook, run_pipeline, default_registry
+
+class ProgressBar(Hook):
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self._lock = threading.Lock()
+
+    def _redraw(self):
+        done = self.done
+        width = 30
+        filled = int(width * done / self.total)
+        sys.stdout.write(f"\r[{'#' * filled}{'-' * (width - filled)}] {done}/{self.total}")
+        sys.stdout.flush()
+
+    def on_node_finish(self, node_id, status, duration, cached):
+        with self._lock:
+            self.done += 1
+        self._redraw()
+
+    def on_run_finish(self, report):
+        sys.stdout.write(f"\n{report.pipeline} {report.status}（{report.duration:.2f}s）\n")
+
+# plan 编译后可取节点数；或简单传 len(spec.nodes)
+report, values = run_pipeline(spec, registry=default_registry,
+                              hooks=[ProgressBar(len(spec.nodes))])
+```
+
+### 6.3 async 宿主嵌入（M2-8）：`run_pipeline_async`
+
+`run_pipeline` 是同步阻塞调用，在 async 宿主（Web 服务、脚本主协程）里直接
+调用会**卡死事件循环**。`run_pipeline_async`（包顶层导出）用
+`loop.run_in_executor` 把同步引擎抛到事件循环的默认线程执行器，参数与返回值
+与 `run_pipeline` 完全一致：
+
+```python
+import asyncio
+
+from op_pipeline import default_registry, run_pipeline_async
+
+async def main():
+    report, values = await run_pipeline_async(
+        spec, registry=default_registry, workdir="."
+    )
+    print(report.status, report.run_id)
+
+asyncio.run(main())
+```
+
+- **非阻塞**：await 期间同循环的其它 asyncio 任务照常推进（有单测验证）；
+- **语义不变**：调度仍在线程池内，重试/缓存/钩子/续跑与同步版本完全一致；
+- **取消语义**：`asyncio.CancelledError` 只放弃 await，不会中途终止正在跑的
+  流水线；需要中途止损仍用 `cancel_event`；
+- **边界**：这是"嵌入 async 宿主"的桥接，**不是全 asyncio 调度器**——后者意味着
+  引擎内部改用 `asyncio.wait(FIRST_COMPLETED)` 调度同步与异步算子，不在本里程碑范围。
+
+---
+
+## 7. 一次完整运行时序
 
 ```
 CLI/库调用
   │ from_file()               解析 JSON/TOML/YAML
+  │ await run_pipeline_async() M2-8：run_in_executor 抛到线程执行器，事件循环不被阻塞
   │ build_plan()              §1 全部校验，产出 Plan
   │ RunContext.create()       计算 artifacts_dir（惰性，首次使用才建目录）
   │ CacheStore(cache_dir)     目录为空即禁用
+  │ RunStore(db)              仅 --runs / run_store 时构造（否则零副作用）
   ▼
 Engine.run()
+  │ 构造时 └─ --resume：预载参考 run 的 nodes(status/cache_key) → _resume_map
   │ dispatch  ├─ 取消 / fail_fast 已触发 → 全部 skipped
   │           ├─ 无依赖节点并行提交（≤ max_workers）
   │           ├─ when 为假 / 上游失败 → skipped
   │           └─ 依赖未完成 → 留到下一轮
   │ wait(FIRST_COMPLETED)
   │ collect   ├─ 写 _results/_completed
+  │           ├─ 缓存命中且 _resume_map 匹配 → 标记 resumed（[resumed]）
+  │           ├─ RunStore.record_node（成功/失败/跳过，含 cache_key）
   │           └─ fail_fast 且硬失败 → _aborted
+  │ 每节点     └─ on_node_start（_run_node 开头）→ on_node_finish（finally，成功/失败/缓存命中）
+  │ run 末尾 └─ on_run_finish(report)（总在最后）
   │ ...循环直到 pending 与 running 均为空
   │ 解析 pipeline outputs
   │ 聚合 status / warnings
+  │ RunStore.record_run（runs 表一条）
   ▼
 RunReport（summary() / to_json()）+ handles
 ```
 
 ---
 
-## 7. 修改引擎时的检查清单
+## 8. 修改引擎时的检查清单
 
 改动 [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) 或
 [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) 时，下面这些不变量必须仍然成立：
