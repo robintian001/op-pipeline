@@ -2290,14 +2290,14 @@ class RunStoreTest(unittest.TestCase):
     def test_compute_key_source_hash_opt_in(self):
         from op_pipeline.cache import CacheStore
 
-        default_cache = CacheStore(None)
+        default_cache = CacheStore(None, include_source=False)  # M5-4：默认已翻转为 True，此处测显式关闭路径
         optin_cache = CacheStore(None, include_source=True)
         src_a = "class A:\n    pass\n"
         src_b = "class B:\n    pass\n"
         self.assertEqual(
             default_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_a),
             default_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_b),
-            "默认关闭源码摘要时 source 不应影响 key",
+            "关闭源码摘要（include_source=False）时 source 不应影响 key",
         )
         k1 = optin_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_a)
         k2 = optin_cache.compute_key("m25.srcdep", "1.0", {"a": 1}, {}, source=src_b)
@@ -2344,10 +2344,10 @@ class RunStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             plan = build_plan(spec, default_registry)
             context = RunContext.create(pipeline="t", params={}, workdir=tmp)
-            engine = Engine(plan, context, cache_store=SpyCache(tmp))
+            engine = Engine(plan, context, cache_store=SpyCache(tmp, include_source=False))  # M5-4：默认已翻转为 True，此处测显式关闭路径
             engine.run()
         self.assertTrue(seen)
-        self.assertEqual(seen, [None], "默认关闭源码摘要时 source 应为 None")
+        self.assertEqual(seen, [None], "关闭源码摘要（include_source=False）时 source 应为 None")
 
 
 # --------------------------------------------------------------------------- #

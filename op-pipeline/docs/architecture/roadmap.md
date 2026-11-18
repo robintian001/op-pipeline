@@ -54,11 +54,11 @@
 | 场景 | 需要补的算子 | 对内核的改动 | 计划落点 |
 | --- | --- | --- | --- |
 | API 数据采集 | `http.request`（标准库 `urllib` 即可，不破零依赖） | 无 | M3（**已落地**） |
-| 数据库读写 | `db.sqlite_*`（标准库）；MySQL/PG 走可选 extras | 无 | M3（**已落地**） |
+| 数据库读写 | `db.sqlite_*`（标准库）；MySQL/PG 走可选 extras | 无 | M3 sqlite / M5-3 MySQL、PG（**均已落地**） |
 | Excel/Parquet | 可选依赖算子，做成 extras 不污染内核 | 无 | M4（**已落地**） |
 | 较大数据量 | `list[dict]` ↔ DataFrame adapter（df.from_table/to_table/to_csv，pandas extras），重计算段交给 pandas | 无（编排层零改动） | M3（**已落地**） |
 | 插件包分发 | `[project.entry-points."op_pipeline.ops"]` 入口点自动发现（M3-4），pip 安装即用 | 无（`load_plugins` 加开关，CLI 默认开启） | M3（**已落地**） |
-| 定时调度 | 不自己做，交给 cron / 任务计划 / CI schedule | 无 | 不做 |
+| 定时调度 | 库内嵌定时触发由外围子包 `scheduler_app` 提供（M5-2，**已落地**）；平台化调度仍不做，交给 cron / 任务计划 / CI schedule | 无（内核不引用该包） | M5-2 |
 
 这一节成立的前提是"算子级封装"核心决策有效——目前所有补齐都不需要动引擎，说明该决策成立。
 
@@ -144,16 +144,21 @@
 > [runtime-semantics §6.3](../architecture/runtime-semantics.md#63-async-宿主嵌入m2-8)）；
 > 全 asyncio 调度器仍明确不在范围。
 
-### 阶段 3：生态与规模化（对应版本 0.4/0.5，按需触发）
+### 阶段 3：生态与规模化（对应版本 0.4～0.6，按需触发）
 
 - **数据生态**：pandas/Arrow adapter 算子；默认交换格式保持 `list[dict]` 不变——
   **已落地**（M3 pandas adapter；M4-2 Arrow/Parquet 算子 + extras `parquet`；
-  M4-3 Excel 算子 + extras `excel`；examples 数据生态往返示例）；
+  M4-3 Excel 算子 + extras `excel`；M5-3 `db.read/write_mysql` + `db.read/write_postgres`
+  + extras `mysql`/`postgres`；examples 数据生态往返示例；算子数 50）；
 - **远程执行**：`Executor` 接队列 + worker，句柄走对象存储（前提：阶段 2 抽象已稳定）——
-  **已落地（M4-4，示范定位）**：`QueueWorkerExecutor` + `op_pipeline worker` CLI 双进程
-  示范；引擎节点调度接入与句柄对象存储仍留待真实诉求触发；
+  **已接入引擎（M5-1；M4-4 队列执行器示范）**：引擎 `executor` 参数接受
+  `Executor` 实例或字符串 `"queue"`，节点任务以可 pickle payload 提交、
+  输出经共享目录 `SharedHandleStore` 发布（18 节点双进程 e2e）；
 - **调度与 UI**：如确有需要，做成**独立外围服务**（读 `RunStore`、调 `run_pipeline`），
-  内核仍是库——这是与 Airflow 的差异化定位，不要在包里长出调度守护进程；——未落地，按需触发
+  内核仍是库——这是与 Airflow 的差异化定位，不要在包里长出调度守护进程；——
+  **已落地（M5-2，独立外围子包 `scheduler_app/`）**：调度守护进程（定时触发
+  `run_pipeline`，结果写 `RunStore`）+ `http.server` 轻量 Web UI（运行历史/运行详情）；
+  内核不引用该包，"外围服务、内核仍是库"的定位保持；
 - **插件生态**：独立插件包 + `entry_points` 发现 + 签名/白名单机制，缓解插件任意代码执行风险
   ——**已落地**（M3-4 entry_points 发现；M4-1 allowlist 白名单 + verify_manifest 清单校验）；
 - **配置演进**：`spec_version` 字段 + 迁移器，保证老配置长期可跑——**已落地（M3-5）**；

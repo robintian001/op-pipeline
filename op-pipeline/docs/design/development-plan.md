@@ -3,7 +3,7 @@
 > 本文是 [演进路线](../architecture/roadmap.md) 的任务级分解：
 > 每个任务给出**改动落点**与**可验证的验收标准**，按里程碑组织。
 > 任务编号规则：`M<里程碑>-<序号>`。技术债编号（T*）见
-> [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口)，映射关系见本文 §7。
+> [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口)，映射关系见本文 §8。
 
 ---
 
@@ -11,7 +11,7 @@
 
 | 约定项 | 内容 |
 | --- | --- |
-| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4`；M4 → `0.5` |
+| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4`；M4 → `0.5`；M5 → `0.6` |
 | 合入门槛 | `python -m unittest discover -s tests -v` 全绿 + 新任务自带测试 + 两个示例流水线端到端通过 |
 | 回归基线 | 每个任务合入前先跑基线；M2 的抽象类任务要求"平移后行为零变化"（现有 21 用例不改断言） |
 | 文档同步 | 改动涉及节点字段/执行语义/CLI 的，同一变更内更新 [运行时语义](../architecture/runtime-semantics.md) 与 [配置规范](../reference/config-schema.md)；新增算子更新 [算子清单](../reference/operator-catalog.md) |
@@ -314,7 +314,7 @@
 > 共 40 个算子（≥ 40）；每个 extras（dataframe/yaml/otel/dev）独立依赖声明且 README 有说明；
 > 内核 `dependencies = []` 零第三方依赖（extras 模块延迟导入）；`examples/includes/`
 > 新增配置组合示例（跨 JSON/TOML 拆分 + 主配置聚合）。T15（表算子首行列假设）由 M3-3 消除。
-> 剩余技术债见 §7。
+> 剩余技术债见 §8。
 
 ---
 
@@ -369,7 +369,43 @@
 
 ---
 
-## 7. 技术债映射
+## 7. M5：远程执行落地、调度与 UI 外围、数据生态补齐与体验打磨（v0.6，按需启动）
+
+目标：把 M4 的远程示范推进为引擎正式能力；补齐数据生态的 MySQL/PostgreSQL；
+调度与 UI 以独立外围子包落地（内核不引用）；顺手收口体验与技术债。
+
+| 编号 | 方向 | 关键交付 |
+| --- | --- | --- |
+| M5-1 | 远程执行落地 | `run_pipeline`/CLI `--executor` 接受 `Executor` 实例或字符串（`"thread"`/`"process"`/`"queue"`）；[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py) `_remote_run` payload 序列化（解决 bound method 不可 pickle）+ `SharedHandleStore` 共享目录句柄发布；引擎节点调度接入队列执行器（18 节点双进程 e2e）；extension-points §4.2、runtime-semantics §9.1 同步 |
+| M5-2 | 调度与 UI 外围 | 独立子包 `scheduler_app/`：`scheduler.py` 守护进程（定时触发 `run`，结果写 RunStore）+ `web.py` 轻量 Web UI（http.server，运行历史/运行详情）；内核零引用有测试断言 |
+| M5-3 | 数据生态 MySQL/PG | `db.read_mysql` / `db.write_mysql`（extras `mysql`，pymysql）、`db.read_postgres` / `db.write_postgres`（extras `postgres`，psycopg2），延迟导入；算子数 46→50 |
+| M5-4 | 体验与技术债 | `CacheStore.include_source` 默认 `True`（确定性算子源码变更后缓存失效）；T13 `strict=False` 文档收口；CLI 失败节点展示截断 traceback；`ops --json` 契约完整性测试 |
+
+**M5 完成定义（DoD）**：全量回归全绿；两示例端到端 + 远程双进程示范通过；
+`pyproject.toml` 升 `0.6.0`；关闭声明与 roadmap 阶段 3 条目同步落地。
+
+> **M5 已完成（v0.6.0，2026-11-18）**。
+> M5-1：引擎 `executor` 参数支持 `str | Executor | None`（实例直接使用、字符串映射、
+> 非法串报错）；节点任务打包为可 pickle payload，上游句柄值经共享目录
+> `SharedHandleStore` 取用、输出原子发布；队列执行器接入引擎主循环，
+> 双进程 e2e（`pipeline_orders.json` 18 节点全 success 且与线程执行器结果一致）通过。
+> 新增 22 个用例（test_m5_remote_exec.py）；文档：extension-points §4.2 改写为
+> "已接入"、runtime-semantics §9.1 远程执行语义。
+> M5-2：`scheduler_app/` 落于项目根独立子包（标准库实现），调度守护进程
+> `--pipeline <cfg> --every <秒>` 定时触发并把结果写 `RunStore`（复用 M2-5 SQLite），
+> Web UI 提供运行历史列表与单次运行详情（节点状态/耗时/traceback 摘要）；
+> 新增 7 个用例（test_scheduler_app.py），含"内核 import 路径无 `scheduler_app` 引用"断言。
+> M5-3：新增 `db.read_mysql` / `db.write_mysql` / `db.read_postgres` / `db.write_postgres`
+> 四个算子（延迟导入 pymysql / psycopg2，pyproject extras `mysql` / `postgres`，
+> README / 算子清单同步），算子数 46→50；新增 14 个用例（test_db_mysql_pg.py）。
+> M5-4：`CacheStore.include_source` 默认 `True`——确定性算子源码变更后默认参数重跑
+> 缓存失效（`cached=false`）；CLI `run` 报告展示失败节点截断堆栈；`ops --json`
+> 契约完整性有测试核对；新增 5 个用例（test_m5_experience.py）。
+> 全量回归 **230 用例全绿** ✓；两示例端到端 + 远程双进程示范通过 ✓。
+
+---
+
+## 8. 技术债映射
 
 [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口) 的 T1–T15 与本计划的对应关系：
 
@@ -393,7 +429,7 @@
 
 ---
 
-## 8. 里程碑级验收清单
+## 9. 里程碑级验收清单
 
 每个里程碑收尾时执行（也是发版前检查单）：
 
@@ -422,7 +458,7 @@ python -m op_pipeline ops
 
 ---
 
-## 9. 工程实践约定
+## 10. 工程实践约定
 
 1. **一个任务一个 PR**，PR 描述引用任务编号（如 `M1-2`），便于回溯验收标准；
 2. **语义变更先改文档再改代码**：涉及 [运行时语义](../architecture/runtime-semantics.md)

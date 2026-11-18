@@ -1,18 +1,25 @@
-"""远程执行示范（M4-4）：基于共享队列文件 + 结果目录的跨进程执行器。
+"""远程执行（M5-1）：基于共享队列文件 + 结果目录的跨进程执行器。
 
 ``QueueWorkerExecutor`` 是 ``Executor`` 协议的一个队列版实现：客户端把任务
 载荷（函数 + 实参，pickle 后 base64）按行追加进 JSONL 队列文件，远端 worker
 进程（``python -m op_pipeline worker``）增量消费并执行，结果/异常以
 ``<job_id>.json`` 写回共享结果目录；``wait`` 轮询结果目录直到任务完成。
 
+M5-1 起该执行器已接入引擎节点调度主循环：引擎把每个节点的载荷（纯 dict，
+模块级 ``_remote_run`` + payload）提交进队列，worker 侧经 ``default_registry``
+按算子名实例化并执行，输出经共享目录句柄存储（``SharedHandleStore``）原子发布
+（上游输入值由引擎主进程解析后直接进载荷，见 ``_remote_run`` docstring）。
+
 设计取舍：
-- 共享文件系统（队列文件 + 结果目录）代替网络 socket：演示场景零额外依赖，
-  跨机器可迁移（挂载盘 / NFS / 对象存储前缀均可），且不要求改动引擎一行；
+- 共享文件系统（队列文件 + 结果目录）代替网络 socket：零额外依赖、跨机器可
+  迁移（挂载盘 / NFS / 对象存储前缀均可）；
 - 载荷走 JSONL 而非逐任务小文件：队列天然有序、可回放、可断点续消费；
 - 结果按 job_id 独立成文件、先写 ``.tmp`` 再原子 ``replace``：
   ``wait`` 轮询不会读到半个结果文件；
 - 载荷必须可 pickle：submit 时即校验，不可 pickle 直接抛 ``RuntimeError``
-  （对比 ``ProcessExecutor`` 的"回退线程"策略，队列模式无法回退，提前报错更诚实）。
+  （对比 ``ProcessExecutor`` 的"回退线程"策略，队列模式无法回退，提前报错更诚实）；
+- 句柄必须可 pickle：``SharedHandleStore.put`` 对不可 pickle 的值同样抛
+  ``RuntimeError``——跨进程没有内存退化的余地，绝不静默丢失数据。
 """
 from __future__ import annotations
 
@@ -22,11 +29,15 @@ import logging
 import pickle
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .context import RunContext
 from .executor import Executor
+from .handlestore import SharedHandleStore
+from .registry import default_registry
 
 log = logging.getLogger("op_pipeline.remote")
 
@@ -118,6 +129,11 @@ class QueueWorkerExecutor:
         self._out.mkdir(parents=True, exist_ok=True)
         self._closed = False
 
+    @property
+    def out(self) -> Path:
+        """结果目录（引擎据此推导共享句柄目录，M5-1）。"""
+        return self._out
+
     def submit(self, fn: Callable[..., Any], /, *args: Any) -> _QueueTask:
         if self._closed:
             raise RuntimeError("执行器已关闭，拒绝新任务")
@@ -143,6 +159,87 @@ class QueueWorkerExecutor:
 
     def shutdown(self) -> None:
         self._closed = True
+
+
+def _remote_run(payload: dict[str, Any]) -> dict[str, Any]:
+    """远端执行单个节点（M5-1）：worker 只做"实例化算子 → 执行 → 发布输出"。
+
+    载荷契约（由 ``Engine._remote_payload`` 构造）::
+
+        {
+          "node_id": 节点 id,
+          "op":      算子名（worker 经 ``default_registry`` 按名实例化），
+          "params":  解析后的节点参数 dict（主进程已解析），
+          "inputs":  解析后的上游输入值 dict（主进程已解析），
+          "outputs": 端口 -> 句柄名映射（worker 发布输出用），
+          "shared_dir": 共享句柄目录（``SharedHandleStore``），
+          "run": {run_id, pipeline, params, workdir, artifacts_dir},
+        }
+
+    序列化决策（为什么输入走 payload、输出走共享目录）：
+
+    - **输入值直接进 payload**：引用解析与快照语义（``RefResolver``）留在引擎
+      主进程——与线程路径 ``_run_node`` 完全一致，worker 不需要知道引用语法。
+      解析结果要么来自共享目录句柄存储（``SharedHandleStore.put`` 已保证句柄值
+      可 pickle），要么是配置/参数字面量，天然可 pickle，因此无需降级路径。
+      万一调用方经 overrides 注入了不可 pickle 的参数值，
+      ``QueueWorkerExecutor.submit`` 会以 ``RuntimeError`` 明确拒绝——该输入
+      不适合远程执行，绝不静默退化。
+    - **输出恒经共享目录句柄存储**：worker 返回值要经结果文件（pickle+base64）
+      回传，若输出值本身不可 pickle，整个返回 dict 都无法落盘、错误路径很糟；
+      改为 worker 把输出 ``put`` 进共享目录（原子发布），返回值只携带句柄名
+      映射——不可 pickle 的输出在 ``put`` 处即抛 ``RuntimeError`` 并打包进
+      返回 dict，引擎侧还原为节点失败。
+
+    返回 ``{"status", "outputs": {port: handle}, "error", "traceback"}``：
+    ``status`` 为 "failed" 时 ``outputs`` 为空 dict——失败不发布任何句柄，
+    引擎侧按失败节点处理（下游照常跳过）。传输层恒为 "ok"（异常已打包进
+    dict），``_QueueTask.result()`` 拿到的就是这个 dict。
+    """
+    try:
+        node_id = payload["node_id"]
+        op_name = payload["op"]
+        params = payload["params"]
+        inputs = payload["inputs"]
+        outputs = payload["outputs"]
+        shared_dir = payload["shared_dir"]
+        run_info = payload["run"]
+        run = RunContext(
+            run_id=run_info["run_id"],
+            pipeline=run_info["pipeline"],
+            params=run_info["params"],
+            workdir=Path(run_info["workdir"]),
+            artifacts_dir=Path(run_info["artifacts_dir"]),
+            logger=log,
+        )
+        ctx = run.for_node(node_id, op_name)
+        ctx.params = params
+        # 算子按名经 default_registry 实例化：worker 进程须能 import 算子定义
+        # （内置算子天然可见；自定义算子经插件机制或随代码部署，见扩展设计 §4.2）
+        operator_cls = default_registry.get(op_name)
+        instance = operator_cls(**params)
+        raw_outputs = instance.execute(ctx, inputs)
+        # 输出发布：写进共享目录句柄存储（引擎侧另一实例从同一目录读取）
+        store = SharedHandleStore(shared_dir)
+        published: dict[str, str] = {}
+        for port, value in raw_outputs.items():
+            handle = outputs.get(port)
+            if handle:  # 只发布有句柄名的端口（与引擎 _publish 一致）
+                store.put(handle, value)
+                published[port] = handle
+        return {
+            "status": "success",
+            "outputs": published,
+            "error": None,
+            "traceback": "",
+        }
+    except Exception as exc:  # noqa: BLE001 - 需要把任意异常打包回引擎侧
+        return {
+            "status": "failed",
+            "outputs": {},
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        }
 
 
 def consume_jobs(

@@ -154,7 +154,7 @@ def cmd_describe(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    """M4-4 远端执行：消费共享队列文件并执行任务（配合 QueueWorkerExecutor）。"""
+    """M5-1 远程执行：消费共享队列文件并执行任务（配合 QueueWorkerExecutor）。"""
     from .remote import consume_jobs
 
     out = args.out or str(Path(args.queue).expanduser().resolve().parent / "results")
@@ -191,8 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-cache", action="store_true", help="关闭缓存")
     run.add_argument("--fail-fast", action="store_true", help="任一节点失败即停止调度新节点")
     run.add_argument(
-        "--executor", choices=("thread", "process"), default=None,
-        help="运行级执行器：process 时未显式指定的节点在子进程执行（硬超时）",
+        "--executor", choices=("thread", "process", "queue"), default=None,
+        help="运行级执行器：process 时未显式指定的节点在子进程执行（硬超时）；"
+             "queue 时引擎自建队列执行器——队列与结果目录推导自工作目录下的 "
+             ".op_pipeline/remote/（jobs.jsonl 与 results/），需另启 worker 消费："
+             "python -m op_pipeline worker --queue <工作目录>/.op_pipeline/remote/jobs.jsonl "
+             "--out <工作目录>/.op_pipeline/remote/results",
     )
     run.add_argument("--dry-run", action="store_true", help="只打印执行计划不执行")
     run.add_argument(
@@ -224,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     describe.add_argument("name")
     describe.set_defaults(func=cmd_describe)
 
-    worker = sub.add_parser("worker", help="远端执行：消费共享队列文件并执行任务（M4-4）")
+    worker = sub.add_parser("worker", help="远程执行：消费共享队列文件并执行任务（M5-1）")
     worker.add_argument("--queue", required=True, help="JSONL 任务队列文件路径")
     worker.add_argument("--out", default=None, help="结果目录（默认取队列同目录下的 results/）")
     worker.add_argument("--count", type=int, default=None, help="最多消费任务数（默认不限，持续监听）")

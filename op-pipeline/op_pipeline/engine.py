@@ -27,14 +27,15 @@ import traceback
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .cache import CacheStore
 from .context import RunContext
 from .errors import ConfigError, RefResolutionError
 from .executor import Executor, ProcessExecutor, ThreadExecutor, _child_run_op
 from .expression import evaluate_condition
-from .handlestore import HandleStore, InMemoryHandleStore
+from .handlestore import HandleStore, InMemoryHandleStore, SharedHandleStore
+from .remote import QueueWorkerExecutor, _remote_run
 from .spec import Plan, PlanNode, RefResolver, check_handle_types
 
 log = logging.getLogger("op_pipeline.engine")
@@ -228,37 +229,107 @@ class Engine:
         max_workers: int | None = None,
         fail_fast: bool = False,
         cancel_event: threading.Event | None = None,
-        executor: str | None = None,
+        executor: str | Executor | None = None,
         handle_store: HandleStore | None = None,
         run_store: Any = None,
         resume_run_id: str | None = None,
         hooks: list[Any] | None = None,
     ) -> None:
-        if executor not in (None, "thread", "process"):
-            raise ConfigError(f"executor 只能是 thread/process，实际是 {executor!r}")
+        # M5-1：运行级执行器三元态——字符串选择器 / Executor 实例 / None（默认线程池）。
+        if isinstance(executor, str) and executor not in ("thread", "process", "queue"):
+            raise ConfigError(f"executor 只能是 thread/process/queue，实际是 {executor!r}")
+        if executor is not None and not isinstance(executor, (str, Executor)):
+            raise ConfigError(
+                "executor 只能是字符串选择器（thread/process/queue）或实现 "
+                "Executor 协议（submit/wait/shutdown）的实例，"
+                f"实际是 {type(executor).__name__}"
+            )
         self.plan = plan
         self.context = context
         self.cache = cache_store or CacheStore(None)
         self.max_workers = max_workers or min(8, max(1, (os.cpu_count() or 2)))
         self.fail_fast = fail_fast
+        # 告警先于执行器形态判定初始化：节点级声明被忽略时要在这里留痕
+        self._warnings: list[str] = []
+
+        # M5-1：实例路径——引擎直接使用调用方传入的 Executor，不负责其生命周期
+        # （归属调用方）；字符串 "queue" 与节点级 executor="queue" 声明由引擎自建
+        # 队列执行器（归属引擎，run() 结束时 shutdown）。队列/结果目录固定推导自
+        # 本次运行的 workdir（<workdir>/.op_pipeline/remote/ 下，而非随 run 变化的
+        # artifacts_dir）——路径跨 run 稳定，worker 可预先启动常驻消费，与 worker
+        # CLI 的 --queue/--out 约定一致。
+        self.default_executor = executor  # 字符串 / Executor 实例 / None（M2-2 语义）
+        self._executor_instance: Executor | None = None
+        self._owns_executor = False
+        node_level_queue = any(node.spec.executor == "queue" for node in plan.nodes)
+        # 节点级 "queue" 声明在运行级为 None/"thread" 时触发自建（运行级显式
+        # "process" 优先——用户明确选择了内置执行器，不静默改道，记告警忽略）；
+        # 实例模式（含 queue 自建）下全部节点统一经实例分发，节点级声明一律忽略。
+        need_queue = executor == "queue" or (
+            executor in (None, "thread") and node_level_queue
+        )
+        if isinstance(executor, str) and executor in ("thread", "process") and node_level_queue:
+            self._warnings.append(
+                f"存在节点级 executor='queue' 声明，但运行级 executor={executor!r} 优先，"
+                "本次运行不会创建队列执行器"
+            )
+        if need_queue:
+            remote_dir = self.context.workdir / ".op_pipeline" / "remote"
+            self._executor_instance = QueueWorkerExecutor(
+                remote_dir / "jobs.jsonl", remote_dir / "results", poll=0.05
+            )
+            self._owns_executor = True
+        elif isinstance(executor, Executor):
+            self._executor_instance = executor
+            self._owns_executor = False
+
+        # M5-1：远程（队列）模式标记——主循环据此走 _remote_run 分发与共享句柄读取
+        self._remote = isinstance(self._executor_instance, QueueWorkerExecutor)
+        # 运行级实例接管节点执行时，节点级 executor 声明被忽略——记告警留痕
+        if isinstance(executor, Executor):
+            ignored = {"process"} if self._remote else {"process", "queue"}
+            for node in plan.nodes:
+                if node.spec.executor in ignored:
+                    self._warnings.append(
+                        f"节点 [{node.spec.id}] 显式 executor={node.spec.executor!r} 被忽略："
+                        "运行级传入执行器实例，全部节点统一经该实例执行"
+                    )
+        elif need_queue:
+            for node in plan.nodes:
+                if node.spec.executor == "process":
+                    self._warnings.append(
+                        f"节点 [{node.spec.id}] 显式 executor='process' 被忽略："
+                        "本次运行为远程队列模式，不创建进程池"
+                    )
+        self._remote_shared_dir: Path | None = None
 
         # M2-3：句柄存储抽象——写收敛在 _publish(put)，读收敛在 RefResolver(snapshot)
         self.store: HandleStore = handle_store or InMemoryHandleStore()
+        if self._remote:
+            # M5-1：远程模式共享句柄存储——引擎从执行器 out 目录推导共享目录；
+            # 调用方显式传 handle_store 则优先（此时跨进程一致性由调用方负责）
+            self._remote_shared_dir = Path(self._executor_instance.out) / "handles"
+            if handle_store is None:
+                self.store = SharedHandleStore(shared_dir=self._remote_shared_dir)
         self._lock = threading.Lock()
         self._results: dict[str, NodeResult] = {}
         self._completed: dict[str, str] = {}
         self._aborted = False
-        self._warnings: list[str] = []
         # 取消：支持共享外部事件或 Engine.cancel()，语义见模块 docstring 第 7 条
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._cancel_reason = "cancel_event 被置位"
         self._cancel_announced = False
         # 运行级执行器缺省（M2-2）：节点显式 executor 优先，其次运行级，最后 thread。
         # 进程池只在"有进程节点"时创建：纯线程运行保持零进程开销与行为零变化。
-        self.default_executor = executor
-        need_process = executor == "process" or any(
-            node.spec.executor == "process" for node in plan.nodes
-        )
+        # M5-1：实例路径（含 "queue"/节点级声明触发的自建队列执行器）下引擎不再
+        # 额外创建进程池——实例是唯一执行后端，全部节点经它分发；节点级 "process"
+        # 声明被忽略并记告警（见上）。
+        if isinstance(executor, Executor) or need_queue:
+            need_process = False
+        else:
+            need_process = executor == "process" or any(
+                node.spec.executor == "process" for node in plan.nodes
+            )
         self._process_pool = (
             ProcessExecutor(on_fallback=self._warnings.append) if need_process else None
         )
@@ -326,7 +397,23 @@ class Engine:
         pending = list(self.plan.order)
         running: dict[Future, str] = {}
 
-        with ThreadExecutor(max_workers=self.max_workers) as pool:
+        # M5-1：执行后端形态——
+        # - 远程（队列）模式：主循环 pool 仍是引擎内部 ThreadExecutor，远程节点
+        #   经内部线程任务包装（_run_remote_node：主进程解析载荷 → 队列 submit →
+        #   阻塞等结果），重试/缓存/软超时都在主进程侧——主循环 wait 的
+        #   first_completed 语义完全不变（远程节点在主循环看来仍是普通线程任务）；
+        # - 其他外部实例直接作为主循环 pool 使用（协议兼容，不 shutdown）；
+        # - 自建实例（"queue" / 节点级声明触发）与默认线程池由引擎创建并 shutdown。
+        if self._remote:
+            pool = ThreadExecutor(max_workers=self.max_workers)
+            owned = True
+        elif self._executor_instance is not None:
+            pool = self._executor_instance
+            owned = False
+        else:
+            pool = ThreadExecutor(max_workers=self.max_workers)
+            owned = True
+        try:
             while pending or running:
                 progressed = self._dispatch(pending, running, pool)
                 if running:
@@ -341,6 +428,12 @@ class Engine:
                     for node_id in pending:
                         self._mark_skipped(node_id, "依赖无法满足（上游未执行或已跳过）")
                     pending.clear()
+        finally:
+            if owned:
+                pool.shutdown()
+            if self._owns_executor and self._executor_instance is not None:
+                # 引擎自建的队列执行器（"queue" / 节点级声明触发）随运行收尾
+                self._executor_instance.shutdown()
 
         if self._process_pool is not None:
             self._process_pool.shutdown()
@@ -454,7 +547,13 @@ class Engine:
                 break
 
             pending.remove(node_id)
-            running[pool.submit(self._run_node, node)] = node_id
+            if self._remote:
+                # M5-1：远程模式——submit 引擎方法 _run_remote_node（主循环 pool
+                # 是内部 ThreadExecutor，无需可 pickle），由它构造载荷并经队列
+                # 执行器分发，重试/缓存/软超时都留在主进程侧
+                running[pool.submit(self._run_remote_node, node)] = node_id
+            else:
+                running[pool.submit(self._run_node, node)] = node_id
             progressed = True
         return progressed
 
@@ -481,7 +580,7 @@ class Engine:
     def _collect(self, node_id: str, future: Future) -> None:
         try:
             result: NodeResult = future.result()
-        except Exception as exc:  # pragma: no cover - _run_node 内部已兜住
+        except Exception as exc:  # pragma: no cover - _run_node/_run_remote_node 内部已兜住
             result = NodeResult(node_id=node_id, op=self.plan.node(node_id).spec.op, status=FAILED, error=str(exc))
             result.duration = 0.0
         self._results[node_id] = result
@@ -517,6 +616,175 @@ class Engine:
         if self.run_store is not None:
             self._record_node(result)
         self.context.logger.info("节点 %s 跳过：%s", node_id, note)
+
+    # ------------------------------------------------------------------ #
+    # 远程执行（M5-1）
+    # ------------------------------------------------------------------ #
+    def _remote_payload(
+        self, node: PlanNode, params: Mapping[str, Any], inputs: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """组装可 pickle 的节点载荷（契约见 ``remote._remote_run`` docstring）。
+
+        ``params``/``inputs`` 是主进程 ``RefResolver`` 解析后的实际值——引用
+        解析与快照语义留在主进程（与线程路径 ``_run_node`` 一致），worker 只
+        执行算子并把输出写进共享句柄目录；载荷全部为可 pickle 类型。
+        """
+        return {
+            "node_id": node.spec.id,
+            "op": node.spec.op,
+            "params": dict(params),
+            "inputs": dict(inputs),
+            "outputs": dict(node.handles),
+            "shared_dir": str(self._remote_shared_dir),
+            "run": {
+                "run_id": self.context.run_id,
+                "pipeline": self.plan.spec.name,
+                "params": dict(self.plan.params),
+                "workdir": str(self.context.workdir),
+                "artifacts_dir": str(self.context.artifacts_dir),
+            },
+        }
+
+    def _remote_once(
+        self,
+        node: PlanNode,
+        params: Mapping[str, Any],
+        inputs: Mapping[str, Any],
+        timeout: float | None,
+    ) -> dict[str, Any]:
+        """单次远程执行：载荷提交进队列，阻塞等结果（``timeout`` 即节点软超时）。
+
+        队列任务无法强杀 worker 侧算子——软超时限制不因远程而消失：到点抛
+        ``TimeoutError`` 交给重试包装按普通失败处理，worker 侧算子可能仍在
+        运行（与线程路径"底层线程仍在跑"的已知限制同语义）。
+        """
+        payload = self._remote_payload(node, params, inputs)
+        assert self._executor_instance is not None  # 仅 _remote 模式进入
+        task = self._executor_instance.submit(_remote_run, payload)
+        try:
+            data = task.result(timeout=timeout)
+        except TimeoutError:
+            raise TimeoutError(
+                f"节点 {node.spec.id} 远程执行超过 {timeout}s"
+                "（软超时：队列任务无法强杀，worker 侧算子可能仍在运行）"
+            ) from None
+        if data.get("status") != "success":
+            # 失败已打包进 dict：还原为异常交给重试包装（携带 worker 的 traceback）
+            raise _RemoteFailure(data) from None
+        return data
+
+    def _run_remote_node(self, node: PlanNode) -> NodeResult:
+        """远程节点执行（M5-1）：与 ``_run_node`` 同构，算子改在队列 worker 进程跑。
+
+        - 引用解析在主进程（``RefResolver`` 快照语义与线程路径一致）；worker
+          只执行 op.run 并把输出原子发布进共享句柄目录，引擎侧从同一目录读回；
+        - 重试/退避沿用引擎包装（主进程侧）；缓存 ``cache_key`` 计算与读写也
+          在主进程——命中则根本不发队列任务；``timeout`` 在主进程侧生效（软
+          超时，见 ``_remote_once``）；
+        - 失败时把 worker 打包的 error/traceback 还原进 ``NodeResult``，下游
+          照常跳过。
+        """
+        ctx = self.context.for_node(node.spec.id, node.spec.op)
+        result = NodeResult(node_id=node.spec.id, op=node.spec.op, started_at=time.time())
+        self._emit("on_node_start", node.spec.id, node.spec.op)
+        resolver = RefResolver(self.plan.params, self.store)
+        try:
+            inputs = {
+                port: resolver.resolve(ref) for port, ref in node.spec.inputs.items()
+            }
+            params = resolver.resolve(node.spec.params)
+            ctx.params = params
+
+            cache_key = None
+            if (
+                node.spec.cache
+                and self.cache.enabled
+                and getattr(node.operator_cls, "deterministic", True)
+            ):
+                source = None
+                if getattr(self.cache, "include_source", False):
+                    try:
+                        source = inspect.getsource(node.operator_cls)
+                    except (OSError, TypeError):  # pragma: no cover - 动态类拿不到源码
+                        source = None
+                cache_key = self.cache.compute_key(
+                    node.spec.op,
+                    node.operator_cls.version,
+                    params,
+                    inputs,
+                    source=source,
+                )
+                cached = self.cache.load(cache_key)
+                if cached is not None:
+                    outputs = cached
+                    result.cached = True
+                    result.cache_key = cache_key
+                    result.status = SUCCESS
+                    result.duration = time.time() - result.started_at
+                    result.outputs = {k: _describe(v) for k, v in outputs.items()}
+                    # M2-6：断点续跑语义与线程路径一致
+                    prev = self._resume_map.get(node.spec.id)
+                    if prev is not None and prev[0] == SUCCESS and prev[1] == cache_key:
+                        result.resumed = True
+                    # 缓存命中走引擎写收敛点：值经 store.put 进共享目录（下游可读）
+                    self._publish(node, outputs)
+                    self.context.logger.info(
+                        "节点 %s 命中缓存%s",
+                        node.spec.id,
+                        f"，续跑自 {self.resume_run_id}" if result.resumed else "",
+                    )
+                    return result
+
+            result.cache_key = cache_key or ""
+            data = self._attempt_loop(
+                node,
+                ctx,
+                result,
+                lambda: self._remote_once(node, params, inputs, node.spec.timeout),
+            )
+            result.status = SUCCESS
+            # worker 已把输出原子发布进共享目录；引擎侧从同一目录读回实际值
+            raw = {
+                port: self.store.get(handle)
+                for port, handle in (data.get("outputs") or {}).items()
+            }
+            result.outputs = {k: _describe(v) for k, v in raw.items()}
+            if cache_key is not None:
+                self.cache.store(cache_key, raw)
+        except _NodeFailure as failure:
+            result.status = FAILED
+            result.error = f"{type(failure.cause).__name__}: {failure.cause}"
+            if isinstance(failure.cause, _RemoteFailure):
+                # worker 打包的堆栈：截断保留末尾（与线程路径 format_exc 同语义）
+                result.traceback = _clip_traceback(
+                    (failure.cause.data or {}).get("traceback") or ""
+                )
+            else:
+                result.traceback = _clip_traceback(traceback.format_exc())
+        except Exception as exc:
+            result.status = FAILED
+            result.error = f"{type(exc).__name__}: {exc}"
+            result.traceback = _clip_traceback(traceback.format_exc())
+        finally:
+            result.duration = time.time() - result.started_at
+            if result.status == FAILED:
+                ctx.logger.error("节点 %s 失败：%s", node.spec.id, result.error)
+            else:
+                ctx.logger.info(
+                    "节点 %s 完成（%.2fs%s）",
+                    node.spec.id,
+                    result.duration,
+                    "，续跑" if result.resumed else ("，缓存" if result.cached else ""),
+                )
+            # M2-7：节点结果确定（成功/失败/缓存命中都触发）
+            self._emit(
+                "on_node_finish",
+                node.spec.id,
+                result.status,
+                result.duration,
+                result.cached,
+            )
+        return result
 
     # ------------------------------------------------------------------ #
     # 单节点执行
@@ -623,22 +891,25 @@ class Engine:
             if handle:
                 self.store.put(handle, value)
 
-    def _execute_with_retry(
+    def _attempt_loop(
         self,
-        instance: Any,
-        ctx: Any,
-        inputs: Mapping[str, Any],
         node: PlanNode,
+        ctx: Any,
         result: NodeResult,
-    ) -> dict[str, Any]:
+        once: Callable[[], Any],
+    ) -> Any:
+        """重试包装（M5-1 自 _execute_with_retry 抽取）：attempts 次指数退避。
+
+        ``once`` 是"单次执行"callable（线程/进程路径传 ``_execute_once``，
+        远程路径传 ``_remote_once``）——重试策略与执行方式解耦；
+        ``ConfigError``（含引用解析错误）重试也没意义，直接抛。
+        """
         attempts = max(0, node.spec.retries) + 1
         last_error: BaseException | None = None
         for attempt in range(1, attempts + 1):
             result.attempts = attempt
             try:
-                return self._execute_once(
-                    instance, ctx, inputs, node.spec.timeout, self._executor_kind(node)
-                )
+                return once()
             except ConfigError as exc:
                 # 配置/契约错误重试也没意义，直接抛
                 raise _NodeFailure(exc) from exc
@@ -654,6 +925,23 @@ class Engine:
                 time.sleep(delay)
         # from 显式链接根因：traceback.format_exc() 才能带出算子内原始异常的完整帧
         raise _NodeFailure(last_error) from last_error  # type: ignore[arg-type]
+
+    def _execute_with_retry(
+        self,
+        instance: Any,
+        ctx: Any,
+        inputs: Mapping[str, Any],
+        node: PlanNode,
+        result: NodeResult,
+    ) -> dict[str, Any]:
+        return self._attempt_loop(
+            node,
+            ctx,
+            result,
+            lambda: self._execute_once(
+                instance, ctx, inputs, node.spec.timeout, self._executor_kind(node)
+            ),
+        )
 
     def _executor_kind(self, node: PlanNode) -> str:
         return node.spec.executor or self.default_executor or "thread"
@@ -721,6 +1009,19 @@ class _NodeFailure(Exception):
         super().__init__(str(cause))
 
 
+class _RemoteFailure(Exception):
+    """远程单次执行失败包装（M5-1）：携带 worker 返回的 error/traceback 文本。
+
+    ``_remote_once`` 把 worker 打包的失败 dict 还原为异常抛给重试包装
+    （按普通失败参与重试），重试耗尽后引擎从 ``data`` 里取 traceback 文本
+    写进 ``NodeResult.traceback``——不需要跨进程传异常对象。
+    """
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.data = data
+        super().__init__(str(data.get("error") or "远程执行失败"))
+
+
 # --------------------------------------------------------------------------- #
 # 便捷入口
 # --------------------------------------------------------------------------- #
@@ -734,7 +1035,7 @@ def run_pipeline(
     max_workers: int | None = None,
     fail_fast: bool = False,
     cancel_event: threading.Event | None = None,
-    executor: str | None = None,
+    executor: str | Executor | None = None,
     handle_store: HandleStore | None = None,
     run_store: Any = None,
     resume_run_id: str | None = None,
@@ -753,6 +1054,12 @@ def run_pipeline(
     与本次 cache_key 比对，成功段复用缓存并标记 [resumed]，失败段与下游照常重跑。
     ``hooks``（M2-7）执行事件钩子列表：on_node_start / on_node_finish /
     on_run_finish，节点并行时可能被并发调用，异常只记告警不影响流水线。
+    ``executor``（M5-1）三种形态：None（默认线程池）；字符串 "thread"/"process"/"queue"
+    快捷方式（"queue" 由引擎自建 :class:`~op_pipeline.remote.QueueWorkerExecutor`，
+    队列与结果目录固定为 ``<workdir>/.op_pipeline/remote/``——路径跨 run 稳定，
+    worker 可预先启动常驻消费）；或任意 ``Executor`` 实例（如
+    ``QueueWorkerExecutor(...)`` / ``ThreadExecutor(...)``），引擎把节点执行分发到
+    该实例，实例生命周期归调用方、引擎不 shutdown。
 
     典型的库内调用::
 
@@ -790,7 +1097,7 @@ async def run_pipeline_async(
     max_workers: int | None = None,
     fail_fast: bool = False,
     cancel_event: threading.Event | None = None,
-    executor: str | None = None,
+    executor: str | Executor | None = None,
     handle_store: HandleStore | None = None,
     run_store: Any = None,
     resume_run_id: str | None = None,

@@ -48,8 +48,8 @@ from .errors import (
     SpecValidationError,
 )
 from .executor import Executor, ProcessExecutor, ThreadExecutor
-from .remote import QueueWorkerExecutor  # M4-4：共享队列文件 + 结果目录的跨进程执行器
-from .handlestore import HandleStore, InMemoryHandleStore, SpillHandleStore
+from .remote import QueueWorkerExecutor  # M5-1：共享队列文件 + 结果目录的跨进程执行器
+from .handlestore import HandleStore, InMemoryHandleStore, SharedHandleStore, SpillHandleStore
 from .expression import evaluate, evaluate_condition, register_function
 from .operator import Operator
 from .params import Param
@@ -90,6 +90,7 @@ __all__ = [
     "RunContext",
     "RunReport",
     "RunStore",
+    "SharedHandleStore",
     "SpecValidationError",
     "SpillHandleStore",
     "ThreadExecutor",
@@ -124,7 +125,7 @@ def run(
     plugin_modules: tuple[str, ...] = (),
     registry: Registry | None = None,
     logger: logging.Logger | None = None,
-    executor: str | None = None,
+    executor: str | Executor | None = None,
     handle_store: Any = None,
     run_store: Any = None,
     resume_run_id: str | None = None,
@@ -147,6 +148,8 @@ def run(
     - ``hooks``（M2-7）：执行事件钩子列表（on_node_start / on_node_finish /
       on_run_finish），节点并行时可能被并发调用，异常只记告警不影响流水线；
       默认 None = 无钩子。
+    - ``executor``（M5-1）：None / 字符串快捷方式（"thread"/"process"/"queue"）/
+      任意 ``Executor`` 实例；"queue" 与实例语义详见 :func:`run_pipeline` docstring。
     """
     config_path = Path(config).expanduser().resolve()
     load_plugins(

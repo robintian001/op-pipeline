@@ -580,7 +580,47 @@ exec_.wait([f1, ...])                    └─ 结果/异常写回
 
 与内置执行器的差异：`ThreadExecutor`/`ProcessExecutor` 由引擎内部创建并驱动，
 服务**同一进程内**的节点调度；`QueueWorkerExecutor` 面向"另起 worker 进程 /
-跨机器共享盘"的任务分发（M4-4 为示范定位）。引擎的 `executor` 参数仍是字符串
-选择器，队列执行器尚未接入引擎节点调度主循环（载荷 `_run_node` 为 bound method，
-需先解决序列化与共享句柄存储），见 [扩展设计 §4.2](../design/extension-points.md#42-执行器)。
-端到端双进程示范：`python examples/remote_exec_demo.py`。
+跨机器共享盘"的任务分发。端到端双进程示范：`python examples/remote_exec_demo.py`。
+
+### 9.1 远程执行语义（M5-1）：引擎接入队列执行器
+
+M5-1 起 `run_pipeline(executor=...)` / `Engine` 的 executor 参数接受
+`str | Executor | None`：字符串 `"thread"`/`"process"`/`"queue"` 仍是快捷方式
+（`"queue"` 由引擎自建 `QueueWorkerExecutor`，队列与结果目录固定为
+`<workdir>/.op_pipeline/remote/`——路径跨 run 稳定，worker 可预先启动常驻消费）；
+也可以直接传任意 `Executor` 实例（如 `QueueWorkerExecutor(...)` /
+`ThreadExecutor(...)`），引擎把节点执行分发到该实例，实例生命周期归调用方、
+引擎不 shutdown。节点级 `executor="process"`/`"queue"` 声明在运行级实例模式下
+被忽略并记 warning（实例是唯一执行后端）。
+
+远程节点的执行语义（`Engine._run_remote_node`，与线程路径 `_run_node` 同构）：
+
+1. **载荷打包**：引用解析与快照语义留在**主进程**（`RefResolver` 对
+   `self.store` 快照，与线程路径一致）——worker 只做"按 `default_registry`
+   实例化算子 → 执行 → 发布输出"。载荷（`remote._remote_run` 的 payload）携带
+   **解析后的**输入值与参数：输入值要么来自共享句柄存储（`SharedHandleStore.put`
+   已保证句柄值可 pickle），要么是配置/参数字面量，天然可 pickle，无需降级
+   路径；调用方经 overrides 注入不可 pickle 的参数值时 `submit` 即抛
+   `RuntimeError`——该输入不适合远程执行，绝不静默退化。
+2. **输出经共享目录对象存储**：worker 把输出 `put` 进共享句柄目录（原子发布），
+   返回值只携带句柄名映射——输出值不可 pickle 时在 `put` 处即报错并打包进
+   返回 dict，引擎侧还原为节点失败（结果文件必须整体 pickle 回传，输出直接进
+   返回值的错误路径很糟）；引擎侧从同一共享目录读回输出值与描述，主循环结束
+   后 `run_pipeline` 返回的句柄表经 `SharedHandleStore.snapshot` 即可读全。
+3. **调度形态**：远程模式下主循环 pool 仍是引擎内部 `ThreadExecutor`，远程节点
+   经内部线程任务包装（主进程构造载荷 → 队列 `submit` → 阻塞等结果）——主循环
+   `wait(first_completed=True)` 语义完全不变（远程节点在主循环看来仍是普通
+   线程任务）。
+4. **重试 / 缓存 / 超时都在主进程侧**：重试退避沿用引擎包装（`_attempt_loop`，
+   与线程/进程路径同一套）；缓存 `cache_key` 计算与读写也在主进程，命中则根本
+   不发队列任务（命中路径走引擎 `_publish` 写收敛点，值经 `store.put` 进共享
+   目录）；`timeout` 在主进程侧生效——**软超时限制不因远程而消失**：到点抛
+   `TimeoutError` 按普通失败参与重试，worker 侧算子可能仍在运行（队列任务无法
+   强杀，与线程路径"底层线程仍在跑"的已知限制同语义）。
+5. **失败还原**：worker 把异常打包为 `{"status": "failed", "error",
+   "traceback"}` 返回（传输层恒为 ok）；引擎重试耗尽后把 error 与截断的
+   traceback 还原进 `NodeResult`，下游节点照常跳过，报告状态归并
+   （hard → partial → success）与线程路径一致。
+6. **worker 侧算子可见性**：worker 经 `default_registry` 按算子名实例化——
+   内置算子天然可见；自定义算子需经插件机制或随代码部署（见
+   [扩展设计 §4.2](../design/extension-points.md#42-执行器)）。

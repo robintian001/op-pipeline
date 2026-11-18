@@ -301,11 +301,17 @@ M4-4）把任务分发给独立 worker 进程——客户端 `submit` 把载荷
 不要求 worker 与客户端同机。端到端示范见
 [examples/remote_exec_demo.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/examples/remote_exec_demo.py)。
 
-> 边界说明：引擎的 `executor` 参数目前仍为字符串选择器（`"thread"`/`"process"`）；
-> `QueueWorkerExecutor` 是 `Executor` 协议下的独立远程任务分发实现（示范定位），
-> 尚未接入引擎的节点调度主循环——真正把整条流水线的节点调度到远端 worker，
-> 需要同时解决载荷序列化（`_run_node` 为 bound method）与句柄的共享存储，
-> 留待 roadmap 中"调度/集群执行"出现真实诉求时落地。
+> 边界说明（M5-1 起已接入）：`run_pipeline(executor=...)` / `Engine` 的
+> `executor` 参数接受 `str | Executor | None`——传任意 `Executor` 实例时引擎
+> 自动把节点执行分发到该实例（实例生命周期归调用方，引擎不 shutdown）；
+> 字符串 `"thread"`/`"process"`/`"queue"` 仍是快捷方式（`"queue"` 由引擎自建
+> 队列执行器，目录固定为 `<workdir>/.op_pipeline/remote/`）。队列执行器的节点载荷
+> 为纯 dict（模块级 `remote._remote_run` + payload，上游输入值由主进程
+> `RefResolver` 解析后直接进载荷），输出经共享目录句柄存储（`SharedHandleStore`）
+> 原子发布；重试 / 缓存 / 软超时都留在主进程侧，运行语义详见
+> [运行时语义 §9.1](../architecture/runtime-semantics.md#91-远程执行语义m5-1引擎接入队列执行器)。
+> 跨机器共享盘部署形态不变：同路径挂载队列 / 结果 / 句柄三个目录，worker 侧
+> 算子经 `default_registry` 或插件机制可见（自定义算子随代码/插件分发）。
 
 ### 4.3 报告
 

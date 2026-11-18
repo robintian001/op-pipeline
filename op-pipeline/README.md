@@ -317,7 +317,22 @@ python -m op_pipeline run examples/pipeline_data_ecosystem.toml --no-cache
 
 ---
 
-## 10. 已知限制与后续演进
+## 10. 调度与 Web UI 外围服务（M5-2）
+
+独立子包 `scheduler_app/`（纯标准库，**不进内核**——`op_pipeline` 不引用它，保持
+"零依赖、零守护进程"承诺）：
+
+```powershell
+# 调度守护进程：启动立即执行一次，之后每 60 秒一轮，运行记录写 RunStore SQLite
+python -m scheduler_app.scheduler --pipeline examples/pipeline_orders.json --every 60 --db runs.db
+
+# 轻量 Web UI（http.server）：运行历史列表 + 单次运行详情（节点状态/耗时/traceback 摘要）
+python -c "from scheduler_app import create_server; create_server('runs.db', 8000).serve_forever()"
+```
+
+---
+
+## 11. 已知限制与后续演进
 
 | 限制 | 现状 | 演进方向 |
 | --- | --- | --- |
@@ -330,7 +345,7 @@ python -m op_pipeline run examples/pipeline_data_ecosystem.toml --no-cache
 
 ---
 
-## 11. 自测
+## 12. 自测
 
 ```powershell
 python -m unittest discover -s tests -v

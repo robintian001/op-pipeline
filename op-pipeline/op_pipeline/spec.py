@@ -270,8 +270,9 @@ class NodeSpec:
     timeout: float | None = None
     cache: bool = False
     allow_failure: bool = False
-    # 执行器选择（M2-2）：""=未指定（引擎按运行级 default 或 thread），
-    # "thread"=线程（软超时），"process"=子进程（硬超时）
+    # 执行器选择（M2-2 / M5-1）：""=未指定（引擎按运行级 default 或 thread），
+    # "thread"=线程（软超时），"process"=子进程（硬超时），
+    # "queue"=远程队列执行器（M5-1：节点级声明触发引擎自建 QueueWorkerExecutor）
     executor: str = ""
     description: str = ""
 
@@ -311,9 +312,9 @@ class NodeSpec:
         merged = {k: raw.get(k, fallback.get(k)) for k in _STRATEGY_KEYS}
         timeout_raw = merged["timeout"]
         executor_raw = merged["executor"] or ""
-        if executor_raw not in ("", "thread", "process"):
+        if executor_raw not in ("", "thread", "process", "queue"):
             raise ConfigError(
-                f"节点 [{node_id}] 的 executor 只能是 thread/process，实际是 {executor_raw!r}"
+                f"节点 [{node_id}] 的 executor 只能是 thread/process/queue，实际是 {executor_raw!r}"
             )
         return cls(
             id=str(node_id),
