@@ -1,6 +1,7 @@
 # ---- 本项目运行时产物 ----
 .pipeline_cache/
 .op_pipeline/
+../trae/
 examples/output/
 
 # ---- Python 字节码 ----
@@ -39,3 +40,4 @@ Thumbs.db
 
 # ---- 其他 ----
 *.txt
+*.log

@@ -27,6 +27,8 @@ dependencies = []
 dataframe = ["pandas>=1.5"]
 parquet = ["pyarrow>=12"]  # M4-2：parquet/arrow 算子的可选依赖
 excel = ["openpyxl"]  # M4-3：excel 算子的可选依赖
+mysql = ["pymysql"]  # M5-3：mysql 算子的可选依赖
+postgres = ["psycopg2"]  # M5-3：postgres 算子的可选依赖
 yaml = ["pyyaml"]
 otel = ["opentelemetry-api"]  # M3-6：observe.OtelHook 的可选 OTel bridge
 dev = ["pytest"]

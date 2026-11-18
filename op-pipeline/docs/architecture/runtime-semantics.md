@@ -270,7 +270,7 @@ key = blake2b(20 bytes, json.dumps({
   "version": <算子 version 类属性，默认 "1">,
   "params": fingerprint(解析后的参数),
   "inputs": {端口名: fingerprint(上游值)},
-  "source": blake2b(算子类源码)   ← 仅 CacheStore(include_source=True) 时（M2-5）
+  "source": blake2b(算子类源码)   ← 默认纳入（M2-5 起可选；M5-4 起默认开启）
 }, sort_keys=True))
 ```
 
@@ -282,8 +282,10 @@ key = blake2b(20 bytes, json.dumps({
 
 - **上游数据变化 ⇒ 自动失效**（inputs 指纹变）；
 - **下游逻辑变化 ⇒ 不影响上游复用**（上游 key 不含下游信息）；
-- **源码变化 ⇒ 失效（可选）**：`CacheStore(include_source=True)` 把算子类源码
-  blake2b 摘要纳入 key（M2-5/T7 出债）；默认关闭保持 key 只含版本字符串。
+- **源码变化 ⇒ 自动失效（默认）**：`CacheStore` 默认 `include_source=True`
+  （M5-4/Task 9 起），把算子类源码 blake2b 摘要纳入 key——算子源码变更后
+  以默认参数重跑会自动缓存失效（`cached=false`）；显式
+  `include_source=False` 可关闭，退回只按版本字符串的旧行为。
 
 ### 4.2 生效条件
 
@@ -308,7 +310,7 @@ key = blake2b(20 bytes, json.dumps({
 | 淘汰策略 | 无，只有 `CacheStore.clear()` 手动清理 |
 | 算子在执行中写文件但被缓存命中 | 文件写入不会重放（副作用丢失），因此带副作用的算子应关闭缓存 |
 | pickle 反序列化 | 只应指向可信目录；不要使用他人提供的缓存目录 |
-| 版本失效 | 靠算子类 `version` 手动递增，不会感知代码变更 |
+| 源码失效 | 默认（M5-4 起）按算子源码指纹失效——源码变更自动缓存失效；显式 `include_source=False` 后仅靠 `version` 手动递增 |
 | 别名 | key 使用配置里的名字，`read_csv` 与 `io.read_csv` 会产生不同 key |
 
 ---

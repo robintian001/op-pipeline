@@ -237,7 +237,7 @@ load_plugins(entry_points=True)  # 扫描已安装插件包入口点
 
 ---
 
-## 8. 内置算子（46 个）
+## 8. 内置算子（50 个）
 
 | 分组 | 算子 | 说明 |
 | --- | --- | --- |
@@ -248,13 +248,15 @@ load_plugins(entry_points=True)  # 扫描已安装插件包入口点
 | 报告 | `report.markdown` `report.html` | 单文件 HTML，无前端依赖 |
 | 控制 | `control.const` `if_else` `switch` `assert` `passthrough` `merge_dicts` | 常量注入、分支、数据质量门禁 |
 | HTTP | `http.request` | GET/POST、json/text 双视图、超时与重试 |
-| DB | `db.sqlite_exec` `db.sqlite_query` | 标准库 sqlite3，参数化绑定，写后读须接 `gate` 排序 |
+| DB | `db.sqlite_exec` `db.sqlite_query` `db.read_mysql` `db.write_mysql` `db.read_postgres` `db.write_postgres` | SQLite 用标准库 sqlite3；MySQL/PostgreSQL 走 DSN（可选 extras），均参数化绑定，写后读须接 `gate` 排序 |
 | DataFrame | `df.from_table` `df.to_table` `df.to_csv` | pandas 可选依赖（`pip install op-pipeline[dataframe]`），重计算段交给 pandas |
 | Arrow/Parquet | `df.from_arrow` `df.to_arrow` `io.read_parquet` `io.write_parquet` | pyarrow 可选依赖（`pip install op-pipeline[parquet]`），行表 ↔ pyarrow Table / Parquet 文件（M4-2） |
 | Excel | `io.read_excel` `io.write_excel` | openpyxl 可选依赖（`pip install op-pipeline[excel]`），行表 ↔ .xlsx、多 sheet 读写（M4-3） |
 
 > extras 说明：内核 import 路径保持零第三方依赖，可选功能做成 extras 延迟导入——
 > `dataframe`（pandas）、`parquet`（pyarrow）、`excel`（openpyxl）、
+> `mysql`（pymysql，`db.read_mysql`/`db.write_mysql`，M5-3）、
+> `postgres`（psycopg2，`db.read_postgres`/`db.write_postgres`，M5-3）、
 > `yaml`（pyyaml，`.yaml` 配置格式）、`otel`（opentelemetry-api，
 > `observe.OtelHook` 的可选 OTel bridge，未安装只告警跳过）。
 

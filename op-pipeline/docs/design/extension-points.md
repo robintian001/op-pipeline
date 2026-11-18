@@ -21,7 +21,7 @@
 | 运行存储 | 实现 `RunStore`（`record_run`/`record_node`/`query`/`prev_node`）；内置 SQLite 实现（M2-5），默认关闭零副作用；M2-6 起引擎以 `run_store=...` + `resume_run_id=...` 实现断点续跑 | [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/store.py) | 稳定（M2-5） |
 | 执行事件钩子 | 实现 `Hook` 协议（`on_node_start`/`on_node_finish`/`on_run_finish`，可只实现其一）；`Engine(hooks=[...])` / `run_pipeline(hooks=[...])` / `run(hooks=[...])` 挂载；进度条/日志聚合/OTel/UI 从这里取数（M2-7） | `engine.py` `_run_node`（start/finish）与 `run()` 末尾（run_finish） | 稳定（M2-7） |
 | async 宿主桥接 | `run_pipeline_async`（`loop.run_in_executor` 包装同步引擎，参数/返回值与 `run_pipeline` 一致）；async 宿主内 `await` 不阻塞事件循环（M2-8） | `engine.py` `run_pipeline_async`，包顶层导出 | 稳定（M2-8） |
-| 缓存指纹策略 | `CacheStore.compute_key` 签名扩展：新增可选 `source` 参数（算子源码摘要，`include_source=True` 时启用，M2-5/T7） | `cache.py` | 弱契约（鸭子类型） |
+| 缓存指纹策略 | `CacheStore.compute_key` 签名扩展：`source` 参数（算子源码摘要）默认纳入指纹——算子源码变更即缓存失效；显式 `include_source=False` 可关闭（M2-5/T7 出债，M5-4 起默认开启） | `cache.py` | 弱契约（鸭子类型） |
 | 新渲染格式 | `graph.py` 增加函数 + CLI choices | `graph.py` / `cli.py` | 内部接口 |
 
 ---
@@ -320,9 +320,10 @@ M4-4）把任务分发给独立 worker 进程——客户端 `submit` 把载荷
 
 | # | 缺口 | 证据 | 影响 | 建议落点 |
 | --- | --- | --- | --- | --- |
-| T13 | `strict=False` 可返回残缺 Plan | [spec.py#L477-L487](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L477-L487) | 无调用方使用，属预留 | 保持现状并在文档说明 |
+| T13 | `strict=False` 可返回残缺 Plan | [spec.py#L587](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L587)（默认参数）与 [spec.py#L729-L730](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L729-L730)（残缺 Plan 返回） | 无调用方使用，属预留 | **已收口（M5-4）：保留行为并文档明确，默认 `strict=True` 不变，无调用方** |
 
-> 剩余按需处理；T13 保持"预留，不处理"。
+> 剩余按需处理。**T13 已收口（M5-4）**：保留 `strict=False` 行为（无调用方、非默认）
+> 并文档明确——默认 `strict=True` 不变，属"文档明确而非删代码"的收口。
 > 已消除：T1/T5（M1-1，软类型告警接入）、T6（M1-2，缓存目录相对 workdir 解析）、
 > T9（M1-3，`NodeResult.traceback` 截断保留堆栈，重试耗尽路径 `from last_error` 链根因）、
 > T10（M1-4，`run_id` 追加 4 位随机十六进制后缀，同秒并发产物目录隔离）、
@@ -333,8 +334,8 @@ M4-4）把任务分发给独立 worker 进程——客户端 `submit` 把载荷
 > T12（M1-8，`run()` 新增 `plugin_modules` 参数，支持模块路径插件）、
 > **T8（M2-2，`ProcessExecutor` 硬超时——节点 `executor="process"` 或运行级
 > `--executor process` 时，`timeout` 到点 terminate 子进程；线程模式仍为软超时）**、
-> **T7（M2-5，`CacheStore(include_source=True)` 把算子类源码 blake2b 摘要纳入
-> cache_key，源码变化即缓存失效；默认关闭保持旧行为）**、
+> **T7（M2-5，`CacheStore` 把算子类源码 blake2b 摘要纳入 cache_key，源码变化即缓存
+> 失效；M5-4 起默认开启，显式 `include_source=False` 可关闭旧行为）**、
 > **T15（M3-3，表算子列判定改为全表列集合并集——`table_ops.table_columns`
 > 取代 `rows[0].keys()`，select_columns/sort_rows/derive_column/join 四处
 > 统一改用，列参差的行不再丢字段或误报）**。

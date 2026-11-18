@@ -99,6 +99,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if run_store is not None:
         run_store.close()
     print(report.summary())
+    # M5-4（Task 10）：失败节点在 CLI 报告追加截断堆栈——
+    # NodeResult.traceback 已由引擎 _clip_traceback 截断（保留末尾约 2000 字符），
+    # 这里只负责展示；summary() 保持不含堆栈的既有约定
+    for node in report.nodes:
+        if node.status == "failed" and node.traceback:
+            print(f"\n── 节点 [{node.node_id}]（{node.op}）失败堆栈 ──")
+            print(node.traceback)
     if args.json:
         path = report.to_json(args.json)
         print(f"\n报告已写入：{path}")

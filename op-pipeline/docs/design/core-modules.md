@@ -241,9 +241,9 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 - 集合排序后再指纹，保证 `set` 顺序无关；
 - 字典按 `str(key)` 排序，保证跨进程稳定；
 - 写入用 `tmp + os.replace`，读取异常降级为未命中；
-- `CacheStore(include_source=True)`（M2-5，T7 出债）：`compute_key` 新增可选
-  `source` 参数，开启时把算子类源码 blake2b 摘要纳入 key——源码变化即缓存失效；
-  默认关闭保持旧行为（key 只含版本字符串）。
+- `CacheStore` 默认 `include_source=True`（M2-5 起可选，M5-4 起默认开启；T7 出债）：
+  `compute_key` 的 `source` 参数把算子类源码 blake2b 摘要纳入 key——源码变化即缓存失效；
+  显式 `include_source=False` 关闭后 key 只含版本字符串（旧行为，兼容不变）。
 
 ---
 

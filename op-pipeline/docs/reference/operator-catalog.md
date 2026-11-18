@@ -1,6 +1,6 @@
 # 内置算子契约清单
 
-共 40 个算子，按 `ops/` 下的文件分组。字段约定：
+共 44 个算子，按 `ops/` 下的文件分组。字段约定：
 
 - **入 / 出**：`名字:类型`，`?` 表示 optional（未接线时收到 `None`）；
 - **参数**：`*` 表示必填；未标默认值即必填；
@@ -170,24 +170,37 @@
 
 ---
 
-## 8. SQLite（db_ops.py，2 个）
+## 8. DB（db_ops.py，6 个）
 
-标准库 `sqlite3` 实现，**零第三方依赖**。每个节点每次运行各自打开/关闭一个连接；
-`db` 为相对工作目录的文件路径，`:memory:` 表示单节点内存库（跨节点不共享，闭环需用文件库）。
+SQLite 用标准库 `sqlite3` 实现，**零第三方依赖**；MySQL / PostgreSQL 为**可选依赖**
+（`pip install op-pipeline[mysql]` / `[postgres]`），仅在 `run()` 内延迟导入：
+未安装时算子照常注册，调用才报清晰错误。每个节点每次运行各自打开/关闭一个连接；
+SQLite 的 `db` 为相对工作目录的文件路径，`:memory:` 表示单节点内存库（跨节点不共享，闭环需用文件库）。
 
 | 算子 | 入 | 出 | 参数 |
 | --- | --- | --- | --- |
 | `db.sqlite_exec` | `gate:any?` | `rowcount:int` `lastrowid:int?` | `db*`、`query*`、`params=None` |
 | `db.sqlite_query` | `gate:any?` | `rows:list` `count:int` `columns:list` | `db*`、`query*`、`params=None` |
+| `db.read_mysql`（`read_mysql`） | `gate:any?` | `rows:list` `count:int` `columns:list` | `dsn*`、`query=None`、`table=None`、`where=None`、`limit=None` |
+| `db.write_mysql`（`write_mysql`） | `rows:list?` `gate:any?` | `rowcount:int` `lastrowid:int?` | `dsn*`、`table*` |
+| `db.read_postgres`（`read_postgres`） | `gate:any?` | `rows:list` `count:int` `columns:list` | `dsn*`、`query=None`、`table=None`、`where=None`、`limit=None` |
+| `db.write_postgres`（`write_postgres`） | `rows:list?` `gate:any?` | `rowcount:int` `lastrowid:int?` | `dsn*`、`table*` |
 
 行为要点：
 
 - `params` 为位置参数列表，按 `?` 占位符绑定（防注入）；
 - `sqlite_exec` 返回 `rowcount`（DDL 语句 sqlite3 约定为 `-1`）与 `lastrowid`（无自增行时为 `None`）；
 - `sqlite_query` 的 `rows` 为行字典表（列名 -> 值），`columns` 为列名列表，`count` 为行数；
+- MySQL / PostgreSQL 的 `dsn` 形如 `scheme://user:pass@host:port/db`（MySQL 可用
+  `?charset=utf8mb4` 指定编码），由标准库 `urllib.parse` 拆解后连接；
+- `read_mysql` / `read_postgres` 的 `query` 与 `table` 至少提供其一：给 `query` 直接执行
+  原始 SQL；给 `table` 自动拼 `SELECT * FROM <table>`，`where`/`limit` 为附加的原始
+  SQL 文本与行数上限（`table` 模式专用）；
+- `write_mysql` / `write_postgres` 接收行字典表（`rows`），按首行键序推断列名并批量
+  参数化 INSERT（`%s` 占位符），返回 `rowcount` 与 `lastrowid`；
 - 引擎按依赖边调度：**写后读的节点必须显式接线**（可选输入端口 `gate`，接上游任意手柄）
   保证顺序，否则多个 db 节点会并行执行而互相踩踏；
-- SQL 执行失败（如表不存在）抛 `sqlite3.OperationalError`，节点失败并走 `retries` 策略；
+- SQL 执行失败（如表不存在）抛驱动异常（`sqlite3.OperationalError` 等），节点失败并走 `retries` 策略；
 - **`deterministic=False`**（外部状态）：读写均改变/依赖库内容，永不落入节点缓存。
 
 ---

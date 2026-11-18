@@ -49,7 +49,7 @@ class CacheStore:
         self,
         directory: str | Path | None,
         base_dir: str | Path | None = None,
-        include_source: bool = False,
+        include_source: bool = True,
     ) -> None:
         path = Path(directory).expanduser() if directory else None
         # 相对缓存目录以 base_dir（通常为 workdir）为基准，而非进程 CWD：
@@ -57,8 +57,9 @@ class CacheStore:
         if path is not None and not path.is_absolute() and base_dir is not None:
             path = Path(base_dir).expanduser() / path
         self.directory = path
-        # M2-5（T7 出债）：开启后 compute_key 纳入算子源码摘要——
-        # 源码变化即缓存失效；默认关闭保持旧行为
+        # M2-5（T7 出债）：compute_key 纳入算子源码摘要——源码变化即缓存失效；
+        # M5-4（Task 9）起默认开启（算子源码变更后默认参数重跑自动失效），
+        # 显式 include_source=False 仍可关闭（保持旧行为，兼容不变）
         self.include_source = include_source
         if self.directory:
             self.directory.mkdir(parents=True, exist_ok=True)
