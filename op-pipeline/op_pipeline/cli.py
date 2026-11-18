@@ -146,6 +146,23 @@ def cmd_describe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_worker(args: argparse.Namespace) -> int:
+    """M4-4 远端执行：消费共享队列文件并执行任务（配合 QueueWorkerExecutor）。"""
+    from .remote import consume_jobs
+
+    out = args.out or str(Path(args.queue).expanduser().resolve().parent / "results")
+    print(f"worker 监听队列：{args.queue}\n结果目录：{out}")
+    try:
+        processed = consume_jobs(args.queue, out, count=args.count, poll=args.poll)
+    except KeyboardInterrupt:
+        print("\nworker 已停止（Ctrl+C）")
+        return 130
+    print(f"共消费 {len(processed)} 个任务：")
+    for item in processed:
+        print(f"  {item['job_id']} -> {item['status']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="op_pipeline", description="算子级可配置流水线框架")
     parser.add_argument("-v", "--verbose", action="store_true", help="打印调试日志")
@@ -199,6 +216,13 @@ def build_parser() -> argparse.ArgumentParser:
     describe = sub.add_parser("describe", help="查看单个算子契约")
     describe.add_argument("name")
     describe.set_defaults(func=cmd_describe)
+
+    worker = sub.add_parser("worker", help="远端执行：消费共享队列文件并执行任务（M4-4）")
+    worker.add_argument("--queue", required=True, help="JSONL 任务队列文件路径")
+    worker.add_argument("--out", default=None, help="结果目录（默认取队列同目录下的 results/）")
+    worker.add_argument("--count", type=int, default=None, help="最多消费任务数（默认不限，持续监听）")
+    worker.add_argument("--poll", type=float, default=0.1, help="队列轮询间隔（秒）")
+    worker.set_defaults(func=cmd_worker)
     return parser
 
 

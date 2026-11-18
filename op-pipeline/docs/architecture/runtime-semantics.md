@@ -538,3 +538,47 @@ RunReport（summary() / to_json()）+ handles
 4. `ConfigError` 永远不重试；
 5. 报告状态三分类的判定顺序（hard → partial → success）不能被短路；
 6. 新的校验若依赖运行期值，必须同时在 `build_plan` 里做静态版本，否则配置错误会延迟暴露。
+
+---
+
+## 9. 远程执行示范（M4-4）：队列执行器与 worker CLI
+
+`QueueWorkerExecutor`（[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py)）
+实现 `Executor` 协议（submit/wait/shutdown），但把任务分发给**独立 worker 进程**执行，
+客户端与 worker 之间只通过共享文件系统交换：
+
+```
+客户端进程（引擎进程）                worker 进程（可不同机器）
+─────────────────────────            ─────────────────────────────
+exec_.submit(fn, *args)              python -m op_pipeline worker
+  └─ pickle→base64 追加进               └─ 按 offset 增量读队列文件
+      jobs.jsonl（JSONL 队列）           └─ fn(*args) 执行
+exec_.wait([f1, ...])                    └─ 结果/异常写回
+  └─ 轮询 results/<job_id>.json          results/<job_id>.json
+      （存在即完成）                      （先写 .tmp 再原子 replace）
+```
+
+运行时序要点：
+
+1. **载荷**：`(fn, args)` 先 `pickle.dumps` 再 base64，写入队列文件的一行
+   `{"job_id": ..., "payload": ...}`；worker 按 `offset` 增量消费（可断点续消费、
+   可回放）。载荷不可 pickle 时 `submit` 直接抛 `RuntimeError`——队列模式没有
+   "回退线程"选项，提前报错比静默丢失任务诚实。
+2. **结果回写**：worker 把 `{"job_id", "status", "result"(base64), "error"}` 写为
+   `<job_id>.json`，先写 `.tmp` 再 `replace()` 原子改名——客户端 `wait` 轮询
+   `is_file()` 永远读到完整文件，不会读到半个结果。
+3. **wait 语义**：与引擎主循环对 `Executor.wait` 的约定一致——`first_completed=True`
+   时首个完成即返回，`False` 时等全部完成；轮询间隔由 `poll` 控制（默认 0.1s）。
+4. **异常语义**：任务执行异常不会让 worker 进程退出，而是以 `status="error"` +
+   `"ZeroDivisionError: division by zero"` 形式的字符串回写；客户端 `f.result()`
+   时以 `RuntimeError` 抛出（与 `ThreadExecutor` 的 Future 行为一致）。
+5. **worker CLI**：`op_pipeline worker --queue <path> [--out <dir>] [--count N]
+   [--poll 秒]`。`--count` 限定消费条数后正常退出；不传则持续监听直到
+   `Ctrl+C`（exit 130）。`--out` 缺省为队列同目录下的 `results/`。
+
+与内置执行器的差异：`ThreadExecutor`/`ProcessExecutor` 由引擎内部创建并驱动，
+服务**同一进程内**的节点调度；`QueueWorkerExecutor` 面向"另起 worker 进程 /
+跨机器共享盘"的任务分发（M4-4 为示范定位）。引擎的 `executor` 参数仍是字符串
+选择器，队列执行器尚未接入引擎节点调度主循环（载荷 `_run_node` 为 bound method，
+需先解决序列化与共享句柄存储），见 [扩展设计 §4.2](../design/extension-points.md#42-执行器)。
+端到端双进程示范：`python examples/remote_exec_demo.py`。

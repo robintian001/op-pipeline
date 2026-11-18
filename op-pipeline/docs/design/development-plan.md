@@ -3,7 +3,7 @@
 > 本文是 [演进路线](../architecture/roadmap.md) 的任务级分解：
 > 每个任务给出**改动落点**与**可验证的验收标准**，按里程碑组织。
 > 任务编号规则：`M<里程碑>-<序号>`。技术债编号（T*）见
-> [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口)，映射关系见本文 §6。
+> [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口)，映射关系见本文 §7。
 
 ---
 
@@ -11,7 +11,7 @@
 
 | 约定项 | 内容 |
 | --- | --- |
-| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4+` |
+| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4`；M4 → `0.5` |
 | 合入门槛 | `python -m unittest discover -s tests -v` 全绿 + 新任务自带测试 + 两个示例流水线端到端通过 |
 | 回归基线 | 每个任务合入前先跑基线；M2 的抽象类任务要求"平移后行为零变化"（现有 21 用例不改断言） |
 | 文档同步 | 改动涉及节点字段/执行语义/CLI 的，同一变更内更新 [运行时语义](../architecture/runtime-semantics.md) 与 [配置规范](../reference/config-schema.md)；新增算子更新 [算子清单](../reference/operator-catalog.md) |
@@ -314,11 +314,62 @@
 > 共 40 个算子（≥ 40）；每个 extras（dataframe/yaml/otel/dev）独立依赖声明且 README 有说明；
 > 内核 `dependencies = []` 零第三方依赖（extras 模块延迟导入）；`examples/includes/`
 > 新增配置组合示例（跨 JSON/TOML 拆分 + 主配置聚合）。T15（表算子首行列假设）由 M3-3 消除。
-> 剩余技术债见 §6。
+> 剩余技术债见 §7。
 
 ---
 
-## 6. 技术债映射
+## 6. M4：插件信任、数据生态扩展与远程执行示范（v0.5，按需启动）
+
+目标：补全 [roadmap 阶段 3](../architecture/roadmap.md#5-路线图阶段-1--15--2--3) 剩余方向中
+"保持内核可嵌入"的部分——插件生态的信任边界（白名单 + 清单校验，M3-4 入口点发现的配套）、
+数据生态的 Excel/Parquet/Arrow 读写（全部 extras，默认交换格式保持 `list[dict]` 不变）、
+远程执行示范（Executor 接队列 + worker，句柄走共享目录，复用 M2 的 Executor/HandleStore 抽象）。
+调度与 UI 无真实需求，按 roadmap 定位保持"独立外围服务、不进内核"方向**暂缓**（触发条件：出现
+真实的调度/可视化诉求），本次不做。
+
+| 编号 | 任务 | 改动落点 | 验收标准 |
+| --- | --- | --- | --- |
+| M4-1 | 插件信任：`load_plugins` 新增 `allowlist`（入口点名 / 模块名 / 文件路径三类来源的信任清单）与 `strict` 开关——清单外来源默认告警跳过、`strict=True` 报错拒绝；可选清单校验 `verify_manifest`（插件包 `.dist-info` 提供 `OP_PLUGINS.sha256` 清单，hashlib 校验文件哈希，零第三方） | [registry.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py) `load_plugins` | 单测①：allowlist 外插件不加载且告警；② `strict=True` 报错拒绝；③ 篡改插件文件后 `verify_manifest` 拒绝加载；④ 不传新参数行为完全向后兼容（160 用例不改断言全绿）；文档：extension-points.md 新增插件信任小节 |
+| M4-2 | 数据生态（Arrow/Parquet）：`df.from_arrow` / `df.to_arrow`（`list[dict]` ↔ pyarrow Table）与 `io.read_parquet` / `io.write_parquet`（行表 ↔ parquet 文件）；pyarrow 可选 extras `parquet`，延迟导入模式同 `df._pandas()` | 新增 `ops/parquet_ops.py`、[pyproject.toml](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/pyproject.toml) extras | 单测：行表 ↔ Arrow/parquet 往返逐值一致；未装 pyarrow 时模块照常导入、调用报错提示 `pip install op-pipeline[parquet]`；extras 独立依赖声明 + README 说明；算子数 40→44 |
+| M4-3 | 数据生态（Excel）：`io.read_excel` / `io.write_excel`（openpyxl 可选 extras `excel`，`sheet` 参数指定/多 sheet 写盘），行表交换格式不变 | 新增 `ops/excel_ops.py`、[pyproject.toml](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/pyproject.toml) extras | 单测：行表 ↔ .xlsx 往返一致；多 sheet 读写；未装 openpyxl 时延迟导入报错；extras 独立声明；算子数 44→46 |
+| M4-4 | 远程执行示范：`QueueWorkerExecutor`（[executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) 协议实现）——`submit` 把载荷 pickle 写入任务队列文件（JSONL），独立 worker 进程（新 CLI 入口 `op_pipeline worker --queue <path> [--out <dir>]`）消费执行、结果与异常写回共享目录（对象存储替代，复用 M2-4 SpillHandleStore 落盘语义），`wait` 轮询完成标记；载荷不可 pickle 直接报错不静默回退 | 新增 [remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py)（或并入 executor.py）、[cli.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cli.py) | 单测①：另起 worker 进程消费队列，`run_pipeline(executor=QueueWorkerExecutor(...))` 与 ThreadExecutor 结果一致；② 无 worker 时超时/失败语义清晰；③ 不可 pickle 载荷报错；④ 文档：extension-points.md §4.2 更新远程执行器示例 + [运行时语义](../architecture/runtime-semantics.md) 新节 |
+
+**M4 完成定义（DoD）**：`op_pipeline ops` 算子数 ≥ 46；每个 extras（excel/parquet）独立依赖声明
+且 README 有说明；内核 `dependencies = []` 零第三方依赖保持（新模块延迟导入）；远程执行有端到端
+示范（worker 进程 + 引擎进程双进程演示）；examples 新增数据生态示例（Excel/parquet 读写流水线）；
+全量回归全绿。
+
+> **M4 状态**：M4-1 已完成（2026-11-18，TDD 红→绿 8 新用例，全量回归 168 tests OK）。
+> M4-1：`load_plugins` 新增 `allowlist` 白名单（入口点名/模块名/文件路径，清单外告警跳过、
+> `strict=True` 拒绝）与 `verify_manifest` 哈希清单校验（hashlib，默认 `<base_dir>/OP_PLUGINS.sha256`，
+> 仅文件插件，缺清单/未列入/不匹配均 `ConfigError`）。文档：extension-points §1 新行 + §3.5 新增。
+> M4-2 已完成（2026-11-18，TDD 红→绿 5 新用例）：新增 `ops/parquet_ops.py` 四个算子——
+> `df.from_arrow` / `df.to_arrow`（行表 ↔ pyarrow Table）、`io.read_parquet` / `io.write_parquet`
+> （行表 ↔ Parquet 文件）；pyarrow 可选 extras `parquet`（延迟导入，未安装调用报错提示安装）。
+> 算子数 40→44，README 内置算子表与 extras 说明同步。
+> M4-3 已完成（2026-11-18，TDD 红→绿 4 新用例）：新增 `ops/excel_ops.py` 两个算子——
+> `io.read_excel` / `io.write_excel`（openpyxl 可选 extras `excel`，延迟导入）；
+> `io.write_excel` 支持 `sheets` 可选输入一次写多 sheet，`io.read_excel` 用 `sheet` 参数
+> 指定工作表（None 读活动表）。算子数 44→46。
+> M4-4 已完成（2026-11-18，TDD 红→绿 5 新用例）：新增 `remote.py` ——
+> `QueueWorkerExecutor`（Executor 协议实现）把载荷 `pickle→base64` 追加进 JSONL 队列，
+> `consume_jobs()` 增量消费执行并把结果/异常以 `<job_id>.json` 写回（`.tmp`→原子 `replace`），
+> 客户端 `wait` 轮询完成标记；载荷不可 pickle 时 submit 直接 `RuntimeError`。
+> 新 CLI：`op_pipeline worker --queue <path> [--out <dir>] [--count N] [--poll 秒]`。
+> `__init__` 导出 `QueueWorkerExecutor`；双进程 e2e 用例（worker 子进程）通过。
+>
+> **M4 已完成（v0.5.0，2026-11-18）**。DoD 复核：算子数 46 ≥ 46 ✓；`parquet`/`excel` extras
+> 独立声明 + README 说明 ✓；内核零第三方依赖保持（新模块均延迟导入，remote.py 纯标准库）✓；
+> 远程执行双进程示范（[examples/remote_exec_demo.py](../../examples/remote_exec_demo.py)，
+> 引擎进程提交 + worker 子进程消费，含异常回写）✓；examples 数据生态示例
+> （[pipeline_data_ecosystem.toml](../../examples/pipeline_data_ecosystem.toml)，
+> CSV → Parquet → Excel 往返）✓；全量回归 **182 tests 全绿** ✓。
+> 文档：README §9（远程执行示范）、extension-points §4.2（队列执行器示例）、
+> runtime-semantics §9（运行时序要点）。
+
+---
+
+## 7. 技术债映射
 
 [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口) 的 T1–T15 与本计划的对应关系：
 
@@ -342,7 +393,7 @@
 
 ---
 
-## 7. 里程碑级验收清单
+## 8. 里程碑级验收清单
 
 每个里程碑收尾时执行（也是发版前检查单）：
 
@@ -371,7 +422,7 @@ python -m op_pipeline ops
 
 ---
 
-## 8. 工程实践约定
+## 9. 工程实践约定
 
 1. **一个任务一个 PR**，PR 描述引用任务编号（如 `M1-2`），便于回溯验收标准；
 2. **语义变更先改文档再改代码**：涉及 [运行时语义](../architecture/runtime-semantics.md)

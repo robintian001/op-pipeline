@@ -220,6 +220,10 @@ from op_pipeline import load_plugins
 load_plugins(modules=["my_company.ops"], paths=["plugins/my_ops.py"], base_dir=".")
 ```
 
+插件信任（M4-1）：`allowlist` 白名单限制可加载来源（入口点名/模块名/文件路径，清单外
+告警跳过，`strict=True` 时拒绝）；`verify_manifest=True` 用 `<base_dir>/OP_PLUGINS.sha256`
+（sha256sum 格式）校验文件插件哈希。详见 [扩展设计 §3.5](docs/design/extension-points.md#35-插件信任白名单与哈希清单校验m4-1)。
+
 **入口点自动发现（M3-4）**：插件包在自己的 `pyproject.toml` 声明
 `[project.entry-points."op_pipeline.ops"]` 后 pip 安装，CLI（`ops`/`run` 等，默认开启）
 与库调用 `load_plugins(entry_points=True)` 即可免 `--plugin` 直接使用：
@@ -233,7 +237,7 @@ load_plugins(entry_points=True)  # 扫描已安装插件包入口点
 
 ---
 
-## 8. 内置算子（40 个）
+## 8. 内置算子（46 个）
 
 | 分组 | 算子 | 说明 |
 | --- | --- | --- |
@@ -246,9 +250,12 @@ load_plugins(entry_points=True)  # 扫描已安装插件包入口点
 | HTTP | `http.request` | GET/POST、json/text 双视图、超时与重试 |
 | DB | `db.sqlite_exec` `db.sqlite_query` | 标准库 sqlite3，参数化绑定，写后读须接 `gate` 排序 |
 | DataFrame | `df.from_table` `df.to_table` `df.to_csv` | pandas 可选依赖（`pip install op-pipeline[dataframe]`），重计算段交给 pandas |
+| Arrow/Parquet | `df.from_arrow` `df.to_arrow` `io.read_parquet` `io.write_parquet` | pyarrow 可选依赖（`pip install op-pipeline[parquet]`），行表 ↔ pyarrow Table / Parquet 文件（M4-2） |
+| Excel | `io.read_excel` `io.write_excel` | openpyxl 可选依赖（`pip install op-pipeline[excel]`），行表 ↔ .xlsx、多 sheet 读写（M4-3） |
 
 > extras 说明：内核 import 路径保持零第三方依赖，可选功能做成 extras 延迟导入——
-> `dataframe`（pandas）、`yaml`（pyyaml，`.yaml` 配置格式）、`otel`（opentelemetry-api，
+> `dataframe`（pandas）、`parquet`（pyarrow）、`excel`（openpyxl）、
+> `yaml`（pyyaml，`.yaml` 配置格式）、`otel`（opentelemetry-api，
 > `observe.OtelHook` 的可选 OTel bridge，未安装只告警跳过）。
 
 ---
@@ -274,7 +281,41 @@ hook.close()
 
 ---
 
-## 9. 已知限制与后续演进
+## 9. 远程执行示范（M4-4）
+
+`QueueWorkerExecutor`（`from op_pipeline import QueueWorkerExecutor`）实现
+`Executor` 协议，但把任务分发给**独立 worker 进程**执行，客户端与 worker 之间
+只交换共享文件：
+
+- 客户端 `exec_.submit(fn, *args)`：载荷 `pickle → base64` 追加进 JSONL 队列
+  文件；载荷不可 pickle 时直接抛 `RuntimeError`；
+- worker：`python -m op_pipeline worker --queue jobs.jsonl --out results [--count N]`
+  增量消费队列并执行，结果/异常写回 `results/<job_id>.json`（先写 `.tmp`
+  再原子改名，`wait` 不会读到半个结果）；
+- 客户端 `exec_.wait([...])` 轮询结果文件，`f.result()` 取结果或抛回远端异常。
+
+```python
+import operator
+from op_pipeline import QueueWorkerExecutor
+
+exec_ = QueueWorkerExecutor("jobs.jsonl", "results", poll=0.05)
+f = exec_.submit(operator.add, 40, 2)
+exec_.wait([f])
+print(f.result())  # 42
+```
+
+双进程端到端示范见 [examples/remote_exec_demo.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/examples/remote_exec_demo.py)
+（脚本扮演引擎进程提交 3 个任务、另起 worker 子进程消费，含异常回写演示）。
+数据生态示例 [examples/pipeline_data_ecosystem.toml](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/examples/pipeline_data_ecosystem.toml)
+（CSV → Parquet → Excel 往返读写）：
+
+```bash
+python -m op_pipeline run examples/pipeline_data_ecosystem.toml --no-cache
+```
+
+---
+
+## 10. 已知限制与后续演进
 
 | 限制 | 现状 | 演进方向 |
 | --- | --- | --- |
@@ -287,7 +328,7 @@ hook.close()
 
 ---
 
-## 10. 自测
+## 11. 自测
 
 ```powershell
 python -m unittest discover -s tests -v

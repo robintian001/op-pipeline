@@ -52,6 +52,18 @@ try:
 except ImportError:
     _HAS_PANDAS = False
 
+try:
+    import pyarrow as pa  # noqa: F401
+    _HAS_PYARROW = True
+except ImportError:
+    _HAS_PYARROW = False
+
+try:
+    import openpyxl  # noqa: F401
+    _HAS_OPENPYXL = True
+except ImportError:
+    _HAS_OPENPYXL = False
+
 
 # --------------------------------------------------------------------------- #
 # 测试用算子
@@ -1420,6 +1432,155 @@ class EntryPointPluginTest(unittest.TestCase):
             )
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("m34.cli_toy", out.stdout, "CLI 应列出入口点插件算子")
+
+
+class PluginTrustTest(unittest.TestCase):
+    """M4-1：插件信任——allowlist 白名单 / strict 拒绝 / verify_manifest 哈希清单校验。"""
+
+    MOD_OP = (
+        'from op_pipeline import Operator, op\n'
+        '\n'
+        '@op("m41.mod_op")\n'
+        'class ModOp(Operator):\n'
+        '    outputs = [("value", int)]\n'
+        '\n'
+        '    def run(self, ctx):\n'
+        '        return 1\n'
+    )
+    FILE_OP = (
+        'from op_pipeline import Operator, op\n'
+        '\n'
+        '@op("m41.file_op")\n'
+        'class FileOp(Operator):\n'
+        '    outputs = [("value", int)]\n'
+        '\n'
+        '    def run(self, ctx):\n'
+        '        return 2\n'
+    )
+
+    def test_allowlist_skips_unlisted_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "trust_mod.py").write_text(self.MOD_OP, encoding="utf-8")
+            sys.path.insert(0, tmp)
+            try:
+                reg = Registry()
+                with self.assertLogs("op_pipeline.registry", level="WARNING") as cm:
+                    loaded = load_plugins(
+                        modules=["trust_mod"], registry=reg, allowlist=["other.module"])
+            finally:
+                sys.path.remove(tmp)
+        self.assertNotIn("trust_mod", loaded, "清单外模块应被跳过")
+        self.assertNotIn("m41.mod_op", reg, "清单外模块的算子不应注册")
+        self.assertTrue(any("不在信任清单" in m for m in cm.output), "跳过应发告警")
+
+    def test_allowlist_loads_listed_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "trust_mod.py").write_text(self.MOD_OP, encoding="utf-8")
+            sys.path.insert(0, tmp)
+            try:
+                reg = Registry()
+                loaded = load_plugins(
+                    modules=["trust_mod"], registry=reg, allowlist=["trust_mod"])
+            finally:
+                sys.path.remove(tmp)
+        self.assertIn("trust_mod", loaded)
+        self.assertIn("m41.mod_op", reg)
+
+    def test_strict_allowlist_raises_on_unlisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "trust_mod.py").write_text(self.MOD_OP, encoding="utf-8")
+            sys.path.insert(0, tmp)
+            try:
+                reg = Registry()
+                with self.assertRaises(ConfigError):
+                    load_plugins(
+                        modules=["trust_mod"], registry=reg,
+                        allowlist=["other.module"], strict=True)
+            finally:
+                sys.path.remove(tmp)
+
+    def test_allowlist_filters_path_plugin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "trust_file.py"
+            f.write_text(self.FILE_OP, encoding="utf-8")
+            reg = Registry()
+            with self.assertLogs("op_pipeline.registry", level="WARNING") as cm:
+                loaded = load_plugins(
+                    paths=[f], registry=reg, allowlist=["not.the.path"])
+            self.assertNotIn(str(f.resolve()), loaded)
+            self.assertNotIn("m41.file_op", reg)
+            self.assertTrue(any("不在信任清单" in m for m in cm.output))
+            # 同一文件进白名单后应加载
+            reg2 = Registry()
+            loaded2 = load_plugins(paths=[f], registry=reg2, allowlist=[str(f.resolve())])
+            self.assertIn(str(f.resolve()), loaded2)
+            self.assertIn("m41.file_op", reg2)
+
+    def test_verify_manifest_accepts_matching_file(self):
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "trust_manifested.py"
+            f.write_text(self.FILE_OP, encoding="utf-8")
+            digest = hashlib.sha256(f.read_bytes()).hexdigest()
+            (Path(tmp) / "OP_PLUGINS.sha256").write_text(
+                f"{digest}  {f.name}\n", encoding="utf-8")
+            reg = Registry()
+            loaded = load_plugins(paths=[f], base_dir=tmp, registry=reg, verify_manifest=True)
+        self.assertIn(str(f.resolve()), loaded)
+        self.assertIn("m41.file_op", reg)
+
+    def test_verify_manifest_rejects_tampered_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "trust_manifested.py"
+            f.write_text(self.FILE_OP, encoding="utf-8")
+            (Path(tmp) / "OP_PLUGINS.sha256").write_text(
+                f"{'0' * 64}  {f.name}\n", encoding="utf-8")
+            reg = Registry()
+            with self.assertRaises(ConfigError):
+                load_plugins(paths=[f], base_dir=tmp, registry=reg, verify_manifest=True)
+
+    def test_verify_manifest_missing_manifest_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "trust_manifested.py"
+            f.write_text(self.FILE_OP, encoding="utf-8")
+            reg = Registry()
+            with self.assertRaises(ConfigError):
+                load_plugins(paths=[f], base_dir=tmp, registry=reg, verify_manifest=True)
+
+    def test_entry_point_allowlist_filters_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for mod, ns in (("m41_ep_a", "m41.ep_a"), ("m41_ep_b", "m41.ep_b")):
+                (Path(tmp) / f"{mod}.py").write_text(
+                    f'from op_pipeline import Operator, op\n'
+                    f'\n'
+                    f'@op("{ns}")\n'
+                    f'class Toy(Operator):\n'
+                    f'    outputs = [("value", int)]\n'
+                    f'\n'
+                    f'    def run(self, ctx):\n'
+                    f'        return 1\n',
+                    encoding="utf-8",
+                )
+                dist = Path(tmp) / f"{mod}-0.1.dist-info"
+                dist.mkdir()
+                (dist / "METADATA").write_text(
+                    f"Metadata-Version: 2.1\nName: {mod}\nVersion: 0.1\n",
+                    encoding="utf-8",
+                )
+                (dist / "entry_points.txt").write_text(
+                    f"[op_pipeline.ops]\n{mod} = {mod}\n", encoding="utf-8")
+            sys.path.insert(0, tmp)
+            try:
+                reg = Registry()
+                with self.assertLogs("op_pipeline.registry", level="WARNING") as cm:
+                    load_plugins(entry_points=True, registry=reg, allowlist=["m41_ep_a"])
+            finally:
+                sys.path.remove(tmp)
+        self.assertIn("m41.ep_a", reg, "白名单内入口点应加载")
+        self.assertNotIn("m41.ep_b", reg, "白名单外入口点应跳过")
+        self.assertTrue(any("不在信任清单" in m for m in cm.output))
+
 
 
 class DryRunNoSideEffectsTest(unittest.TestCase):
@@ -2966,6 +3127,248 @@ class DataFrameOpTest(unittest.TestCase):
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                               cwd=str(ROOT), timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+@unittest.skipUnless(_HAS_PYARROW, "需要 pyarrow（pip install op-pipeline[parquet]）")
+class ParquetOpTest(unittest.TestCase):
+    """df.from_arrow / df.to_arrow / io.read_parquet / io.write_parquet。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, nodes):
+        return run_pipeline(
+            spec_of(nodes), registry=default_registry, workdir=self._tmp.name, cache_dir=None
+        )
+
+    def test_parquet_roundtrip(self):
+        table = [{"region": "north", "amount": 10}, {"region": "south", "amount": 20}]
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": table}},
+            {"id": "w", "op": "io.write_parquet", "inputs": {"table": "${src.value}"},
+             "params": {"path": "out/data.parquet"}},
+            {"id": "r", "op": "io.read_parquet", "inputs": {},
+             "params": {"path": "${w.path}"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertTrue((Path(self._tmp.name) / "out/data.parquet").exists())
+        self.assertEqual(values["r.table"], table)
+        self.assertEqual(values["r.rows"], 2)
+
+    def test_arrow_roundtrip(self):
+        table = [{"region": "north", "amount": 10}, {"region": "south", "amount": 20}]
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": table}},
+            {"id": "fa", "op": "df.from_arrow", "inputs": {"table": "${src.value}"}},
+            {"id": "ta", "op": "df.to_arrow", "inputs": {"arrow": "${fa.arrow}"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["fa.rows"], 2)
+        self.assertEqual(values["fa.columns"], ["region", "amount"])
+        self.assertEqual(values["ta.table"], table)
+        self.assertEqual(values["ta.rows"], 2)
+
+    def test_from_arrow_output_is_pa_table(self):
+        table = [{"a": 1, "b": "x"}]
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": table}},
+            {"id": "fa", "op": "df.from_arrow", "inputs": {"table": "${src.value}"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertIsInstance(values["fa.arrow"], pa.Table)
+        self.assertEqual(values["fa.arrow"].num_rows, 1)
+
+    def test_lazy_import_error_without_pyarrow(self):
+        # 模拟未安装 pyarrow：sys.modules 置 None 使 `import pyarrow` 抛 ImportError
+        original = sys.modules.get("pyarrow")
+        sys.modules["pyarrow"] = None
+        try:
+            op_ = default_registry.get("io.read_parquet")(path="x.parquet")
+            with self.assertRaises(RuntimeError) as cm:
+                op_.execute(ctx=None, inputs={})
+            self.assertIn("op-pipeline[parquet]", str(cm.exception))
+        finally:
+            if original is None:
+                sys.modules.pop("pyarrow", None)
+            else:
+                sys.modules["pyarrow"] = original
+
+    def test_import_without_pyarrow(self):
+        code = (
+            "import sys; sys.modules['pyarrow'] = None; "
+            "import op_pipeline; "
+            "assert 'io.read_parquet' in op_pipeline.default_registry "
+            "and 'io.write_parquet' in op_pipeline.default_registry "
+            "and 'df.from_arrow' in op_pipeline.default_registry "
+            "and 'df.to_arrow' in op_pipeline.default_registry"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              cwd=str(ROOT), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+@unittest.skipUnless(_HAS_OPENPYXL, "需要 openpyxl（pip install op-pipeline[excel]）")
+class ExcelOpTest(unittest.TestCase):
+    """io.read_excel / io.write_excel（openpyxl 可选 extras）。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, nodes):
+        return run_pipeline(
+            spec_of(nodes), registry=default_registry, workdir=self._tmp.name, cache_dir=None
+        )
+
+    def test_excel_roundtrip(self):
+        table = [{"region": "north", "amount": 10}, {"region": "south", "amount": 20}]
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": table}},
+            {"id": "w", "op": "io.write_excel", "inputs": {"table": "${src.value}"},
+             "params": {"path": "out/data.xlsx"}},
+            {"id": "r", "op": "io.read_excel", "inputs": {},
+             "params": {"path": "${w.path}"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertTrue((Path(self._tmp.name) / "out/data.xlsx").exists())
+        self.assertEqual(values["r.table"], table)
+        self.assertEqual(values["r.rows"], 2)
+
+    def test_multi_sheet_write_read(self):
+        sheets = {"A": [{"x": 1}], "B": [{"x": 2}, {"x": 3}]}
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": sheets}},
+            {"id": "w", "op": "io.write_excel", "inputs": {"sheets": "${src.value}"},
+             "params": {"path": "out/multi.xlsx"}},
+            {"id": "ra", "op": "io.read_excel", "inputs": {},
+             "params": {"path": "${w.path}", "sheet": "A"}},
+            {"id": "rb", "op": "io.read_excel", "inputs": {},
+             "params": {"path": "${w.path}", "sheet": "B"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["ra.table"], [{"x": 1}])
+        self.assertEqual(values["rb.table"], [{"x": 2}, {"x": 3}])
+        self.assertEqual(values["rb.rows"], 2)
+
+    def test_lazy_import_error_without_openpyxl(self):
+        # 模拟未安装 openpyxl：sys.modules 置 None 使 `import openpyxl` 抛 ImportError
+        original = sys.modules.get("openpyxl")
+        sys.modules["openpyxl"] = None
+        try:
+            op_ = default_registry.get("io.read_excel")(path="x.xlsx")
+            with self.assertRaises(RuntimeError) as cm:
+                op_.execute(ctx=None, inputs={})
+            self.assertIn("op-pipeline[excel]", str(cm.exception))
+        finally:
+            if original is None:
+                sys.modules.pop("openpyxl", None)
+            else:
+                sys.modules["openpyxl"] = original
+
+    def test_import_without_openpyxl(self):
+        code = (
+            "import sys; sys.modules['openpyxl'] = None; "
+            "import op_pipeline; "
+            "assert 'io.read_excel' in op_pipeline.default_registry "
+            "and 'io.write_excel' in op_pipeline.default_registry"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              cwd=str(ROOT), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class QueueWorkerTest(unittest.TestCase):
+    """M4-4 远程执行示范：QueueWorkerExecutor + consume_jobs + worker CLI。"""
+
+    def test_protocol_satisfies_executor(self):
+        from op_pipeline import Executor, QueueWorkerExecutor
+        with tempfile.TemporaryDirectory() as tmp:
+            exec_ = QueueWorkerExecutor(Path(tmp) / "jobs.jsonl", Path(tmp) / "results")
+            self.assertIsInstance(exec_, Executor)
+            exec_.shutdown()
+
+    def test_queue_roundtrip_in_process(self):
+        import operator
+        from op_pipeline import QueueWorkerExecutor
+        from op_pipeline.remote import consume_jobs
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            queue = tmp / "jobs.jsonl"
+            out = tmp / "results"
+            exec_ = QueueWorkerExecutor(queue, out, poll=0.01)
+            f1 = exec_.submit(operator.add, 2, 3)
+            f2 = exec_.submit(operator.mul, 4, 5)
+            thread = threading.Thread(
+                target=consume_jobs, args=(queue, out),
+                kwargs={"count": 2, "poll": 0.01}, daemon=True,
+            )
+            thread.start()
+            done = exec_.wait([f1, f2], first_completed=False)
+            self.assertEqual(len(done), 2)
+            self.assertEqual(f1.result(), 5)
+            self.assertEqual(f2.result(), 20)
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+
+    def test_exception_written_back(self):
+        import operator
+        from op_pipeline import QueueWorkerExecutor
+        from op_pipeline.remote import consume_jobs
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            queue = tmp / "jobs.jsonl"
+            out = tmp / "results"
+            exec_ = QueueWorkerExecutor(queue, out, poll=0.01)
+            f = exec_.submit(operator.truediv, 1, 0)
+            threading.Thread(
+                target=consume_jobs, args=(queue, out),
+                kwargs={"count": 1, "poll": 0.01}, daemon=True,
+            ).start()
+            exec_.wait([f])
+            with self.assertRaises(RuntimeError) as cm:
+                f.result()
+            self.assertIn("ZeroDivisionError", str(cm.exception))
+
+    def test_unpicklable_submit_raises(self):
+        from op_pipeline import QueueWorkerExecutor
+        with tempfile.TemporaryDirectory() as tmp:
+            exec_ = QueueWorkerExecutor(Path(tmp) / "jobs.jsonl", Path(tmp) / "results")
+            with self.assertRaises(RuntimeError) as cm:
+                exec_.submit(lambda: 1)  # lambda 不可 pickle
+            self.assertIn("pickle", str(cm.exception))
+
+    def test_two_process_e2e(self):
+        import operator
+        from op_pipeline import QueueWorkerExecutor
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            queue = tmp / "jobs.jsonl"
+            out = tmp / "results"
+            exec_ = QueueWorkerExecutor(queue, out, poll=0.05)
+            f1 = exec_.submit(operator.add, 40, 2)
+            f2 = exec_.submit(operator.mul, 6, 7)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "op_pipeline", "worker",
+                 "--queue", str(queue), "--out", str(out), "--count", "2",
+                 "--poll", "0.05"],
+                cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            done = exec_.wait([f1, f2], first_completed=False)
+            self.assertEqual(len(done), 2)
+            self.assertEqual(f1.result(), 42)
+            self.assertEqual(f2.result(), 42)
+            stdout, stderr = proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 0, stderr)
 
 
 if __name__ == "__main__":

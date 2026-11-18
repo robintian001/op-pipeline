@@ -1,0 +1,45 @@
+name = "data_ecosystem"
+version = "1.0"
+description = "数据生态示例：CSV → Parquet → Excel 往返读写（M4-2 / M4-3，pyarrow/openpyxl 可选 extras）"
+
+[params]
+input_path = "data/orders.csv"
+out_dir = "output"
+
+[[nodes]]
+id = "load"
+op = "io.read_csv"
+  [nodes.params]
+  path = "${p.input_path}"
+
+[[nodes]]
+id = "to_parquet"
+op = "io.write_parquet"
+  [nodes.inputs]
+  table = "${load.table}"
+  [nodes.params]
+  path = "${p.out_dir}/orders.parquet"
+
+[[nodes]]
+id = "from_parquet"
+op = "io.read_parquet"
+  [nodes.params]
+  path = "${to_parquet.path}"
+
+[[nodes]]
+id = "to_excel"
+op = "io.write_excel"
+  [nodes.inputs]
+  table = "${load.table}"
+  [nodes.params]
+  path = "${p.out_dir}/orders.xlsx"
+
+[[nodes]]
+id = "from_excel"
+op = "io.read_excel"
+  [nodes.params]
+  path = "${to_excel.path}"
+
+[outputs]
+parquet_rows = "${from_parquet.rows}"
+excel_rows = "${from_excel.rows}"

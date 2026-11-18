@@ -12,13 +12,14 @@ import importlib.metadata
 import importlib.util
 import itertools
 import logging
+import os
 import sys
 import threading
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from .errors import DuplicateOperatorError, OperatorNotFoundError, PipelineError
+from .errors import ConfigError, DuplicateOperatorError, OperatorNotFoundError, PipelineError
 
 log = logging.getLogger("op_pipeline.registry")
 
@@ -185,6 +186,14 @@ def op(
 _OPS_ENTRY_POINT_GROUP = "op_pipeline.ops"
 
 
+def _resolve_allow_path(entry: str, root: Path | None) -> Path:
+    """把 allowlist 里可能相对的路径条目解析为绝对路径（相对 base_dir）。"""
+    p = Path(entry).expanduser()
+    if not p.is_absolute() and root is not None:
+        p = root / p
+    return p.resolve()
+
+
 def load_plugins(
     modules: Sequence[str] = (),
     paths: Sequence[str | Path] = (),
@@ -193,6 +202,10 @@ def load_plugins(
     package: str | None = "op_pipeline.ops",
     registry: Registry | None = None,
     entry_points: bool = False,
+    allowlist: Sequence[str] | None = None,
+    strict: bool = False,
+    verify_manifest: bool = False,
+    manifest: str | Path | None = None,
 ) -> list[str]:
     """加载算子插件。
 
@@ -209,10 +222,73 @@ def load_plugins(
         如 ``my_ops = "my_company.ops"``。入口点默认关闭（向后兼容），CLI 默认开启：
         安装的插件包无需 ``--plugin`` 即可被发现。单个入口点模块导入失败或算子
         名与已注册算子撞重时只告警跳过，不拖垮其余入口点（自动发现场景以稳为先）。
+    :param allowlist: M4-1 信任清单：入口点组内名字 / 模块名 / 文件路径（绝对路径，或
+        相对 ``base_dir`` 解析）。不在清单内的来源默认**告警跳过**；为 ``None`` 时不过滤
+        （向后兼容）。空清单 ``[]`` 表示"什么都不信任"。
+    :param strict: ``True`` 时清单外来源直接抛 ``ConfigError`` 拒绝，不再告警跳过。
+    :param verify_manifest: 对 ``paths`` 文件插件校验哈希清单（默认 ``<base_dir>/``
+        ``OP_PLUGINS.sha256``，可经 ``manifest`` 指定）。清单格式与 sha256sum 一致
+        （每行 ``<sha256hex>  <相对路径>``）。清单缺失、文件未列入、哈希不匹配均抛
+        ``ConfigError`` 拒绝加载。仅作用于文件插件；模块/入口点按 import 幂等语义
+        无法做文件级校验。
+    :param manifest: 哈希清单路径（配合 ``verify_manifest=True``）。
     :return: 本次实际加载的模块名列表
     """
     loaded: list[str] = []
     token = _ambient_registry.set(registry) if registry is not None else None
+    root = Path(base_dir).expanduser() if base_dir else None
+
+    # M4-1：信任清单（allowlist）。None = 不过滤；非 None 时只放行清单内来源。
+    allowed_names = set(allowlist) if allowlist is not None else None
+    allowed_paths = (
+        {str(_resolve_allow_path(e, root)) for e in allowed_names}
+        if allowed_names is not None else None
+    )
+
+    def _check_allow(kind: str, ident: str, path: Path | None = None) -> bool:
+        if allowed_names is None:
+            return True
+        if ident in allowed_names:
+            return True
+        if path is not None and str(path) in allowed_paths:
+            return True
+        if strict:
+            raise ConfigError(
+                f"插件 {kind} '{ident}' 不在信任清单（allowlist）内，已拒绝加载"
+            )
+        log.warning("插件 %s '%s' 不在信任清单（allowlist）内，已跳过", kind, ident)
+        return False
+
+    # M4-1：哈希清单（verify_manifest）。键为相对清单目录的路径（统一正斜杠）。
+    manifest_path: Path | None = None
+    manifest_hashes: dict[str, str] = {}
+    if verify_manifest:
+        manifest_path = (
+            Path(manifest).expanduser() if manifest is not None else None
+        )
+        if manifest_path is None:
+            manifest_path = (root or Path.cwd()) / "OP_PLUGINS.sha256"
+        if not manifest_path.exists():
+            raise ConfigError(f"verify_manifest 需要哈希清单，但未找到：{manifest_path}")
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) == 2:
+                manifest_hashes[parts[1].replace(os.sep, "/")] = parts[0].lower()
+
+    def _check_manifest(path: Path) -> None:
+        rel = os.path.relpath(str(path), str(manifest_path.parent)).replace(os.sep, "/")
+        expected = manifest_hashes.get(rel)
+        if expected is None:
+            raise ConfigError(f"插件文件未在哈希清单中：{rel}")
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise ConfigError(
+                f"插件文件哈希校验失败：{rel}（清单 {expected} ≠ 实际 {actual}）"
+            )
+
     try:
         if package:
             try:
@@ -225,6 +301,8 @@ def load_plugins(
 
         if entry_points:
             for ep in importlib.metadata.entry_points(group=_OPS_ENTRY_POINT_GROUP):
+                if not _check_allow("入口点", ep.name):
+                    continue
                 try:
                     importlib.import_module(ep.module)
                     loaded.append(f"entry:{ep.name}")
@@ -234,10 +312,11 @@ def load_plugins(
                     log.warning("跳过插件入口点 %s：算子名已被占用（%s）", ep.name, exc)
 
         for mod in modules:
+            if not _check_allow("模块", mod):
+                continue
             importlib.import_module(mod)
             loaded.append(mod)
 
-        root = Path(base_dir).expanduser() if base_dir else None
         for raw in paths:
             path = Path(raw).expanduser()
             if not path.is_absolute() and root is not None:
@@ -245,6 +324,10 @@ def load_plugins(
             path = path.resolve()
             if not path.exists():
                 raise PipelineError(f"插件文件不存在：{path}")
+            if not _check_allow("文件插件", str(path), path=path):
+                continue
+            if manifest_path is not None:
+                _check_manifest(path)
             key = str(path)
             if registry is not None:
                 # 同表去重（原子占位，并发加载同一文件只执行一次）；

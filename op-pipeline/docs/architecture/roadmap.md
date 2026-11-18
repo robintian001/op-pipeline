@@ -55,7 +55,7 @@
 | --- | --- | --- | --- |
 | API 数据采集 | `http.request`（标准库 `urllib` 即可，不破零依赖） | 无 | M3（**已落地**） |
 | 数据库读写 | `db.sqlite_*`（标准库）；MySQL/PG 走可选 extras | 无 | M3（**已落地**） |
-| Excel/Parquet | 可选依赖算子，做成 extras 不污染内核 | 无 | M3 |
+| Excel/Parquet | 可选依赖算子，做成 extras 不污染内核 | 无 | M4（**已落地**） |
 | 较大数据量 | `list[dict]` ↔ DataFrame adapter（df.from_table/to_table/to_csv，pandas extras），重计算段交给 pandas | 无（编排层零改动） | M3（**已落地**） |
 | 插件包分发 | `[project.entry-points."op_pipeline.ops"]` 入口点自动发现（M3-4），pip 安装即用 | 无（`load_plugins` 加开关，CLI 默认开启） | M3（**已落地**） |
 | 定时调度 | 不自己做，交给 cron / 任务计划 / CI schedule | 无 | 不做 |
@@ -144,13 +144,18 @@
 > [runtime-semantics §6.3](../architecture/runtime-semantics.md#63-async-宿主嵌入m2-8)）；
 > 全 asyncio 调度器仍明确不在范围。
 
-### 阶段 3：生态与规模化（对应版本 0.4+，按需触发）
+### 阶段 3：生态与规模化（对应版本 0.4/0.5，按需触发）
 
-- **数据生态**：pandas/Arrow adapter 算子；默认交换格式保持 `list[dict]` 不变；
-- **远程执行**：`Executor` 接队列 + worker，句柄走对象存储（前提：阶段 2 抽象已稳定）；
+- **数据生态**：pandas/Arrow adapter 算子；默认交换格式保持 `list[dict]` 不变——
+  **已落地**（M3 pandas adapter；M4-2 Arrow/Parquet 算子 + extras `parquet`；
+  M4-3 Excel 算子 + extras `excel`；examples 数据生态往返示例）；
+- **远程执行**：`Executor` 接队列 + worker，句柄走对象存储（前提：阶段 2 抽象已稳定）——
+  **已落地（M4-4，示范定位）**：`QueueWorkerExecutor` + `op_pipeline worker` CLI 双进程
+  示范；引擎节点调度接入与句柄对象存储仍留待真实诉求触发；
 - **调度与 UI**：如确有需要，做成**独立外围服务**（读 `RunStore`、调 `run_pipeline`），
-  内核仍是库——这是与 Airflow 的差异化定位，不要在包里长出调度守护进程；
-- **插件生态**：独立插件包 + `entry_points` 发现 + 签名/白名单机制，缓解插件任意代码执行风险；
+  内核仍是库——这是与 Airflow 的差异化定位，不要在包里长出调度守护进程；——未落地，按需触发
+- **插件生态**：独立插件包 + `entry_points` 发现 + 签名/白名单机制，缓解插件任意代码执行风险
+  ——**已落地**（M3-4 entry_points 发现；M4-1 allowlist 白名单 + verify_manifest 清单校验）；
 - **配置演进**：`spec_version` 字段 + 迁移器，保证老配置长期可跑——**已落地（M3-5）**；
   配置组合 `includes`（跨文件拆分/复用，环检测 + 节点 id 查重）——**已落地（M3-7）**；
 - **观测性**：基于事件钩子的结构化日志 / Trace 导出——**已落地（M3-6）**：`observe.JsonlHook`

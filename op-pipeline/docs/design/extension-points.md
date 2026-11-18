@@ -11,11 +11,12 @@
 | --- | --- | --- | --- |
 | 新增算子 | `@op` 装饰器 + `Operator` 子类 | 只新增文件，不改框架 | 稳定 |
 | 算子插件 | 模块路径 / 文件路径加载；**入口点自动发现**（M3-4：插件包 pyproject 声明 `[project.entry-points."op_pipeline.ops"]`，`load_plugins(entry_points=True)` / CLI 默认开启） | 配置或调用方传参；插件包发布方在自己的 pyproject 声明入口点 | 稳定 |
+| 插件信任 | `load_plugins` 白名单（`allowlist` 限入口点名/模块名/文件路径，`strict` 拒绝）+ 文件插件哈希清单校验（`verify_manifest`，M4-1） | 只新增调用参数，不改框架 | 稳定（M4-1） |
 | 表达式函数 | `register_function(name, fn)`（纯函数、禁覆盖内置名） | 只新增调用，不改框架 | 稳定 |
 | 新配置格式 | `PipelineSpec.register_loader(suffix, fn)` 注册表（M3-8）：内建 json/toml/yaml 亦为注册项；`fn(path) -> dict`，后缀自动归一化（`"fake"`/`".fake"` 等价），未知后缀报错并列出已注册格式 | 只新增注册调用，不改框架 | 稳定（M3-8） |
 | 算子别名 | `Registry.register(aliases=...)` | 算子声明 | 稳定 |
 | 自定义缓存 | 传入 `CacheStore` 兼容对象 | `run_pipeline` / `Engine` | 弱契约（鸭子类型） |
-| 替换执行器 | 实现 `Executor` 协议（submit/wait/shutdown）；内置 `ThreadExecutor`（默认）与 `ProcessExecutor`（硬超时，M2-2） | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) | 稳定（M2-1） |
+| 替换执行器 | 实现 `Executor` 协议（submit/wait/shutdown）；内置 `ThreadExecutor`（默认）、`ProcessExecutor`（硬超时，M2-2）、`QueueWorkerExecutor`（共享队列 + worker 进程，M4-4） | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py)、[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py) | 稳定（M2-1） |
 | 替换句柄存储 | 实现 `HandleStore` 协议（get/put/snapshot/items）；内置 `InMemoryHandleStore`（默认）与 `SpillHandleStore`（超阈值落盘、按需加载，M2-4） | [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py) | 稳定（M2-3） |
 | 运行存储 | 实现 `RunStore`（`record_run`/`record_node`/`query`/`prev_node`）；内置 SQLite 实现（M2-5），默认关闭零副作用；M2-6 起引擎以 `run_store=...` + `resume_run_id=...` 实现断点续跑 | [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/store.py) | 稳定（M2-5） |
 | 执行事件钩子 | 实现 `Hook` 协议（`on_node_start`/`on_node_finish`/`on_run_finish`，可只实现其一）；`Engine(hooks=[...])` / `run_pipeline(hooks=[...])` / `run(hooks=[...])` 挂载；进度条/日志聚合/OTel/UI 从这里取数（M2-7） | `engine.py` `_run_node`（start/finish）与 `run()` 末尾（run_finish） | 稳定（M2-7） |
@@ -109,7 +110,7 @@ from op_pipeline import load_plugins
 load_plugins(entry_points=True)
 ```
 
-加载顺序（[registry.py#L188-L281](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L188-L281)）：
+加载顺序（[registry.py#L197-L360](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L197-L360)）：
 内置 `op_pipeline.ops` → 入口点 → `modules` → `paths`。文件加载的模块名是
 `_op_plugin_<路径 blake2b 摘要>`（同一文件重复加载幂等跳过；指定 `registry` 时为
 `_op_plugin_<stem>_<序号>`，跨注册表各执行一次）。入口点按包分发去重（同一已安装包
@@ -200,6 +201,44 @@ python -m op_pipeline run cfg.toml # 配置里即可用 my_company.* 算子
   `replace=True` 或隔离注册表（§3.3）显式处理；
 - 零第三方依赖约束只针对框架内核，插件包可以自由使用第三方库。
 
+### 3.5 插件信任：白名单与哈希清单校验（M4-1）
+
+插件本质是任意代码执行（[roadmap §2](../architecture/roadmap.md#2-能力边界评估的事实基础)），
+信任边界默认是"本机可信用户"。若需要更严格的信任控制（例如从不可信目录加载插件），
+M4-1 提供两级机制，全部在 `load_plugins` 上，纯标准库（hashlib）：
+
+```python
+from op_pipeline import load_plugins
+
+# 1) 白名单：只有清单内的来源会被加载，其余告警跳过
+load_plugins(
+    entry_points=True,                 # 按入口点组内名字匹配
+    modules=["my_company.ops"],        # 按模块名匹配
+    paths=["plugins/my_ops.py"],       # 按文件路径匹配（绝对路径，或相对 base_dir 解析）
+    allowlist=["my_company.ops", "my_ops.py"],
+    base_dir=".",
+)
+
+# 2) 严格模式：清单外来源直接报错拒绝（不再告警跳过）
+load_plugins(paths=["plugins/my_ops.py"], allowlist=["plugins/my_ops.py"],
+             strict=True, base_dir=".")
+
+# 3) 哈希清单校验：文件插件必须与清单哈希一致才加载（防静默篡改）
+load_plugins(paths=["plugins/my_ops.py"], verify_manifest=True, base_dir=".")
+```
+
+规则：
+
+- `allowlist=None`（默认）不过滤，行为与 M4-1 之前完全一致（向后兼容）；
+  `allowlist=[]` 表示"什么都不信任"；
+- 匹配对象分三类：入口点组内名字 / 模块名 / 文件路径（路径条目支持相对 `base_dir`）；
+  同一来源命中任一即放行；
+- `verify_manifest` 默认读取 `<base_dir>/OP_PLUGINS.sha256`（可经 `manifest=` 指定），
+  格式与 sha256sum 一致：每行 `<sha256hex>  <相对路径>`（相对清单所在目录）。
+  清单缺失、文件未列入、哈希不匹配均抛 `ConfigError` 拒绝加载；
+- 哈希校验仅作用于 `paths` 文件插件——模块/入口点受 Python import 幂等性限制，
+  无法做文件级校验；插件包级信任建议用入口点白名单。
+
 ---
 
 ## 4. 替换/扩展外部能力
@@ -248,6 +287,25 @@ class Executor(Protocol):
 `BrokenProcessPool`、殃及同时在跑的其它节点。跨进程载荷要求算子类、参数、
 输入全部可 pickle 且子进程能按模块名 import 其定义（插件文件里的算子
 需要注意子进程的可见性）。
+
+**远程执行示范（M4-4）**：`QueueWorkerExecutor`（[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py)，
+M4-4）把任务分发给独立 worker 进程——客户端 `submit` 把载荷
+`pickle → base64` 逐行追加进 JSONL 队列文件，worker 进程
+（`python -m op_pipeline worker --queue <path> [--out <dir>]`，新 CLI 入口）
+增量消费并执行，结果/异常以 `<job_id>.json` 写回共享结果目录（先写 `.tmp`
+再原子 `replace`），客户端 `wait` 轮询完成标记。载荷不可 pickle 时
+`submit` 直接抛 `RuntimeError`（队列模式无法像进程池那样回退线程，提前报错
+更诚实）。与 `ProcessExecutor` 的区别：`ProcessExecutor` 每任务一个本地
+`spawn` 子进程 + 硬超时，由引擎内部调度；`QueueWorkerExecutor` 面向
+"独立 worker 进程/跨机器（共享挂载盘）"，任务与结果通过文件系统交换，
+不要求 worker 与客户端同机。端到端示范见
+[examples/remote_exec_demo.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/examples/remote_exec_demo.py)。
+
+> 边界说明：引擎的 `executor` 参数目前仍为字符串选择器（`"thread"`/`"process"`）；
+> `QueueWorkerExecutor` 是 `Executor` 协议下的独立远程任务分发实现（示范定位），
+> 尚未接入引擎的节点调度主循环——真正把整条流水线的节点调度到远端 worker，
+> 需要同时解决载荷序列化（`_run_node` 为 bound method）与句柄的共享存储，
+> 留待 roadmap 中"调度/集群执行"出现真实诉求时落地。
 
 ### 4.3 报告
 
@@ -306,7 +364,7 @@ M2-3 起收敛点已落在 `HandleStore` 接口（[handlestore.py](file:///C:/Us
 
 ## 7. 新增能力时的回归清单
 
-1. 跑 `python -m unittest discover -s tests -v`（137 个用例，M3-4）；
+1. 跑 `python -m unittest discover -s tests -v`（168 个用例，M4-1）；
 2. 用 `examples/pipeline_orders.json` 做端到端（覆盖并行 fan-out、when、断言、4 种输出）；
 3. 用 `examples/pipeline_text.toml --plugin plugins/demo_ops.py`（`--plugin` 相对配置文件所在目录解析）验证插件与重试；
 4. `python -m op_pipeline validate` 与 `graph` 必须仍然可用；

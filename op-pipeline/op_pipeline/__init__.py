@@ -48,6 +48,7 @@ from .errors import (
     SpecValidationError,
 )
 from .executor import Executor, ProcessExecutor, ThreadExecutor
+from .remote import QueueWorkerExecutor  # M4-4：共享队列文件 + 结果目录的跨进程执行器
 from .handlestore import HandleStore, InMemoryHandleStore, SpillHandleStore
 from .expression import evaluate, evaluate_condition, register_function
 from .operator import Operator
@@ -83,6 +84,7 @@ __all__ = [
     "PlanNode",
     "Port",
     "ProcessExecutor",
+    "QueueWorkerExecutor",
     "RefResolver",
     "Registry",
     "RunContext",
