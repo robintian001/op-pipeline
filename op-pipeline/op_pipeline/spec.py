@@ -39,7 +39,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .errors import (
     ConfigError,
@@ -68,6 +68,182 @@ def _warn_unknown_keys(where: str, raw: Mapping[str, Any], known: frozenset[str]
         close = difflib.get_close_matches(key, known, n=1, cutoff=0.6)
         hint = f"；是否想写 '{close[0]}'？" if close else ""
         logger.warning("%s 含未知键 %r（将被忽略）%s", where, key, hint)
+
+
+# --------------------------------------------------------------------------- #
+# 配置格式版本化（M3-5）
+# --------------------------------------------------------------------------- #
+# 当前配置格式版本。老配置缺省按 "1"（首个发布格式）解析；
+# 不兼容变更必须新增迁移器（见 MIGRATIONS）并升此版本号。
+CURRENT_SPEC_VERSION = "1"
+
+# 迁移器注册表：目标版本 -> 迁移函数。迁移函数接收一份配置 dict，
+# 返回升级到该版本后的 dict（只做加法/改写，不做降级）。
+# 升序逐级升级：1 -> 2 -> ... -> CURRENT_SPEC_VERSION。
+MIGRATIONS: dict[str, Callable[[dict], dict]] = {}
+
+
+def _next_version(version: int) -> str:
+    """取下一个版本号的字符串表示（"1" -> "2"）。"""
+    return str(version + 1)
+
+
+def _migrate(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """版本检查 + 逐级迁移到当前格式。
+
+    - ``spec_version`` 缺省视为 ``"1"``（首个发布格式），无需迁移；
+    - 配置版本低于当前版本时按 ``MIGRATIONS`` 逐级升级；
+    - 配置版本高于当前版本（未来文件）直接报错，绝不静默猜测；
+    - 版本号非数字报错。
+    """
+    data = dict(raw)
+    version = data.get("spec_version", "1")
+    try:
+        version_int = int(str(version))
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"spec_version 必须是整数格式的字符串（如 \"1\"），实际是 {version!r}"
+        ) from None
+    if version_int > int(CURRENT_SPEC_VERSION):
+        raise ConfigError(
+            f"配置的 spec_version={version!r} 高于当前框架支持的版本 "
+            f"{CURRENT_SPEC_VERSION!r}：请升级 op_pipeline 后再读取该配置"
+        )
+    while version_int < int(CURRENT_SPEC_VERSION):
+        target = _next_version(version_int)
+        migrator = MIGRATIONS.get(target)
+        if migrator is None:
+            raise ConfigError(
+                f"缺少配置迁移器：{version} -> {target}（MIGRATIONS 未注册）"
+            )
+        data = migrator(data)
+        version_int += 1
+        version = target
+    data["spec_version"] = CURRENT_SPEC_VERSION
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# 配置组合（M3-7）：顶层 includes
+# --------------------------------------------------------------------------- #
+def _load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_toml(path: Path) -> dict[str, Any]:
+    import tomllib
+
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise ConfigError(
+            "读取 YAML 需要 PyYAML：pip install pyyaml；"
+            "或改用 .json / .toml 配置（标准库即可）"
+        ) from exc
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+# 配置格式 loader 注册表（M3-8）：扩展名（含前导点）-> 解析函数。
+# 内建 json/toml/yaml 也是注册项；第三方可用 PipelineSpec.register_loader 扩展新格式。
+_LOADERS: dict[str, Callable[[Path], dict[str, Any]]] = {
+    ".json": _load_json,
+    ".toml": _load_toml,
+    ".yaml": _load_yaml,
+    ".yml": _load_yaml,
+}
+
+
+def _load_raw(path: Path) -> dict[str, Any]:
+    """读取单个配置文件：按扩展名从 loader 注册表取解析器。"""
+    if not path.exists():
+        raise ConfigError(f"配置文件不存在：{path}")
+    suffix = path.suffix.lower()
+    loader = _LOADERS.get(suffix)
+    if loader is None and suffix == "":
+        loader = _LOADERS[".json"]  # 兼容历史行为：无后缀按 JSON 解析
+    if loader is None:
+        raise ConfigError(
+            f"不支持的配置扩展名：{suffix or '(无后缀)'}（已注册格式："
+            f"{', '.join(sorted(_LOADERS))}）"
+        )
+    data = loader(path)
+    if not isinstance(data, Mapping):
+        raise ConfigError(f"配置文件必须是对象（键值映射）：{path}")
+    return dict(data)
+
+
+def _resolve_includes(raw: Mapping[str, Any], base_dir: str | Path | None) -> dict[str, Any]:
+    """递归合并顶层 ``includes``，返回不含 ``includes`` 键的合并配置。
+
+    合并语义（主配置优先）：
+    - ``params`` / ``defaults`` / ``outputs``：dict 逐键覆盖（include 先合入，主配置覆盖）；
+    - ``nodes``：按 include 顺序拼接，节点 id 重复（跨文件或与主配置）即报错；
+    - ``name`` / ``description`` / ``version`` / ``spec_version``：主配置优先。
+
+    子配置的 ``includes`` 相对其自身所在目录解析；沿加载栈做环检测。
+    """
+    includes = raw.get("includes")
+    if not includes:
+        return dict(raw)
+    if isinstance(includes, str):
+        raise ConfigError("includes 必须是字符串路径数组，实际是单个字符串")
+    if not isinstance(includes, list) or not all(isinstance(p, str) for p in includes):
+        raise ConfigError(f"includes 必须是字符串路径数组，实际是 {includes!r}")
+    if base_dir is None:
+        raise ConfigError(
+            "顶层 includes 需要文件上下文：请通过 from_file 加载配置，或显式传入 base_dir"
+        )
+    base = Path(base_dir)
+    merged: dict[str, Any] = {"params": {}, "defaults": {}, "outputs": {}}
+    nodes: list[dict[str, Any]] = []
+    node_source: dict[str, str] = {}
+
+    def _take(data: dict[str, Any], source: str) -> None:
+        """把一份子配置合入 merged：dict 字段覆盖、nodes 拼接并查重。"""
+        for key in ("params", "defaults", "outputs"):
+            value = data.get(key) or {}
+            if not isinstance(value, Mapping):
+                raise ConfigError(f"文件 {source} 的 {key} 必须是映射")
+            merged[key].update(dict(value))
+        for node in data.get("nodes") or []:
+            if not isinstance(node, Mapping):
+                raise ConfigError(f"文件 {source} 的 nodes 元素必须是对象")
+            nid = node.get("id") or node.get("name")
+            if nid and nid in node_source:
+                raise ConfigError(
+                    f"includes 合并后节点 id '{nid}' 重复（来自 {node_source[nid]} 与 {source}）"
+                )
+            if nid:
+                node_source[nid] = source
+            nodes.append(dict(node))
+
+    def _load(rel: str, bdir: Path, stack: tuple[Path, ...]) -> None:
+        target = (bdir / rel).resolve()
+        if target in stack:
+            chain = " -> ".join(str(p) for p in stack + (target,))
+            raise ConfigError(f"includes 存在循环引用：{chain}")
+        if not target.exists():
+            raise ConfigError(f"includes 引用的文件不存在：{rel}（相对 {bdir}）")
+        data = _load_raw(target)
+        _take(data, str(target))
+        for sub in data.get("includes") or []:
+            if not isinstance(sub, str):
+                raise ConfigError(f"includes 必须是字符串路径数组，实际含 {sub!r}")
+            _load(sub, target.parent, stack + (target,))
+
+    for rel in includes:
+        _load(rel, base, ())
+    # 主配置节点也并入同一张表（查重），并覆盖 include 的 dict 字段
+    _take(dict(raw), "主配置")
+    for key in ("name", "description", "version", "spec_version"):
+        if key in raw:
+            merged[key] = raw[key]
+    merged["nodes"] = nodes
+    return merged
 
 
 # --------------------------------------------------------------------------- #
@@ -168,13 +344,18 @@ class PipelineSpec:
 
     # from_dict 接受的合法键（dataclass 字段之外无类型注解，不会被当作字段）
     _KNOWN_KEYS = frozenset(
-        {"name", "description", "version", "params", "nodes", "outputs", "defaults"}
+        {"name", "description", "version", "params", "nodes", "outputs", "defaults",
+         "spec_version", "includes"}
     )
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any]) -> "PipelineSpec":
+    def from_dict(
+        cls, raw: Mapping[str, Any], base_dir: str | Path | None = None
+    ) -> "PipelineSpec":
         if not isinstance(raw, Mapping):
             raise ConfigError("流水线配置根节点必须是对象")
+        raw = _resolve_includes(raw, base_dir=base_dir)  # M3-7：合并顶层 includes
+        raw = _migrate(raw)  # M3-5：版本检查 + 逐级迁移到当前格式
         _warn_unknown_keys("流水线配置", raw, cls._KNOWN_KEYS)
         nodes_raw = raw.get("nodes") or []
         if not isinstance(nodes_raw, list):
@@ -198,33 +379,35 @@ class PipelineSpec:
 
     # ------------------------------------------------------------------ #
     @classmethod
+    def register_loader(
+        cls, suffix: str, fn: Callable[[Path], dict[str, Any]]
+    ) -> None:
+        """注册自定义配置格式的加载器（M3-8）。
+
+        ``suffix`` 为扩展名（可省略前导点，``"fake"`` 与 ``".fake"`` 等价）；
+        ``fn`` 接收文件路径，返回配置映射（dict）。注册后 ``from_file`` 即按该
+        后缀分发。覆盖同后缀的内建/已有加载器以最后注册者为准。
+        """
+        if not isinstance(suffix, str) or not suffix.strip():
+            raise ConfigError(f"loader 后缀必须是字符串，实际是 {suffix!r}")
+        if not callable(fn):
+            raise ConfigError(
+                f"loader {suffix!r} 必须是可调用对象，实际是 {type(fn).__name__}"
+            )
+        norm = suffix.lower()
+        if not norm.startswith("."):
+            norm = "." + norm
+        _LOADERS[norm] = fn
+
+    @classmethod
     def from_file(cls, path: str | Path) -> "PipelineSpec":
         path = Path(path).expanduser()
-        if not path.exists():
-            raise ConfigError(f"配置文件不存在：{path}")
-        text = path.read_text(encoding="utf-8")
-        suffix = path.suffix.lower()
-        if suffix in (".json", ""):
-            data = json.loads(text)
-        elif suffix == ".toml":
-            import tomllib
-
-            data = tomllib.loads(text)
-        elif suffix in (".yaml", ".yml"):
-            try:
-                import yaml  # type: ignore
-            except ImportError as exc:  # pragma: no cover
-                raise ConfigError(
-                    "读取 YAML 需要 PyYAML：pip install pyyaml；"
-                    "或改用 .json / .toml 配置（标准库即可）"
-                ) from exc
-            data = yaml.safe_load(text)
-        else:
-            raise ConfigError(f"不支持的配置扩展名：{path.suffix}（支持 .json/.toml/.yaml）")
-        return cls.from_dict(data or {})
+        data = _load_raw(path)
+        return cls.from_dict(data, base_dir=path.parent)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "spec_version": CURRENT_SPEC_VERSION,
             "name": self.name,
             "description": self.description,
             "version": self.version,

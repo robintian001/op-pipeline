@@ -24,11 +24,18 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+dataframe = ["pandas>=1.5"]
 yaml = ["pyyaml"]
+otel = ["opentelemetry-api"]  # M3-6：observe.OtelHook 的可选 OTel bridge
 dev = ["pytest"]
 
 [project.scripts]
 op-pipeline = "op_pipeline.cli:main"
+
+# 插件包可在自己的 pyproject 里声明算子入口点组（M3-4），安装后由
+# load_plugins(entry_points=True) / CLI 自动发现，无需 --plugin 参数：
+#   [project.entry-points."op_pipeline.ops"]
+#   my_ops = "my_company.ops"
 
 [tool.setuptools.packages.find]
 include = ["op_pipeline*"]

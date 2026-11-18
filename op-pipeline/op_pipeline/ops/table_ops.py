@@ -23,6 +23,19 @@ def row_env(row: dict[str, Any], index: int | None = None) -> dict[str, Any]:
     return env
 
 
+def table_columns(rows: Iterable[dict[str, Any]]) -> list[str]:
+    """全表列集合并集（按首次出现顺序）。
+
+    取代"首行代表全表列"假设（T15）：列参差的行（某列只在非首行出现）不再丢字段或误报。
+    """
+    seen: dict[str, None] = {}
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen[key] = None
+    return list(seen)
+
+
 @op("table.filter_rows", aliases=["filter"])
 class FilterRows(Operator):
     """按表达式过滤行，如 ``amount > 0 and region != "north"``。"""
@@ -55,7 +68,7 @@ class SelectColumns(Operator):
         rows = list(table or [])
         if not rows:
             return {"table": []}
-        available = set(rows[0].keys())
+        available = set(table_columns(rows))
         unknown = [c for c in columns if c not in available]
         if unknown and missing == "error":
             raise KeyError(f"表中不存在列：{', '.join(map(str, unknown))}；可用：{', '.join(sorted(available))}")
@@ -110,7 +123,7 @@ class DeriveColumn(Operator):
 
     def run(self, ctx, table, name, expr, overwrite):
         rows = list(table or [])
-        if rows and name in rows[0] and not overwrite:
+        if rows and name in table_columns(rows) and not overwrite:
             raise ValueError(f"列 '{name}' 已存在；如需覆盖请设置 overwrite=true")
         result = []
         for i, row in enumerate(rows):
@@ -138,7 +151,8 @@ class SortRows(Operator):
         if not keys:
             return {"table": rows}
 
-        missing = [k for k in keys if rows and k not in rows[0]]
+        cols = table_columns(rows)
+        missing = [k for k in keys if cols and k not in cols]
         if missing:
             raise KeyError(f"排序键不存在：{', '.join(missing)}")
 
@@ -252,9 +266,10 @@ class Join(Operator):
                 out.append(merged)
 
         if how in ("right", "full"):
+            left_columns = table_columns(left_rows)
             for rrow in right_rows:
                 if id(rrow) not in matched_right:
-                    merged = {col: None for col in (left_rows[0].keys() if left_rows else [])}
+                    merged = {col: None for col in left_columns}
                     merged.update(rrow)
                     out.append(merged)
 

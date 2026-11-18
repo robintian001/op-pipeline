@@ -8,8 +8,10 @@ from __future__ import annotations
 import difflib
 import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 import itertools
+import logging
 import sys
 import threading
 from contextvars import ContextVar
@@ -17,6 +19,8 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from .errors import DuplicateOperatorError, OperatorNotFoundError, PipelineError
+
+log = logging.getLogger("op_pipeline.registry")
 
 
 class Registry:
@@ -176,6 +180,11 @@ def op(
 # --------------------------------------------------------------------------- #
 # 插件加载
 # --------------------------------------------------------------------------- #
+# 插件入口点组：插件包在自己的 pyproject 声明 `[project.entry-points."op_pipeline.ops"]`，
+# 框架安装后经 importlib.metadata 自动发现（M3-4）。
+_OPS_ENTRY_POINT_GROUP = "op_pipeline.ops"
+
+
 def load_plugins(
     modules: Sequence[str] = (),
     paths: Sequence[str | Path] = (),
@@ -183,6 +192,7 @@ def load_plugins(
     base_dir: str | Path | None = None,
     package: str | None = "op_pipeline.ops",
     registry: Registry | None = None,
+    entry_points: bool = False,
 ) -> list[str]:
     """加载算子插件。
 
@@ -194,6 +204,11 @@ def load_plugins(
         指定后：加载期间插件源码里的裸 ``@op`` 落到该表、内置算子自动补齐、
         同一插件文件可在不同注册表各执行一次（模块级状态互不影响）。
         注意 ``modules`` 受 Python import 幂等性限制：已导入过的模块不会重新执行。
+    :param entry_points: 是否扫描已安装包的 ``[project.entry-points."op_pipeline.ops"]``
+        入口点组（M3-4）。组内每项的值应指向**模块**（模块级 ``@op`` 即注册），
+        如 ``my_ops = "my_company.ops"``。入口点默认关闭（向后兼容），CLI 默认开启：
+        安装的插件包无需 ``--plugin`` 即可被发现。单个入口点模块导入失败或算子
+        名与已注册算子撞重时只告警跳过，不拖垮其余入口点（自动发现场景以稳为先）。
     :return: 本次实际加载的模块名列表
     """
     loaded: list[str] = []
@@ -207,6 +222,16 @@ def load_plugins(
                 pass
             if registry is not None:
                 _copy_builtin_ops(registry)
+
+        if entry_points:
+            for ep in importlib.metadata.entry_points(group=_OPS_ENTRY_POINT_GROUP):
+                try:
+                    importlib.import_module(ep.module)
+                    loaded.append(f"entry:{ep.name}")
+                except ImportError as exc:
+                    log.warning("跳过不可用的插件入口点 %s (%s)：%s", ep.name, ep.value, exc)
+                except DuplicateOperatorError as exc:
+                    log.warning("跳过插件入口点 %s：算子名已被占用（%s）", ep.name, exc)
 
         for mod in modules:
             importlib.import_module(mod)

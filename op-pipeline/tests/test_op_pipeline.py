@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,8 @@ import threading
 import time
 import tomllib
 import unittest
+import unittest.mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,12 +37,20 @@ from op_pipeline import (  # noqa: E402
 from op_pipeline import expression  # noqa: E402
 from op_pipeline.expression import ExpressionError  # noqa: E402
 from op_pipeline.spec import build_plan, PlanNode  # noqa: E402
+from op_pipeline import spec as spec_module  # noqa: E402
+from op_pipeline.observe import JsonlHook, OtelHook  # noqa: E402
 from op_pipeline.errors import ConfigError  # noqa: E402
 from op_pipeline.cache import CacheStore  # noqa: E402
 from op_pipeline.context import RunContext  # noqa: E402
 from op_pipeline.engine import Engine  # noqa: E402
 from op_pipeline.registry import Registry  # noqa: E402
 from op_pipeline import run  # noqa: E402
+
+try:
+    import pandas  # noqa: F401
+    _HAS_PANDAS = True
+except ImportError:
+    _HAS_PANDAS = False
 
 
 # --------------------------------------------------------------------------- #
@@ -645,6 +656,232 @@ class UnknownKeyWarningTest(unittest.TestCase):
         self.assertIn("'param'", proc.stderr)
 
 
+class SpecVersionMigrationTest(unittest.TestCase):
+    """M3-5：配置格式版本化——顶层 `spec_version` + `MIGRATIONS` 迁移器框架。"""
+
+    @staticmethod
+    def _migrator(raw):
+        data = dict(raw)
+        params = dict(data.get("params") or {})
+        if "old_key" in params:
+            params["new_key"] = params.pop("old_key")
+        data["params"] = params
+        return data
+
+    def test_spec_version_missing_defaults_to_current(self):
+        # 无 spec_version 的老配置按当前格式（"1"）解析，无需迁移
+        p = PipelineSpec.from_dict(
+            {"nodes": [{"id": "a", "op": "control.const", "params": {"value": 1}}]}
+        )
+        self.assertEqual(len(p.nodes), 1)
+        self.assertEqual(p.version, "1")
+
+    def test_future_spec_version_raises_clear_error(self):
+        with self.assertRaises(ConfigError) as ctx:
+            PipelineSpec.from_dict({"spec_version": "99", "nodes": []})
+        self.assertIn("99", str(ctx.exception))
+        self.assertIn("1", str(ctx.exception))
+
+    def test_old_config_migrated_step_by_step(self):
+        raw = {
+            "spec_version": "1",
+            "params": {"old_key": 42},
+            "nodes": [{"id": "a", "op": "control.const", "params": {"value": 1}}],
+        }
+        with unittest.mock.patch.object(spec_module, "CURRENT_SPEC_VERSION", "2"), \
+                unittest.mock.patch.dict(spec_module.MIGRATIONS, {"2": self._migrator}):
+            p = PipelineSpec.from_dict(raw)
+        self.assertEqual(p.params["new_key"], 42)
+        self.assertNotIn("old_key", p.params)
+
+    def test_missing_migrator_raises_clear_error(self):
+        raw = {"spec_version": "1", "nodes": []}
+        with unittest.mock.patch.object(spec_module, "CURRENT_SPEC_VERSION", "3"), \
+                unittest.mock.patch.dict(spec_module.MIGRATIONS, {"2": self._migrator}):
+            with self.assertRaises(ConfigError) as ctx:
+                PipelineSpec.from_dict(raw)
+        self.assertIn("2 -> 3", str(ctx.exception))
+
+    def test_non_numeric_spec_version_raises(self):
+        with self.assertRaises(ConfigError):
+            PipelineSpec.from_dict({"spec_version": "abc", "nodes": []})
+
+    def test_spec_version_is_known_key(self):
+        # spec_version 不应触发未知键告警；只有真正的未知键被点名
+        with self.assertLogs("op_pipeline.spec", level="WARNING") as cm:
+            PipelineSpec.from_dict({"spec_version": "1", "bogus_key": 1, "nodes": []})
+        self.assertTrue(any("bogus_key" in m for m in cm.output))
+        self.assertFalse(any("spec_version" in m for m in cm.output))
+
+
+class IncludesConfigTest(unittest.TestCase):
+    """M3-7：顶层 `includes` 配置组合——合并 params/nodes/outputs，节点 id 重复报错，环检测。"""
+
+    @staticmethod
+    def _write(tmp: Path, rel: str, text: str) -> Path:
+        target = tmp / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def test_includes_merge_equals_handwritten_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "load.json", json.dumps({
+                "nodes": [{"id": "load", "op": "control.const", "params": {"value": 21}}],
+            }))
+            self._write(
+                tmp,
+                "agg.toml",
+                '[[nodes]]\nid = "agg"\nop = "testkit.double"\n'
+                '[nodes.inputs]\nvalue = "${load.value}"\n[nodes.params]\ntimes = 2\n',
+            )
+            spec = PipelineSpec.from_dict(
+                {"includes": ["load.json", "agg.toml"],
+                 "params": {"threshold": 0.5},
+                 "outputs": {"total": "${agg.value}"}},
+                base_dir=tmp,
+            )
+            # 手写大配置（同样的内容平铺在一个文件里）
+            handwritten = PipelineSpec.from_dict({
+                "params": {"threshold": 0.5},
+                "outputs": {"total": "${agg.value}"},
+                "nodes": [
+                    {"id": "load", "op": "control.const", "params": {"value": 21}},
+                    {"id": "agg", "op": "testkit.double",
+                     "inputs": {"value": "${load.value}"}, "params": {"times": 2}},
+                ],
+            })
+            self.assertEqual(len(spec.nodes), len(handwritten.nodes))
+            self.assertEqual(spec.params, handwritten.params)
+            self.assertEqual(spec.outputs, handwritten.outputs)
+            plan = build_plan(spec, default_registry)
+            plan_hw = build_plan(handwritten, default_registry)
+            # 依赖图相同：拓扑序中 load 必须先于 agg
+            self.assertEqual(plan.order, plan_hw.order)
+            self.assertEqual(plan.order, ["load", "agg"])
+
+    def test_include_params_overridden_by_main(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "part.json", json.dumps(
+                {"params": {"p1": "fromA", "p2": "fromA"}},
+            ))
+            spec = PipelineSpec.from_dict(
+                {"includes": ["part.json"], "params": {"p1": "fromMain"}},
+                base_dir=tmp,
+            )
+            # 主配置优先；include 独有的参数保留
+            self.assertEqual(spec.params, {"p1": "fromMain", "p2": "fromA"})
+
+    def test_duplicate_node_id_across_includes_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "a.json", json.dumps(
+                {"nodes": [{"id": "x", "op": "control.const", "params": {"value": 1}}]},
+            ))
+            self._write(tmp, "b.json", json.dumps(
+                {"nodes": [{"id": "x", "op": "control.const", "params": {"value": 2}}]},
+            ))
+            with self.assertRaises(ConfigError) as ctx:
+                PipelineSpec.from_dict({"includes": ["a.json", "b.json"]}, base_dir=tmp)
+            self.assertIn("重复", str(ctx.exception))
+
+    def test_missing_include_file_raises_clear_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with self.assertRaises(ConfigError) as ctx:
+                PipelineSpec.from_dict({"includes": ["nope.json"]}, base_dir=tmp)
+            self.assertIn("不存在", str(ctx.exception))
+            self.assertIn("nope.json", str(ctx.exception))
+
+    def test_cyclic_includes_raise_clear_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "a.json", json.dumps({"includes": ["b.json"]}))
+            self._write(tmp, "b.json", json.dumps({"includes": ["a.json"]}))
+            with self.assertRaises(ConfigError) as ctx:
+                PipelineSpec.from_dict({"includes": ["a.json"]}, base_dir=tmp)
+            self.assertIn("循环", str(ctx.exception))
+
+    def test_from_file_resolves_includes_relative_to_config_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "part.json", json.dumps(
+                {"nodes": [{"id": "load", "op": "control.const", "params": {"value": 7}}]},
+            ))
+            main = tmp / "main.json"
+            main.write_text(json.dumps({"includes": ["part.json"]}), encoding="utf-8")
+            spec = PipelineSpec.from_file(main)
+            self.assertEqual([n.id for n in spec.nodes], ["load"])
+
+    def test_includes_without_base_dir_raises(self):
+        with self.assertRaises(ConfigError) as ctx:
+            PipelineSpec.from_dict({"includes": ["part.json"]})
+        self.assertIn("base_dir", str(ctx.exception))
+
+
+class RegisterLoaderTest(unittest.TestCase):
+    """M3-8：自定义配置格式注册表——register_loader 分发、未知后缀报错、后缀归一化。"""
+
+    @staticmethod
+    def _write(tmp: Path, rel: str, text: str) -> Path:
+        target = tmp / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def test_custom_loader_dispatches(self):
+        def fake_loader(path: Path) -> dict:
+            self.assertEqual(path.name, "pipe.fake")
+            return {
+                "name": "fake_pipe",
+                "nodes": [{"id": "a", "op": "control.const", "params": {"value": 1}}],
+            }
+
+        PipelineSpec.register_loader(".fake", fake_loader)
+        self.addCleanup(lambda: spec_module._LOADERS.pop(".fake", None))
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "pipe.fake", "不是 JSON/TOML/YAML 的原生内容")
+            spec = PipelineSpec.from_file(tmp / "pipe.fake")
+            self.assertEqual(spec.name, "fake_pipe")
+            self.assertEqual([n.id for n in spec.nodes], ["a"])
+
+    def test_suffix_normalized_without_dot(self):
+        PipelineSpec.register_loader("fake2", lambda path: {"name": "x"})
+        self.addCleanup(lambda: spec_module._LOADERS.pop(".fake2", None))
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "a.fake2", "x")
+            spec = PipelineSpec.from_file(tmp / "a.fake2")
+            self.assertEqual(spec.name, "x")
+
+    def test_unknown_suffix_lists_registered_formats(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "a.xyz", "{}")
+            with self.assertRaises(ConfigError) as ctx:
+                PipelineSpec.from_file(tmp / "a.xyz")
+            msg = str(ctx.exception)
+            self.assertIn("不支持的配置扩展名", msg)
+            self.assertIn(".xyz", msg)
+            self.assertIn(".json", msg)  # 列出已注册格式（含内建）
+
+    def test_register_non_callable_rejected(self):
+        with self.assertRaises((TypeError, ConfigError)):
+            PipelineSpec.register_loader(".bad", "not a function")
+
+    def test_loader_returning_non_mapping_rejected(self):
+        PipelineSpec.register_loader(".list", lambda path: [1, 2])
+        self.addCleanup(lambda: spec_module._LOADERS.pop(".list", None))
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._write(tmp, "a.list", "x")
+            with self.assertRaises(ConfigError):
+                PipelineSpec.from_file(tmp / "a.list")
+
+
 class WhenParamsConsistencyTest(unittest.TestCase):
     """M1.5-5：when 环境的 `params` 用解析后的值（与扁平参数名一致），原值保留在 `raw_params`。"""
 
@@ -1072,6 +1309,117 @@ class RunModulePluginsTest(unittest.TestCase):
             registry=Registry(),
         )
         self.assertEqual("success", report.status)
+
+
+class EntryPointPluginTest(unittest.TestCase):
+    """M3-4：插件入口点发现——`[project.entry-points."op_pipeline.ops"]` 自动注册。
+
+    玩具插件包 = 临时目录里放算子模块 + 同名 .dist-info/entry_points.txt，
+    并把该目录加入 sys.path（等价于 pip 安装到 site-packages 的效果）。
+    """
+
+    @staticmethod
+    def _install_toy(tmp: Path, module: str, op_name: str) -> None:
+        (tmp / f"{module}.py").write_text(
+            "from op_pipeline import Operator, op\n"
+            "\n"
+            f"@op(\"{op_name}\")\n"
+            "class Toy(Operator):\n"
+            "    description = \"M3-4 入口点玩具算子\"\n"
+            "    outputs = [(\"value\", int)]\n"
+            "\n"
+            "    def run(self, ctx):\n"
+            "        return 7\n",
+            encoding="utf-8",
+        )
+        dist_dir = tmp / f"{module}-0.1.dist-info"
+        dist_dir.mkdir()
+        (dist_dir / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {module}\nVersion: 0.1\n",
+            encoding="utf-8",
+        )
+        (dist_dir / "entry_points.txt").write_text(
+            f"[op_pipeline.ops]\n{module} = {module}\n", encoding="utf-8")
+
+    def test_entry_points_discovery_registers_ops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._install_toy(Path(tmp), "m34_toy_a", "m34.toy_a")
+            sys.path.insert(0, tmp)
+            try:
+                reg = Registry()
+                loaded = load_plugins(entry_points=True, registry=reg)
+            finally:
+                sys.path.remove(tmp)
+        self.assertIn("m34.toy_a", reg, "入口点模块的算子应注册进目标注册表")
+        self.assertIn("control.const", reg, "内置算子应照常补齐")
+        self.assertNotIn("m34.toy_a", default_registry, "不应污染全局注册表")
+        self.assertTrue(any("m34_toy_a" in item for item in loaded),
+                        "返回的已加载列表应包含入口点模块")
+
+    def test_entry_points_discovery_off_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._install_toy(Path(tmp), "m34_toy_b", "m34.toy_b")
+            sys.path.insert(0, tmp)
+            try:
+                load_plugins()  # 默认 entry_points=False：不扫描入口点
+            finally:
+                sys.path.remove(tmp)
+        self.assertNotIn("m34.toy_b", default_registry,
+                         "未显式开启 entry_points 时不应自动注册入口点算子")
+
+    def test_broken_entry_point_warns_and_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._install_toy(Path(tmp), "m34_toy_c", "m34.toy_c")
+            (Path(tmp) / "m34_toy_bad.py").write_text(
+                "import op_pipeline\nraise ImportError('broken module')\n",
+                encoding="utf-8",
+            )
+            (Path(tmp) / "m34_toy_bad-0.1.dist-info").mkdir()
+            (Path(tmp) / "m34_toy_bad-0.1.dist-info" / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: m34_toy_bad\nVersion: 0.1\n",
+                encoding="utf-8",
+            )
+            (Path(tmp) / "m34_toy_bad-0.1.dist-info" / "entry_points.txt").write_text(
+                "[op_pipeline.ops]\nm34_toy_bad = m34_toy_bad\n", encoding="utf-8")
+            sys.path.insert(0, tmp)
+            try:
+                reg = Registry()
+                with self.assertLogs("op_pipeline.registry", level="WARNING") as cm:
+                    load_plugins(entry_points=True, registry=reg)
+            finally:
+                sys.path.remove(tmp)
+        self.assertIn("m34.toy_c", reg, "坏入口点不应拖垮其它正常入口点")
+        self.assertNotIn("m34.toy_bad", reg)
+        self.assertTrue(any("m34_toy_bad" in m for m in cm.output), "坏入口点应发告警")
+
+    def test_entry_points_load_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._install_toy(Path(tmp), "m34_toy_d", "m34.toy_d")
+            sys.path.insert(0, tmp)
+            try:
+                reg = Registry()
+                load_plugins(entry_points=True, registry=reg)
+                load_plugins(entry_points=True, registry=reg)  # import 幂等，不得撞重名
+            finally:
+                sys.path.remove(tmp)
+        self.assertIn("m34.toy_d", reg)
+
+    def test_cli_ops_lists_entry_point_ops(self):
+        """验收：安装一个玩具插件包后 `op_pipeline ops` 列出其算子。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._install_toy(Path(tmp), "m34_cli", "m34.cli_toy")
+            env = {
+                **os.environ,
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONPATH": f"{tmp}{os.pathsep}{ROOT}",
+            }
+            out = subprocess.run(
+                [sys.executable, "-m", "op_pipeline", "ops"],
+                capture_output=True, text=True, encoding="utf-8",
+                env=env, cwd=str(ROOT), timeout=120,
+            )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("m34.cli_toy", out.stdout, "CLI 应列出入口点插件算子")
 
 
 class DryRunNoSideEffectsTest(unittest.TestCase):
@@ -2211,6 +2559,413 @@ class AsyncHostTest(unittest.TestCase):
         report, ticks = asyncio.run(main())
         self.assertEqual(report.status, "success")
         self.assertGreaterEqual(ticks, 3, "流水线运行期间事件循环应持续推进")
+
+
+class ObserveJsonlTest(unittest.TestCase):
+    """M3-6：observe.JsonlHook —— 执行事件导出 JSONL，与运行报告一致。"""
+
+    def _linear_spec(self):
+        return spec_of(
+            [
+                {"id": "src", "op": "control.const", "params": {"value": 1}},
+                {"id": "h1", "op": "testkit.double", "params": {"times": 2},
+                 "inputs": {"value": "${src.value}"}},
+                {"id": "h2", "op": "testkit.double", "params": {"times": 3},
+                 "inputs": {"value": "${h1.value}"}},
+            ],
+            outputs={"v": "${h2.value}"},
+        )
+
+    def _read_lines(self, path):
+        return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    def test_jsonl_matches_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            hook = JsonlHook(path)
+            report, values = run_pipeline(
+                self._linear_spec(), registry=default_registry, hooks=[hook]
+            )
+            hook.close()
+            lines = self._read_lines(path)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["h2.value"], 6)
+        # 每个节点恰好一条 node_finish，与报告节点一一对应
+        finish = [e for e in lines if e["event"] == "node_finish"]
+        self.assertEqual(len(finish), len(report.nodes))
+        self.assertEqual({e["node_id"] for e in finish}, {n.node_id for n in report.nodes})
+        for e in finish:
+            node = report.node(e["node_id"])
+            self.assertEqual(e["status"], node.status)
+            self.assertEqual(e["cached"], node.cached)
+        # 每个节点 start 先于其 finish
+        for e in finish:
+            starts = [x for x in lines if x["event"] == "node_start" and x["node_id"] == e["node_id"]]
+            self.assertEqual(len(starts), 1, f"{e['node_id']} 应恰好一次 start")
+            self.assertLess(lines.index(starts[0]), lines.index(e))
+        # run_finish 与报告关键字段一致（"JSONL 与报告一致"验收点）
+        rfin = [e for e in lines if e["event"] == "run_finish"][0]
+        self.assertEqual(rfin["pipeline"], report.pipeline)
+        self.assertEqual(rfin["run_id"], report.run_id)
+        self.assertEqual(rfin["status"], report.status)
+        self.assertEqual(rfin["ok"], report.ok)
+        self.assertAlmostEqual(rfin["duration"], report.duration, places=2)
+        # run_finish 总是最后一行
+        self.assertEqual(lines[-1], rfin)
+
+    def test_jsonl_failure_status(self):
+        spec = spec_of(
+            [
+                {"id": "src", "op": "control.const", "params": {"value": 1}},
+                {"id": "boom", "op": "testkit.boom", "inputs": {"value": "${src.value}"}},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            hook = JsonlHook(path)
+            report, _ = run_pipeline(spec, registry=default_registry, hooks=[hook])
+            hook.close()
+            lines = self._read_lines(path)
+        self.assertEqual(report.status, "failed")
+        boom = [e for e in lines if e["event"] == "node_finish" and e["node_id"] == "boom"][0]
+        self.assertEqual(boom["status"], "failed")
+        rfin = [e for e in lines if e["event"] == "run_finish"][0]
+        self.assertEqual(rfin["status"], "failed")
+        self.assertFalse(rfin["ok"])
+
+    def test_jsonl_thread_safety_with_parallel(self):
+        # 并行节点并发写同一文件：不丢行、不炸（内部有锁）
+        nodes = [
+            {"id": f"a{i}", "op": "testkit.sleep", "inputs": {"value": "${src.value}"},
+             "params": {"seconds": 0.1}}
+            for i in range(6)
+        ]
+        nodes.append({"id": "src", "op": "control.const", "params": {"value": 1}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            hook = JsonlHook(path)
+            report, _ = run_pipeline(spec_of(nodes), registry=default_registry,
+                                     hooks=[hook], max_workers=6)
+            hook.close()
+            lines = self._read_lines(path)
+        self.assertEqual(report.status, "success")
+        # 所有节点（6 个并行 + 1 个 src）各恰好一条 finish，并发下无丢行
+        finish = [e for e in lines if e["event"] == "node_finish"]
+        self.assertEqual(len(finish), len(report.nodes))
+        self.assertEqual(len([e for e in finish if e["node_id"].startswith("a")]), 6)
+
+    def test_otel_hook_missing_dependency_skips(self):
+        # otel extras 未安装：延迟导入失败只告警，不炸流水线
+        with unittest.mock.patch.dict(
+            sys.modules, {"opentelemetry": None, "opentelemetry.trace": None}
+        ):
+            with self.assertLogs("op_pipeline.observe", level="WARNING") as cm:
+                hook = OtelHook()
+                report, _ = run_pipeline(
+                    self._linear_spec(), registry=default_registry, hooks=[hook]
+                )
+        self.assertEqual(report.status, "success")
+        self.assertTrue(any("opentelemetry" in m for m in cm.output))
+
+    def test_otel_hook_records_span_when_installed(self):
+        # 已装（以 mock 模拟）：on_run_finish 创建 span 并记录报告字段
+        span = unittest.mock.MagicMock()
+        tracer = unittest.mock.MagicMock()
+        tracer.start_span.return_value = span
+        trace_mod = unittest.mock.MagicMock()
+        trace_mod.get_tracer.return_value = tracer
+        otel_pkg = unittest.mock.MagicMock()
+        otel_pkg.trace = trace_mod
+        with unittest.mock.patch.dict(sys.modules, {"opentelemetry": otel_pkg}):
+            hook = OtelHook()
+            report, _ = run_pipeline(
+                self._linear_spec(), registry=default_registry, hooks=[hook]
+            )
+        self.assertEqual(report.status, "success")
+        tracer.start_span.assert_called_once()
+        span.set_attribute.assert_called()
+        span.end.assert_called_once()
+
+
+class HttpOpTest(unittest.TestCase):
+    """M3-1：http.request 算子——urllib 实现，json/text 双视图，deterministic=False。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._server = ThreadingHTTPServer(("127.0.0.1", 0), _HttpTestHandler)
+        cls._thread = threading.Thread(target=cls._server.serve_forever, daemon=True)
+        cls._thread.start()
+        cls.base = f"http://127.0.0.1:{cls._server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._server.shutdown()
+        cls._server.server_close()
+
+    def _run(self, params):
+        spec = spec_of([{"id": "req", "op": "http.request", "params": params}])
+        return run_pipeline(spec, registry=default_registry, cache_dir=None)
+
+    def test_get_json_view(self):
+        report, values = self._run({"url": self.base + "/json", "method": "GET"})
+        self.assertEqual(report.status, "success")
+        self.assertTrue(values["req.ok"])
+        self.assertEqual(values["req.status"], 200)
+        self.assertEqual(values["req.json"], {"hello": "world", "n": 42})
+        self.assertIsInstance(values["req.headers"], dict)
+        self.assertEqual(values["req.url"], self.base + "/json")
+
+    def test_get_text_view_json_is_none(self):
+        report, values = self._run({"url": self.base + "/text"})
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["req.text"], "plain text response")
+        self.assertIsNone(values["req.json"])
+
+    def test_post_json_body_echo(self):
+        report, values = self._run(
+            {"url": self.base + "/echo", "method": "POST", "json_body": {"a": 1}}
+        )
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["req.json"], {"echo": {"a": 1}})
+
+    def test_404_reports_ok_false(self):
+        report, values = self._run({"url": self.base + "/missing"})
+        self.assertEqual(report.status, "success")
+        self.assertFalse(values["req.ok"])
+        self.assertEqual(values["req.status"], 404)
+        self.assertIn("not found", values["req.text"])
+        self.assertIsNone(values["req.json"])
+
+    def test_unsupported_method_fails_node_without_retry(self):
+        report, values = self._run(
+            {"url": self.base + "/json", "method": "PUT"}
+        )
+        self.assertEqual(report.node("req").status, "failed")
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(report.node("req").attempts, 1, "ConfigError 不应重试")
+        self.assertIn("ConfigError", report.node("req").traceback or "")
+
+    def test_contract_deterministic_is_false(self):
+        cls = default_registry.get("http.request")
+        self.assertFalse(cls.deterministic, "外部状态算子不得缓存")
+
+
+class _HttpTestHandler(BaseHTTPRequestHandler):
+    """本地假服务：/json、/text、404、POST /echo（回显请求体）。"""
+
+    def do_GET(self):
+        if self.path == "/json":
+            self._send(200, "application/json", b'{"hello": "world", "n": 42}')
+        elif self.path == "/text":
+            self._send(200, "text/plain", b"plain text response")
+        else:
+            self._send(404, "text/plain", b"not found")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length)
+        self._send(200, "application/json", b'{"echo": ' + body + b"}")
+
+    def _send(self, status, content_type, body):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # 安静测试输出
+        pass
+
+
+class SqliteDbOpTest(unittest.TestCase):
+    """db.sqlite_exec / db.sqlite_query：临时文件库闭环（跨节点共享连接状态）。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, nodes):
+        return run_pipeline(
+            spec_of(nodes), registry=default_registry, workdir=self._tmp.name, cache_dir=None
+        )
+
+    def test_closed_loop_create_insert_query(self):
+        nodes = [
+            {"id": "setup", "op": "db.sqlite_exec",
+             "params": {"db": "t.db", "query": "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, name TEXT)"}},
+            {"id": "insert", "op": "db.sqlite_exec",
+             "inputs": {"gate": "${setup.rowcount}"},
+             "params": {"db": "t.db", "query": "INSERT INTO t(name) VALUES(?)", "params": ["alice"]}},
+            {"id": "query", "op": "db.sqlite_query",
+             "inputs": {"gate": "${insert.lastrowid}"},
+             "params": {"db": "t.db", "query": "SELECT * FROM t ORDER BY id"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["setup.rowcount"], -1, "DDL 语句 sqlite3 约定 rowcount=-1")
+        self.assertEqual(values["insert.rowcount"], 1)
+        self.assertEqual(values["insert.lastrowid"], 1)
+        self.assertEqual(values["query.rows"], [{"id": 1, "name": "alice"}])
+        self.assertEqual(values["query.columns"], ["id", "name"])
+        self.assertEqual(values["query.count"], 1)
+
+    def test_update_then_query(self):
+        nodes = [
+            {"id": "setup", "op": "db.sqlite_exec",
+             "params": {"db": "t.db", "query": "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, name TEXT)"}},
+            {"id": "insert", "op": "db.sqlite_exec",
+             "inputs": {"gate": "${setup.rowcount}"},
+             "params": {"db": "t.db", "query": "INSERT INTO t(name) VALUES(?)", "params": ["alice"]}},
+            {"id": "update", "op": "db.sqlite_exec",
+             "inputs": {"gate": "${insert.lastrowid}"},
+             "params": {"db": "t.db", "query": "UPDATE t SET name=? WHERE id=?", "params": ["bob", 1]}},
+            {"id": "query", "op": "db.sqlite_query",
+             "inputs": {"gate": "${update.rowcount}"},
+             "params": {"db": "t.db", "query": "SELECT name FROM t WHERE id=1"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["update.rowcount"], 1)
+        self.assertEqual(values["query.rows"], [{"name": "bob"}])
+
+    def test_parameterized_query_filter(self):
+        nodes = [
+            {"id": "setup", "op": "db.sqlite_exec",
+             "params": {"db": "t.db", "query": "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, name TEXT)"}},
+            {"id": "i1", "op": "db.sqlite_exec",
+             "inputs": {"gate": "${setup.rowcount}"},
+             "params": {"db": "t.db", "query": "INSERT INTO t(name) VALUES(?)", "params": ["alice"]}},
+            {"id": "i2", "op": "db.sqlite_exec",
+             "inputs": {"gate": "${i1.lastrowid}"},
+             "params": {"db": "t.db", "query": "INSERT INTO t(name) VALUES(?)", "params": ["bob"]}},
+            {"id": "query", "op": "db.sqlite_query",
+             "inputs": {"gate": "${i2.lastrowid}"},
+             "params": {"db": "t.db", "query": "SELECT * FROM t WHERE name=?", "params": ["bob"]}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["query.rows"], [{"id": 2, "name": "bob"}])
+
+    def test_missing_table_fails(self):
+        nodes = [
+            {"id": "query", "op": "db.sqlite_query",
+             "params": {"db": "t.db", "query": "SELECT * FROM missing_table"}},
+        ]
+        report, _ = self._run(nodes)
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(report.node("query").status, "failed")
+
+    def test_memory_db_standalone(self):
+        nodes = [
+            {"id": "query", "op": "db.sqlite_query",
+             "params": {"db": ":memory:", "query": "SELECT 1 AS one"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["query.rows"], [{"one": 1}])
+
+    def test_deterministic_is_false(self):
+        for name in ("db.sqlite_exec", "db.sqlite_query"):
+            cls = default_registry.get(name)
+            self.assertFalse(cls.deterministic, f"{name} 涉及外部状态，不得缓存")
+
+
+class TableColumnsUnionTest(unittest.TestCase):
+    """T15 治理：表算子按全表列集合并集判定，而非首行。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, nodes):
+        return run_pipeline(
+            spec_of(nodes), registry=default_registry, workdir=self._tmp.name, cache_dir=None
+        )
+
+    def test_select_columns_ragged_rows(self):
+        # 列只在非首行出现：旧实现按首行 keys 判定会报"列不存在"，新实现按全表并集
+        table = [{"a": 1}, {"a": 2, "b": 9}]
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": table}},
+            {"id": "sel", "op": "table.select_columns", "inputs": {"table": "${src.value}"},
+             "params": {"columns": ["a", "b"], "missing": "error"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["sel.table"], [{"a": 1, "b": None}, {"a": 2, "b": 9}])
+
+    def test_sort_rows_ragged(self):
+        # 排序键只在非首行出现：旧实现报"排序键不存在"，新实现按全表并集
+        table = [{"a": 2}, {"a": 1, "b": 0}]
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": table}},
+            {"id": "sort", "op": "table.sort_rows", "inputs": {"table": "${src.value}"},
+             "params": {"by": "b"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["sort.table"], [{"a": 1, "b": 0}, {"a": 2}])
+
+
+@unittest.skipUnless(_HAS_PANDAS, "需要 pandas（pip install op-pipeline[dataframe]）")
+class DataFrameOpTest(unittest.TestCase):
+    """df.from_table / df.to_table / df.to_csv：list[dict] ↔ DataFrame 往返。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, nodes):
+        return run_pipeline(
+            spec_of(nodes), registry=default_registry, workdir=self._tmp.name, cache_dir=None
+        )
+
+    def test_round_trip(self):
+        table = [{"region": "north", "amount": 10}, {"region": "south", "amount": 20}]
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": table}},
+            {"id": "ft", "op": "df.from_table", "inputs": {"table": "${src.value}"}},
+            {"id": "tt", "op": "df.to_table", "inputs": {"df": "${ft.df}"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        self.assertEqual(values["ft.shape"], (2, 2))
+        self.assertEqual(values["tt.table"], table)
+        self.assertEqual(values["tt.rows"], 2)
+        self.assertEqual(values["tt.columns"], ["region", "amount"])
+
+    def test_to_csv(self):
+        table = [{"a": 1}, {"a": 2}]
+        nodes = [
+            {"id": "src", "op": "control.const", "params": {"value": table}},
+            {"id": "ft", "op": "df.from_table", "inputs": {"table": "${src.value}"}},
+            {"id": "csv", "op": "df.to_csv", "inputs": {"df": "${ft.df}"},
+             "params": {"path": "out/df.csv"}},
+        ]
+        report, values = self._run(nodes)
+        self.assertEqual(report.status, "success")
+        text = (Path(self._tmp.name) / "out/df.csv").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("a"))
+        self.assertEqual(len(text.strip().splitlines()), 3)  # 表头 + 2 行
+
+    def test_import_without_pandas(self):
+        # 模拟未安装 pandas：sys.modules 置 None 使 `import pandas` 抛 ImportError
+        code = (
+            "import sys; sys.modules['pandas'] = None; "
+            "import op_pipeline; "
+            "assert 'df.from_table' in op_pipeline.default_registry "
+            "and 'df.to_table' in op_pipeline.default_registry "
+            "and 'df.to_csv' in op_pipeline.default_registry"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              cwd=str(ROOT), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":

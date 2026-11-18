@@ -25,14 +25,14 @@
 
 | 维度 | 现状 | 直接推论 |
 | --- | --- | --- |
-| 数据处理 | `list[dict]` 行表 + 34 个算子，覆盖文件→清洗→聚合→报告 | 文件型、批式、中等数据量最顺手 |
+| 数据处理 | `list[dict]` 行表 + 40 个算子，覆盖文件→清洗→聚合→报告 | 文件型、批式、中等数据量最顺手 |
 | 数据规模 | 句柄全内存驻留，缓存走 pickle 文件 | 适合 MB～几百 MB 级；GB 级以上不适合 |
 | 计算模型 | 同步算子 + 线程池（默认 `min(8, CPU)`）；async 宿主经 `run_pipeline_async` 桥接（M2-8，`run_in_executor`） | IO 并行有效，CPU 密集无收益；桥接保证事件循环不被阻塞 |
 | 可靠性 | 重试/退避、`allow_failure`、`fail_fast` 完整；元数据持久化与断点续跑（M2-5/M2-6，`--runs` + `--resume`）可选开启 | 可接受"失败重跑"，也可 `--resume` 只重跑失败段 |
 | 容错 | 软超时（线程不可强杀）、失败不保留堆栈 | 不适合强实时、强隔离任务 |
 | 安全 | 表达式 AST 白名单；插件是任意代码执行、缓存是 pickle 反序列化 | 信任边界=本机可信用户；不能接多租户/不可信配置 |
 | 可嵌入性 | 零依赖、一行调用、算子可单测 | 最难被替代的优势 |
-| 生态 | 无 HTTP/DB/DataFrame 算子，插件机制完备 | 缺的是"库存"而非"能力"，扩展成本低 |
+| 生态 | HTTP/SQLite 已内置，DataFrame 走 pandas extras，插件机制完备 | 缺的是"库存"而非"能力"，扩展成本低 |
 
 ---
 
@@ -53,10 +53,11 @@
 
 | 场景 | 需要补的算子 | 对内核的改动 | 计划落点 |
 | --- | --- | --- | --- |
-| API 数据采集 | `http.request`（标准库 `urllib` 即可，不破零依赖） | 无 | M3 |
-| 数据库读写 | `db.sqlite_*`（标准库）；MySQL/PG 走可选 extras | 无 | M3 |
+| API 数据采集 | `http.request`（标准库 `urllib` 即可，不破零依赖） | 无 | M3（**已落地**） |
+| 数据库读写 | `db.sqlite_*`（标准库）；MySQL/PG 走可选 extras | 无 | M3（**已落地**） |
 | Excel/Parquet | 可选依赖算子，做成 extras 不污染内核 | 无 | M3 |
-| 较大数据量 | `list[dict]` ↔ DataFrame adapter，重计算段交给 pandas | 无（编排层零改动） | M3 |
+| 较大数据量 | `list[dict]` ↔ DataFrame adapter（df.from_table/to_table/to_csv，pandas extras），重计算段交给 pandas | 无（编排层零改动） | M3（**已落地**） |
+| 插件包分发 | `[project.entry-points."op_pipeline.ops"]` 入口点自动发现（M3-4），pip 安装即用 | 无（`load_plugins` 加开关，CLI 默认开启） | M3（**已落地**） |
 | 定时调度 | 不自己做，交给 cron / 任务计划 / CI schedule | 无 | 不做 |
 
 这一节成立的前提是"算子级封装"核心决策有效——目前所有补齐都不需要动引擎，说明该决策成立。
@@ -150,8 +151,10 @@
 - **调度与 UI**：如确有需要，做成**独立外围服务**（读 `RunStore`、调 `run_pipeline`），
   内核仍是库——这是与 Airflow 的差异化定位，不要在包里长出调度守护进程；
 - **插件生态**：独立插件包 + `entry_points` 发现 + 签名/白名单机制，缓解插件任意代码执行风险；
-- **配置演进**：`spec_version` 字段 + 迁移器，保证老配置长期可跑；
-- **观测性**：基于事件钩子的结构化日志 / Trace 导出。
+- **配置演进**：`spec_version` 字段 + 迁移器，保证老配置长期可跑——**已落地（M3-5）**；
+  配置组合 `includes`（跨文件拆分/复用，环检测 + 节点 id 查重）——**已落地（M3-7）**；
+- **观测性**：基于事件钩子的结构化日志 / Trace 导出——**已落地（M3-6）**：`observe.JsonlHook`
+  事件流（JSON lines，与报告同源）+ `OtelHook`（extras `otel`，延迟导入）。
 
 ---
 

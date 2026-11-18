@@ -1,0 +1,25 @@
+{
+  "name": "includes_demo",
+  "version": "1.0",
+  "description": "配置组合示例（M3-7）：includes 把数据加载（JSON）与报告（TOML）拆到子配置，主配置只留聚合节点与对外输出",
+  "params": {
+    "input_path": "../data/orders.csv",
+    "region_path": "../data/regions.csv",
+    "min_amount": 20,
+    "top_n": 3,
+    "report_dir": "../output"
+  },
+  "includes": ["parts/load.json", "parts/report.toml"],
+  "nodes": [
+    {
+      "id": "agg",
+      "op": "stats.aggregate",
+      "inputs": {"table": "${clean.table}"},
+      "params": {"group_by": "region", "metrics": {"amount": ["sum"]}}
+    }
+  ],
+  "outputs": {
+    "orders_count": "${count_clean.count}",
+    "top_regions": "${top.table}"
+  }
+}

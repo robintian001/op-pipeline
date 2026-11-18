@@ -1,6 +1,6 @@
 # 内置算子契约清单
 
-共 34 个算子，按 `ops/` 下的文件分组。字段约定：
+共 40 个算子，按 `ops/` 下的文件分组。字段约定：
 
 - **入 / 出**：`名字:类型`，`?` 表示 optional（未接线时收到 `None`）；
 - **参数**：`*` 表示必填；未标默认值即必填；
@@ -152,9 +152,74 @@
 
 ---
 
-## 7. 示例插件算子（examples/plugins/demo_ops.py）
+## 7. HTTP（http_ops.py，1 个）
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `http.request` | — | `status:int` `headers:dict` `json:any?` `text:str` `url:str` `ok:bool` | `url*`、`method="GET"`、`headers=None`、`timeout=10.0`（≥0.1）、`body=None`、`json_body=None` |
+
+行为要点：
+
+- 仅标准库 `urllib` 实现，**零第三方依赖**；
+- `method` 只接受 `GET`/`POST`，其余值抛 `ConfigError`（配置错误，**不重试**）；
+- `json` 视图规则：`Content-Type` 含 `json`，或响应体以 `{`/`[` 开头时尝试 `json.loads`，解析失败返回 `None`；
+- `HTTPError`（4xx/5xx）也是"有响应的失败"：返回 `status`/`headers`/`text`（含 `json` 视图），但 `ok=False`；
+- 连接失败（`URLError`）视为节点失败并正常走 `retries` 重试策略；
+- `POST` 时 `json_body` 自动序列化并设 `Content-Type: application/json`，`body` 为原始字符串请求体；
+- **`deterministic=False`**（外部状态）：结果永不落入节点缓存。
+
+---
+
+## 8. SQLite（db_ops.py，2 个）
+
+标准库 `sqlite3` 实现，**零第三方依赖**。每个节点每次运行各自打开/关闭一个连接；
+`db` 为相对工作目录的文件路径，`:memory:` 表示单节点内存库（跨节点不共享，闭环需用文件库）。
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `db.sqlite_exec` | `gate:any?` | `rowcount:int` `lastrowid:int?` | `db*`、`query*`、`params=None` |
+| `db.sqlite_query` | `gate:any?` | `rows:list` `count:int` `columns:list` | `db*`、`query*`、`params=None` |
+
+行为要点：
+
+- `params` 为位置参数列表，按 `?` 占位符绑定（防注入）；
+- `sqlite_exec` 返回 `rowcount`（DDL 语句 sqlite3 约定为 `-1`）与 `lastrowid`（无自增行时为 `None`）；
+- `sqlite_query` 的 `rows` 为行字典表（列名 -> 值），`columns` 为列名列表，`count` 为行数；
+- 引擎按依赖边调度：**写后读的节点必须显式接线**（可选输入端口 `gate`，接上游任意手柄）
+  保证顺序，否则多个 db 节点会并行执行而互相踩踏；
+- SQL 执行失败（如表不存在）抛 `sqlite3.OperationalError`，节点失败并走 `retries` 策略；
+- **`deterministic=False`**（外部状态）：读写均改变/依赖库内容，永不落入节点缓存。
+
+---
+
+## 9. DataFrame（dataframe_ops.py，3 个）
+
+pandas 为**可选依赖**（`pip install op-pipeline[dataframe]`），仅在 `run()` 内延迟导入：
+未安装时算子照常注册，调用才报错。`df` 句柄是运行时内存对象（DataFrame），不可序列化。
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `df.from_table` | `table:list` | `df:any` `shape:tuple` | `columns=None`、`index_column=None` |
+| `df.to_table` | `df:any` | `table:list` `rows:int` `columns:list` | `drop_index=true`、`column_order=None` |
+| `df.to_csv` | `df:any` | `path:str` `rows:int` | `path*`、`index=false`、`encoding=utf-8` |
+
+行为要点：
+
+- `from_table` 的 `columns=None` 时按全表列集合并集顺序建列（与表算子 T15 治理一致）；
+- `to_table` 把 pandas 空值（NaN/NaT）还原为 `None`，numpy 标量转原生 Python 类型，
+  保证"`list[dict]` ↔ DataFrame 往返"逐值一致；
+- `to_csv` 是 pandas 实现（可写行索引列），与 `io.write_csv`（纯标准库、行字典表）互补；
+- `df` 输出是运行时对象：**不要对 df.* 节点开 `cache`**（缓存按 JSON 序列化会失败）。
+
+---
+
+## 10. 示例插件算子（examples/plugins/demo_ops.py）
 
 不属于内置算子，需 `--plugin plugins/demo_ops.py`（`--plugin` 路径相对配置文件所在目录解析）后可用：
+
+> 插件包也可以做成 pip 分发：在插件包 pyproject 声明 `[project.entry-points."op_pipeline.ops"]`
+> 后安装，CLI 自动发现、免 `--plugin`（M3-4，发布指南见
+> [扩展设计 §3.4](../design/extension-points.md#34-插件包发布指南pip-分发m3-4)）。
 
 | 算子 | 入 | 出 | 参数 |
 | --- | --- | --- | --- |

@@ -229,6 +229,93 @@
 **M3 完成定义（DoD）**：`op_pipeline ops` 算子数 ≥ 40；每个 extras 有独立的依赖声明与 README 说明；
 内核 import 路径保持零第三方依赖（extras 模块延迟导入）；`examples/` 新增 includes 组合示例配置。
 
+> **M3 状态**：M3-1 已完成（HttpOpTest 6 用例绿；全量回归 121 tests OK；e2e 示例调用公开 API 一次通过）。
+> M3-1 落地 `ops/http_ops.py`：`http.request` 仅用 `urllib`，GET/POST、headers/timeout、
+> `json_body`/`body` 双请求体，json/text 双视图（Content-Type 含 json 或文本以 `{`/`[` 开头即给 json 视图），
+> HTTPError 返回 status/headers/text 且 `ok=False`、URLError 抛 `RuntimeError` 走重试、非 GET/POST 抛 `ConfigError`，
+> `deterministic=False`，算子数 34→35（[算子清单](../reference/operator-catalog.md) 新增 §7 HTTP 组）。
+> M3 DoD 的"算子数 ≥ 40"由 M3-2（+2）、M3-3（df.from_table/to_table/to_csv，+3）补齐至 41，
+> 超出原 5 个新增算子的目标（偏差：M3-3 额外提供 `df.to_csv` 保证 ≥40 达成）。
+>
+> M3-2 已完成（SqliteDbOpTest 6 用例绿；全量回归 127 tests OK）。落地 `ops/db_ops.py`：
+> `db.sqlite_exec`（rowcount/lastrowid）与 `db.sqlite_query`（rows/count/columns，行字典表）
+> 仅用标准库 `sqlite3`；`params` 位置参数按 `?` 占位符绑定；`db` 相对 workdir 解析、
+> `:memory:` 支持单节点临时查询；两算子均 `deterministic=False`。重要发现：引擎按依赖边调度，
+> 多节点写后读必须显式接线——两算子新增**可选输入端口 `gate`**（接上游任意手柄即排序），
+> 否则 db 节点并行执行互相踩踏（单测闭环均经 `gate` 接线）。`setup.rowcount` 断言按 sqlite3
+> DDL 约定取 `-1`。算子数 35→37（[算子清单](../reference/operator-catalog.md) 新增 §8 SQLite 组，
+> 示例插件节顺延为 §9）。
+>
+> M3-3 已完成（DataFrameOpTest 3 用例 + TableColumnsUnionTest 2 用例全绿；全量回归通过）。
+> 落地 `ops/dataframe_ops.py`：`df.from_table`（行表→DataFrame，`shape` 输出）、
+> `df.to_table`（DataFrame→行表，NaN/NaT 还原 `None`、numpy 标量转原生类型，保证往返逐值一致）、
+> `df.to_csv`（pandas 实现，可写行索引列）。pandas 只在 `run()` 内延迟导入——
+> 未安装时模块照常导入、算子照常注册（单测用 `sys.modules['pandas']=None` 子进程验证），
+> 调用才报 `RuntimeError` 提示 `pip install op-pipeline[dataframe]`；pyproject 新增
+> `dataframe` extras（README §8 同步 extras 说明）。
+> **T15 治理（行为变更，已标注 config-schema.md §2）**：`table_ops` 新增 `table_columns`
+> （全表列集合并集，按首次出现顺序），select_columns/sort_rows/derive_column/join 四处
+> 弃用 `rows[0].keys()`——列只在非首行出现的参差行不再丢字段或误报，列齐整的表行为不变。
+> 算子数 37→40，达成 M3 DoD 的 "≥ 40" 目标。
+>
+> M3-4 已完成（EntryPointPluginTest 5 用例全绿；全量回归 137 tests OK）。落地入口点发现：
+> `load_plugins(entry_points=True)`（[registry.py#L188-L281](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L188-L281)）
+> 用 `importlib.metadata` 扫描 `[project.entry-points."op_pipeline.ops"]` 组并 import 各模块，
+> 加载顺序：内置包 → 入口点 → `modules` → `paths`；单个入口点模块导入失败或算子名撞重
+> 只告警跳过（自动发现场景以稳为先）。库调用默认关闭（向后兼容）、CLI 默认开启——
+> 验收单测以"玩具插件包"（临时目录模块 + `.dist-info/entry_points.txt`，等价 pip 安装）验证
+> `op_pipeline ops` 直接列出插件算子，无需 `--plugin`。文档：extension-points.md 新增
+> §3.4 插件包发布指南（pip 分发三步 + 要点），README §7 同步入口点用法。算子数保持 40。
+>
+> M3-5 已完成（SpecVersionMigrationTest 6 用例全绿；全量回归 148 tests OK；两示例 e2e 通过）。
+> 落地配置格式版本化：顶层 `spec_version` 字段（缺省 `"1"`，首个发布格式，不兼容变更必须
+> 升号并注册迁移器）；模块级 `CURRENT_SPEC_VERSION` 与 `MIGRATIONS: dict[目标版本, callable]`
+> 迁移器注册表（[spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py)）。
+> `from_dict` 开头先 `_migrate(raw)`：非数字版本号报 `ConfigError`；配置版本高于当前（未来文件）
+> 报清晰错误提示升级框架；低于当前则按 1→2→…→CURRENT 逐级调用 `MIGRATIONS`，缺某级迁移器报
+> "缺少配置迁移器：X -> Y"。迁移后统一写回 `spec_version=CURRENT_SPEC_VERSION` 再解析。
+> 单测用 `patch.object(CURRENT_SPEC_VERSION, "2"/"3")` + `patch.dict(MIGRATIONS, …)` 模拟未来
+> 版本升级与缺迁移器场景；`spec_version` 已入 `_KNOWN_KEYS`（不触发未知键告警），`to_dict`
+> 输出带 `spec_version`。旧配置（无 `spec_version`）照常解析，零破坏。算子数保持 40。
+>
+> M3-6 已完成（ObserveJsonlTest 5 用例全绿；全量回归 148 tests OK）。落地新模块
+> [observe.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/observe.py)：
+> `JsonlHook`（JSON lines 事件流 node_start/node_finish/run_finish，与报告同源——`run_finish`
+> 直接取自 `RunReport` 字段、`node_finish` 的 status/cached 与报告节点一一对应，写文件带锁、
+> 线程安全，并行运行下事件数与报告节点数一致）与 `OtelHook`（`on_run_finish` 内延迟 import
+> opentelemetry，未安装时告警跳过、已安装记录 `op_pipeline.run` span 并带
+> pipeline/run_id/status/duration 属性）。pyproject 新增 `otel` extras（`opentelemetry-api`），
+> 内核 import 路径保持零第三方依赖（单测用 `sys.modules` 模拟缺依赖场景）。README §8 新增
+> "观测性"节（JsonlHook 用法 + OtelHook 说明）。算子数保持 40。
+>
+> M3-7 已完成（IncludesConfigTest 7 用例全绿；全量回归 155 tests OK；两示例 e2e 通过）。
+> 落地顶层 `includes` 配置组合（[spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py)
+> `_resolve_includes`）：`from_dict(raw, base_dir=None)` 新增 `base_dir` 参数，`from_file`
+> 自动以配置所在目录传入；递归加载子配置（子配置自身的 `includes` 按它的所在目录解析），
+> 沿加载栈做环检测（A→B→A 报"includes 存在循环引用"，含链条）；合并语义主配置优先——
+> `params`/`defaults`/`outputs` 逐键覆盖、`nodes` 按 include 顺序拼接且跨文件/与主配置重复
+> 节点 id 即在解析期报 `ConfigError`（含双方来源文件）、`name`/`description`/`version`/
+> `spec_version` 主配置优先；无 `base_dir` 时使用 `includes` 报"需要文件上下文"。
+> 验收：includes 合并结果与手写大配置的节点数、参数、输出及依赖图（build_plan 拓扑序）
+> 完全一致（单测直接比对两者 Plan）。examples 新增 includes 组合示例（M3 DoD）。
+> 算子数保持 40。
+>
+> M3-8 已完成（RegisterLoaderTest 5 用例全绿；全量回归 160 tests OK；三示例 e2e 通过）。
+> 落地自定义配置格式注册表 `PipelineSpec.register_loader(suffix, fn)`（[spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py)）：
+> 模块级 `_LOADERS` 注册表，内建 json/toml/yaml 亦为注册项（无后缀文件按历史行为走 JSON）；
+> 后缀自动归一化（`"fake"`/`".fake"` 等价、大小写不敏感），`fn(path) -> dict` 返回映射，
+> 非 Mapping 报错；未知后缀报 `ConfigError` 并列出已注册格式；非可调用 / 非法后缀报错。
+> `includes`（M3-7）递归加载与自定义 loader 正交——子配置文件同样按注册表分发。
+> 扩展点文档（extension-points.md §1）同步：新配置格式由"内部接口"升级为"稳定"。
+> 算子数保持 40。
+>
+> **M3 关闭（v0.4，2026-11-18）**：M3-1 ~ M3-8 全部完成，全量回归 160 tests OK，三示例
+> （orders JSON / text TOML / includes 组合）端到端通过。M3 DoD 达成——`op_pipeline ops`
+> 共 40 个算子（≥ 40）；每个 extras（dataframe/yaml/otel/dev）独立依赖声明且 README 有说明；
+> 内核 `dependencies = []` 零第三方依赖（extras 模块延迟导入）；`examples/includes/`
+> 新增配置组合示例（跨 JSON/TOML 拆分 + 主配置聚合）。T15（表算子首行列假设）由 M3-3 消除。
+> 剩余技术债见 §6。
+
 ---
 
 ## 6. 技术债映射

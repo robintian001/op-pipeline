@@ -1,0 +1,31 @@
+{
+  "params": {
+    "clean_where": "status == 'paid' and amount >= 20"
+  },
+  "nodes": [
+    {
+      "id": "load_orders",
+      "op": "io.read_csv",
+      "cache": true,
+      "params": {"path": "${p.input_path}"}
+    },
+    {
+      "id": "load_regions",
+      "op": "io.read_csv",
+      "cache": true,
+      "params": {"path": "${p.region_path}"}
+    },
+    {
+      "id": "clean",
+      "op": "table.filter_rows",
+      "cache": true,
+      "inputs": {"table": "${load_orders.table}"},
+      "params": {"where": "${p.clean_where}"}
+    },
+    {
+      "id": "count_clean",
+      "op": "stats.count_rows",
+      "inputs": {"table": "${clean.table}"}
+    }
+  ]
+}

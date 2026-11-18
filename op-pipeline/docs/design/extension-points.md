@@ -10,9 +10,9 @@
 | 扩展点 | 机制 | 需要改动的代码 | 稳定性 |
 | --- | --- | --- | --- |
 | 新增算子 | `@op` 装饰器 + `Operator` 子类 | 只新增文件，不改框架 | 稳定 |
-| 算子插件 | 模块路径 / 文件路径加载 | 配置或调用方传参 | 稳定 |
+| 算子插件 | 模块路径 / 文件路径加载；**入口点自动发现**（M3-4：插件包 pyproject 声明 `[project.entry-points."op_pipeline.ops"]`，`load_plugins(entry_points=True)` / CLI 默认开启） | 配置或调用方传参；插件包发布方在自己的 pyproject 声明入口点 | 稳定 |
 | 表达式函数 | `register_function(name, fn)`（纯函数、禁覆盖内置名） | 只新增调用，不改框架 | 稳定 |
-| 新配置格式 | `PipelineSpec.from_file` 的分支 | `spec.py` | 内部接口 |
+| 新配置格式 | `PipelineSpec.register_loader(suffix, fn)` 注册表（M3-8）：内建 json/toml/yaml 亦为注册项；`fn(path) -> dict`，后缀自动归一化（`"fake"`/`".fake"` 等价），未知后缀报错并列出已注册格式 | 只新增注册调用，不改框架 | 稳定（M3-8） |
 | 算子别名 | `Registry.register(aliases=...)` | 算子声明 | 稳定 |
 | 自定义缓存 | 传入 `CacheStore` 兼容对象 | `run_pipeline` / `Engine` | 弱契约（鸭子类型） |
 | 替换执行器 | 实现 `Executor` 协议（submit/wait/shutdown）；内置 `ThreadExecutor`（默认）与 `ProcessExecutor`（硬超时，M2-2） | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) | 稳定（M2-1） |
@@ -80,7 +80,7 @@ assert out["flagged"] is False
 
 ## 3. 插件加载
 
-### 3.1 两种加载方式
+### 3.1 三种加载方式
 
 ```powershell
 # 文件路径（相对配置文件所在目录解析）
@@ -92,10 +92,29 @@ from op_pipeline import load_plugins
 load_plugins(modules=["my_company.ops"], paths=["plugins/my_ops.py"], base_dir=".")
 ```
 
-加载顺序（[registry.py#L177-L253](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L177-L253)）：
-内置 `op_pipeline.ops` → `modules` → `paths`。文件加载的模块名是
+**入口点发现（M3-4，pip 分发插件）**：插件包在自己的 `pyproject.toml` 声明入口点组，
+安装后 CLI（`ops`/`run`/`validate`/`graph`/`describe` 默认开启）与
+`load_plugins(entry_points=True)` 自动发现，无需 `--plugin`：
+
+```toml
+# 插件包 pyproject.toml
+[project.entry-points."op_pipeline.ops"]
+my_ops = "my_company.ops"    # 值指向模块：模块级 @op 即注册
+```
+
+库调用（`entry_points` 默认关闭，向后兼容）：
+
+```python
+from op_pipeline import load_plugins
+load_plugins(entry_points=True)
+```
+
+加载顺序（[registry.py#L188-L281](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L188-L281)）：
+内置 `op_pipeline.ops` → 入口点 → `modules` → `paths`。文件加载的模块名是
 `_op_plugin_<路径 blake2b 摘要>`（同一文件重复加载幂等跳过；指定 `registry` 时为
-`_op_plugin_<stem>_<序号>`，跨注册表各执行一次）。
+`_op_plugin_<stem>_<序号>`，跨注册表各执行一次）。入口点按包分发去重（同一已安装包
+只导入一次，受 Python import 幂等性限制）；单个入口点模块导入失败或算子名撞重时
+只告警跳过，不拖垮其余入口点（自动发现场景以稳为先）。
 
 ### 3.2 约束与坑
 
@@ -130,6 +149,56 @@ report, values = run("my_pipeline.toml", registry=reg)   # default_registry 全�
   同一插件文件并发加载恰好执行一次，**加载失败不占去重名额**（占位回滚，下次可重试）；
 - 类定义处可直接写 `@op("x.y", registry=reg)`；
 - `modules` 方式受 Python import 幂等性限制：已导入过的模块不会重新执行。
+
+### 3.4 插件包发布指南（pip 分发，M3-4）
+
+把算子库做成 pip 包分发，安装即被自动发现，是最省心的复用方式。发布方只需三步：
+
+1. **写算子模块**（与文件插件完全一致，模块级 `@op` 即注册）：
+
+```python
+# my_company/ops.py
+from op_pipeline import Operator, op
+
+@op("my_company.conversion_rate")
+class ConversionRate(Operator):
+    outputs = [("rate", float)]
+    def run(self, ctx):
+        return {"rate": 0.05}
+```
+
+2. **在 pyproject 声明入口点组**（值指向上面的模块）：
+
+```toml
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-company-ops"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["op-pipeline"]          # 依赖框架，保证入口点组可用
+
+[project.entry-points."op_pipeline.ops"]
+my_ops = "my_company.ops"
+```
+
+3. **发布并安装**：`pip install my-company-ops` 后，用户侧
+
+```powershell
+python -m op_pipeline ops          # 直接列出插件算子，无需 --plugin
+python -m op_pipeline run cfg.toml # 配置里即可用 my_company.* 算子
+```
+
+要点：
+
+- 入口点组的 key 可任意（建议与模块一致），**value 必须是模块路径**，不能是
+  `module:attr` 形式——发现机制只 import 模块，靠模块级 `@op` 注册；
+- 插件只能 import `op_pipeline` 的公开符号，不得依赖框架内部实现；
+- 若插件算子名与其它包撞重，自动发现时该入口点只告警跳过，用户仍需用
+  `replace=True` 或隔离注册表（§3.3）显式处理；
+- 零第三方依赖约束只针对框架内核，插件包可以自由使用第三方库。
 
 ---
 
@@ -194,7 +263,6 @@ class Executor(Protocol):
 | # | 缺口 | 证据 | 影响 | 建议落点 |
 | --- | --- | --- | --- | --- |
 | T13 | `strict=False` 可返回残缺 Plan | [spec.py#L477-L487](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L477-L487) | 无调用方使用，属预留 | 保持现状并在文档说明 |
-| T15 | 表算子假设首行代表全表列 | 多处使用 `rows[0].keys()` | 列不全的行会丢字段或抛错 | 统一列集合并集，或要求 schema 显式声明 |
 
 > 剩余按需处理；T13 保持"预留，不处理"。
 > 已消除：T1/T5（M1-1，软类型告警接入）、T6（M1-2，缓存目录相对 workdir 解析）、
@@ -208,7 +276,10 @@ class Executor(Protocol):
 > **T8（M2-2，`ProcessExecutor` 硬超时——节点 `executor="process"` 或运行级
 > `--executor process` 时，`timeout` 到点 terminate 子进程；线程模式仍为软超时）**、
 > **T7（M2-5，`CacheStore(include_source=True)` 把算子类源码 blake2b 摘要纳入
-> cache_key，源码变化即缓存失效；默认关闭保持旧行为）**。
+> cache_key，源码变化即缓存失效；默认关闭保持旧行为）**、
+> **T15（M3-3，表算子列判定改为全表列集合并集——`table_ops.table_columns`
+> 取代 `rows[0].keys()`，select_columns/sort_rows/derive_column/join 四处
+> 统一改用，列参差的行不再丢字段或误报）**。
 
 ---
 
@@ -235,7 +306,7 @@ M2-3 起收敛点已落在 `HandleStore` 接口（[handlestore.py](file:///C:/Us
 
 ## 7. 新增能力时的回归清单
 
-1. 跑 `python -m unittest discover -s tests -v`（104 个用例）；
+1. 跑 `python -m unittest discover -s tests -v`（137 个用例，M3-4）；
 2. 用 `examples/pipeline_orders.json` 做端到端（覆盖并行 fan-out、when、断言、4 种输出）；
 3. 用 `examples/pipeline_text.toml --plugin plugins/demo_ops.py`（`--plugin` 相对配置文件所在目录解析）验证插件与重试；
 4. `python -m op_pipeline validate` 与 `graph` 必须仍然可用；

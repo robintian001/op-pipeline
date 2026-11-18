@@ -206,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _setup_logging(getattr(args, "verbose", False))
-    load_plugins()  # 确保内置算子已注册
+    load_plugins(entry_points=True)  # 内置算子 + 已安装插件包入口点（M3-4，坏插件只告警）
     return int(args.func(args) or 0)
 
 

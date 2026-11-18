@@ -1,8 +1,12 @@
 # 配置规范参考
 
-配置格式支持 **JSON / TOML / YAML**（内容同构）。`.json` 与无扩展名走 `json`，`.toml` 走标准库 `tomllib`，
-`.yaml/.yml` 需可选依赖 `pyyaml`。解析入口
-[PipelineSpec.from_file()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L132-L155)。
+配置格式支持 **JSON / TOML / YAML**（内容同构），此外可按需注册自定义格式。`.json` 与无扩展名走 `json`，
+`.toml` 走标准库 `tomllib`，`.yaml/.yml` 需可选依赖 `pyyaml`。解析入口
+[PipelineSpec.from_file()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L402-L406)。
+
+格式分发走 loader 注册表（M3-8）：内建 json/toml/yaml 即注册项；第三方格式通过
+`PipelineSpec.register_loader(suffix, fn)` 扩展——`suffix` 为扩展名（可省略前导点、大小写不敏感），
+`fn(path) -> dict` 返回配置映射。未知后缀报错并列出已注册格式；子配置文件（`includes`）同样按注册表分发。
 
 ---
 
@@ -10,12 +14,14 @@
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
+| `spec_version` | str | `"1"` | **配置格式版本**（M3-5）：不兼容变更必须升号并注册迁移器（`MIGRATIONS`）；缺省按 `"1"` 解析；高于框架当前版本报错提示升级；非数字报错 |
 | `name` | str | `"pipeline"` | 流水线名，进入报告 |
 | `version` | str | `"1"` | 流水线版本，进入报告 |
 | `description` | str | `""` | 备注 |
 | `params` | object | `{}` | 流水线参数；可被 `--param` 覆盖；值中可用 `${env.X}` |
 | `nodes` | array | 必填 | 节点列表，**顺序无关**（执行由引用推导的依赖决定） |
 | `outputs` | object | `{}` | 流水线对外产物：名字 → `${...}` 引用 |
+| `includes` | array\<str\> | `[]` | **配置组合**（M3-7）：相对本文件所在目录的配置文件路径数组，按顺序加载并合并（`params`/`defaults`/`outputs` 逐键覆盖、`nodes` 拼接），主配置优先；节点 id 跨文件重复报错；子配置自身也可 `includes`（按自身目录解析）；循环引用报错；仅 `from_file` 或显式 `base_dir` 可用 |
 | `defaults` | object | `{}` | 节点运行策略缺省值（M1-5 起生效）：可用键 `retries/retry_delay/timeout/cache/allow_failure/executor`，未知键报错；节点显式值优先 |
 
 ---
@@ -37,6 +43,12 @@
 | `allow_failure` | bool | `false` | 失败不视为硬失败；报告为 `partial`，下游仍因缺输入跳过 |
 | `executor` | `"thread"` / `"process"` | 无（先继承运行级，最终 `thread`） | 执行器选择（M2-2）：`process` 时算子在子进程执行（载荷须可 pickle，超时为硬超时）；未指定时沿用 `run(executor=...)` / CLI `--executor` |
 | `description` | str | `""` | 备注（不参与执行） |
+
+> **行为变更（M3-3，T15 治理）**：`table.select_columns` / `table.sort_rows` /
+> `table.derive_column` / `table.join` 的列判定从"首行代表全表列"改为**全表列集合并集**。
+> 影响：列只在非首行出现的参差行不再丢字段或误报——例如
+> `select_columns(missing="error")` 不再因目标列"不在首行"而报错，会保留该列并给缺失行补 `None`；
+> `sort_rows` 的排序键出现在任何一行即有效。正常（列齐整）表的执行结果不变。
 
 ---
 

@@ -37,7 +37,8 @@
                                     │ @op 注册
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 算子层  (ops/) + 外部插件                                                    │
-│   io / table / stats / text / report / control 六组，共 34 个内置算子        │
+│   io / table / stats / text / report / control / http / db / df（九组）      │
+│   共 40 个内置算子                                                          │
 │   业务算子以插件形式平级加入，不与框架耦合                                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -50,8 +51,9 @@
 
 | 模块 | 主要符号 | 职责 | 不负责 |
 | --- | --- | --- | --- |
-| [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) | `NodeSpec` `PipelineSpec` `RefResolver` `PlanNode` `Plan` `build_plan` `topological_order` | 配置解析、引用解析、静态校验、依赖推导与拓扑排序 | 不做实际执行、不加载算子实现 |
+| [spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) | `NodeSpec` `PipelineSpec` `RefResolver` `PlanNode` `Plan` `build_plan` `topological_order` | 配置解析、引用解析、静态校验、依赖推导与拓扑排序；配置版本化 `spec_version`+`MIGRATIONS`（M3-5）；顶层 `includes` 配置组合（M3-7）；自定义格式 loader 注册表 `register_loader`（M3-8） | 不做实际执行、不加载算子实现 |
 | [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) | `Engine` `NodeResult` `RunReport` `run_pipeline` `run_pipeline_async` `Hook` | 调度、并行、重试、超时、失败传播、缓存接入、断点续跑、执行事件钩子（M2-7）、async 宿主桥接（M2-8）、报告 | 不解析配置、不做参数声明校验 |
+| [observe.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/observe.py) | `JsonlHook` `OtelHook` | 执行事件结构化导出（M3-6）：JSON lines 事件流（与报告同源）、可选 OTel span（extras otel，延迟导入） | 不生成报告本体、不改变执行语义 |
 | [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py) | `HandleStore` `InMemoryHandleStore` `SpillHandleStore` | 句柄存取抽象（get/put/snapshot/items）、线程安全内存实现（M2-3）与超阈值 pickle 落盘、按需加载（M2-4） | 不做引用解析（RefResolver 的事）、不感知节点语义 |
 | [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/store.py) | `RunStore` | 可选 SQLite 运行记录（`record_run`/`record_node`/`query`/`prev_node`，runs/nodes 两表，M2-5），默认关闭零副作用；M2-6 供断点续跑比对 | 不决定调度/重试，只记录 |
 | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) | `Executor` `ThreadExecutor` `ProcessExecutor` | 执行器抽象（`submit`/`wait`/`shutdown` 协议）、线程池默认实现与硬超时进程执行器（M2-2） | 不做调度决策、不做重试/缓存（仍属 engine） |
@@ -64,7 +66,7 @@
 | [context.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/context.py) | `RunContext` `NodeContext` | 运行 ID、日志、工作目录、产物路径、参数注入 | 不持有句柄表（句柄在 `Engine`） |
 | [graph.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/graph.py) | `to_mermaid` `to_dot` `to_ascii` | 依赖图 / 执行计划渲染 | 不做布局算法 |
 | [cli.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cli.py) | `main` `build_parser` | 命令行入口与退出码 | 不提供业务算子 |
-| [ops/](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/ops/__init__.py) | 34 个 `@op` 类 | 内置算子库，导入即注册 | 不依赖引擎内部实现 |
+| [ops/](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/ops/__init__.py) | 40 个 `@op` 类 | 内置算子库，导入即注册 | 不依赖引擎内部实现 |
 
 ## 4. 核心抽象与不变量
 

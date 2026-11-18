@@ -1,0 +1,25 @@
+[[nodes]]
+id = "ranked"
+op = "table.sort_rows"
+[nodes.inputs]
+table = "${agg.table}"
+[nodes.params]
+by = "amount_sum"
+desc = true
+
+[[nodes]]
+id = "top"
+op = "table.limit"
+[nodes.inputs]
+table = "${ranked.table}"
+[nodes.params]
+n = "${p.top_n}"
+
+[[nodes]]
+id = "write_csv"
+op = "io.write_csv"
+[nodes.inputs]
+table = "${top.table}"
+[nodes.params]
+path = "${p.report_dir}/includes_top.csv"
+columns = ["region", "amount_sum"]

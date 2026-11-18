@@ -111,14 +111,20 @@ print(values["top.table"][0]["region"])
 
 ## 5. 配置参考
 
+支持 **JSON / TOML / YAML**（内容同构），`.yaml` 需 `pip install pyyaml`；扩展格式经
+`PipelineSpec.register_loader(suffix, fn)` 注册（M3-8，如 `.ini`）。顶层字段见下表，
+`includes`（M3-7）可按相对路径拆分复用配置。
+
 ### 5.1 顶层字段
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
+| `spec_version` | str | 配置格式版本（可选，缺省 `"1"`）：高于框架当前版本报错；旧版本配置按 `MIGRATIONS` 迁移器逐级升级 |
 | `name` / `version` / `description` | str | 流水线标识，进报告 |
 | `params` | dict | 流水线参数，可被 `--param` 覆盖，参数内可用 `${env.X}` |
 | `nodes` | list | 节点数组，顺序无关（执行由依赖决定） |
 | `outputs` | dict | 流水线对外产物：名字 → 引用 |
+| `includes` | list[str] | 配置组合（可选）：相对配置文件目录的子配置路径，按顺序合并（params/defaults/outputs 覆盖、nodes 拼接），主配置优先；节点 id 重复报错；循环引用报错（`from_file` 下自动按目录解析） |
 | `defaults` | dict | 预留的默认运行策略（当前由节点字段直接表达） |
 
 ### 5.2 节点字段
@@ -214,18 +220,57 @@ from op_pipeline import load_plugins
 load_plugins(modules=["my_company.ops"], paths=["plugins/my_ops.py"], base_dir=".")
 ```
 
+**入口点自动发现（M3-4）**：插件包在自己的 `pyproject.toml` 声明
+`[project.entry-points."op_pipeline.ops"]` 后 pip 安装，CLI（`ops`/`run` 等，默认开启）
+与库调用 `load_plugins(entry_points=True)` 即可免 `--plugin` 直接使用：
+
+```python
+from op_pipeline import load_plugins
+load_plugins(entry_points=True)  # 扫描已安装插件包入口点
+```
+
+发布插件包的完整指南见 [扩展设计 §3.4](../op-pipeline/docs/design/extension-points.md#34-插件包发布指南pip-分发m3-4)。
+
 ---
 
-## 8. 内置算子（34 个）
+## 8. 内置算子（40 个）
 
 | 分组 | 算子 | 说明 |
 | --- | --- | --- |
 | IO | `io.read_csv` `io.write_csv` `io.read_json` `io.write_json` `io.read_text` `io.write_text` | 表格以 `list[dict]` 为通用交换格式 |
-| 表 | `table.filter_rows` `select_columns` `rename_columns` `drop_columns` `derive_column` `sort_rows` `dedupe` `limit` `join` `union` `take_column` | 哈希连接、表达式派生列 |
+| 表 | `table.filter_rows` `select_columns` `rename_columns` `drop_columns` `derive_column` `sort_rows` `dedupe` `limit` `join` `union` `take_column` | 哈希连接、表达式派生列；列判定按全表并集 |
 | 统计 | `stats.aggregate` `count_rows` `value_counts` `describe` | `sum/mean/count/min/max/median/std/nunique/first/last` |
 | 文本 | `text.template` `split_lines` `join_lines` `regex_extract` `replace_regex` | 模板用 `{{key}}`，避开 `${}` |
 | 报告 | `report.markdown` `report.html` | 单文件 HTML，无前端依赖 |
 | 控制 | `control.const` `if_else` `switch` `assert` `passthrough` `merge_dicts` | 常量注入、分支、数据质量门禁 |
+| HTTP | `http.request` | GET/POST、json/text 双视图、超时与重试 |
+| DB | `db.sqlite_exec` `db.sqlite_query` | 标准库 sqlite3，参数化绑定，写后读须接 `gate` 排序 |
+| DataFrame | `df.from_table` `df.to_table` `df.to_csv` | pandas 可选依赖（`pip install op-pipeline[dataframe]`），重计算段交给 pandas |
+
+> extras 说明：内核 import 路径保持零第三方依赖，可选功能做成 extras 延迟导入——
+> `dataframe`（pandas）、`yaml`（pyyaml，`.yaml` 配置格式）、`otel`（opentelemetry-api，
+> `observe.OtelHook` 的可选 OTel bridge，未安装只告警跳过）。
+
+---
+
+## 8. 观测性（M3-6）
+
+`run_pipeline(..., hooks=[...])` 之外，`op_pipeline.observe.JsonlHook` 把一次运行的事件流
+导出为 JSON lines（NDJSON），每行一个事件：`node_start` / `node_finish` / `run_finish`，
+与运行报告同一事实源（`run_finish` 行直接取自 `RunReport`，字段一致）。线程安全，节点
+并行执行不丢行。
+
+```python
+from op_pipeline import run_pipeline
+from op_pipeline.observe import JsonlHook
+
+hook = JsonlHook("runs/events.jsonl")
+report, values = run_pipeline(spec, hooks=[hook])
+hook.close()
+```
+
+可选 OTel bridge：`observe.OtelHook`（`pip install op-pipeline[otel]`）在运行结束时把报告
+摘要记为 `op_pipeline.run` span；未安装 `opentelemetry-api` 时只告警、不影响流水线。
 
 ---
 
