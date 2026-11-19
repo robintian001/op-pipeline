@@ -11,7 +11,7 @@
 
 | 约定项 | 内容 |
 | --- | --- |
-| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4`；M4 → `0.5`；M5 → `0.6` |
+| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4`；M4 → `0.5`；M5 → `0.6`；M6 → `0.7` |
 | 合入门槛 | `python -m unittest discover -s tests -v` 全绿 + 新任务自带测试 + 两个示例流水线端到端通过 |
 | 回归基线 | 每个任务合入前先跑基线；M2 的抽象类任务要求"平移后行为零变化"（现有 21 用例不改断言） |
 | 文档同步 | 改动涉及节点字段/执行语义/CLI 的，同一变更内更新 [运行时语义](../architecture/runtime-semantics.md) 与 [配置规范](../reference/config-schema.md)；新增算子更新 [算子清单](../reference/operator-catalog.md) |
@@ -402,6 +402,29 @@
 > 缓存失效（`cached=false`）；CLI `run` 报告展示失败节点截断堆栈；`ops --json`
 > 契约完整性有测试核对；新增 5 个用例（test_m5_experience.py）。
 > 全量回归 **230 用例全绿** ✓；两示例端到端 + 远程双进程示范通过 ✓。
+
+---
+
+## 7.5 M6：工程质量与运维能力增强（v0.7）
+
+目标：不做新能力扩张，只做**工程化收口**——把发布链路、调度外围、执行可靠性与
+文档一致性补齐；内核语义、默认数据模型与零第三方依赖保持不变。
+
+| 编号 | 方向 | 关键交付 |
+| --- | --- | --- |
+| M6-1 | 发布工程 | GitHub Actions 矩阵（Python 3.11/3.12/3.13，最小依赖档 + 全 extras 档）；CHANGELOG 按版本归档；wheel 内容与临时目录安装运行纳入发版前校验 |
+| M6-2 | 调度与运维 | 调度器多流水线（`--pipeline` 可重复）、失败告警 `--alert-webhook`、`--keep-runs` + `RunStore.prune` 历史清理、`nodes.duration` 耗时列、Web UI 分页/状态筛选/节点耗时 |
+| M6-3 | 执行可靠性 | 节点 `concurrency_group` + 运行级 `concurrency_limits`、按异常类型重试 `retry_on`、`worker --workers` 并发消费、远程节点取消传播（取消后标记 skipped、不再等待结果） |
+| M6-4 | 文档与开发者体验 | 算子清单与注册表数量一致性测试；新增快速上手、运维指南、稳定 API 清单三份文档；配置规范/运行时语义补充并发分组、条件重试、远程取消 |
+
+**M6 完成定义（DoD）**：全量回归全绿；主示例、插件示例与远程双进程示范端到端通过；
+`pyproject.toml` 升 `0.7.0`；`CHANGELOG` 归档 0.7.0；文档与实现对齐核查通过。
+
+> **M6 已完成（v0.7.0，2026-11-19）**：新增 52 个用例（7 个 M6 测试模块），全量回归
+> **282 个用例全绿**；`examples/pipeline_orders.json`（18 节点全 success）、
+> `pipeline_text.toml --plugin plugins/demo_ops.py`、`examples/remote_exec_demo.py`
+> 三个端到端均退出码 0；wheel 元数据 0.7.0、含 `py.typed`，临时目录安装后
+> `op_pipeline ops --json` 得 50 个算子。
 
 ---
 

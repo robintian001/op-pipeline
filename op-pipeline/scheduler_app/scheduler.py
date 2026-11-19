@@ -1,30 +1,36 @@
-"""调度守护进程（M5-2 Task 5）：定时触发 ``op_pipeline.run``，结果写 RunStore。
+"""调度守护进程（M5-2 Task 5 / M6-2 Task 6）：定时触发 ``op_pipeline.run``，结果写 RunStore。
 
 - 命令行：``python -m scheduler_app.scheduler --pipeline <cfg> --every <秒>``，
   可选 ``--registry/--plugin/--workdir/--cache-dir/--db``；
+- M6：``--pipeline`` 可重复（多流水线每轮按顺序全部触发）；``--alert-webhook``
+  在运行失败时 POST JSON 告警；``--keep-runs`` 每轮结束后清理历史运行记录；
 - 启动后立即执行一次，之后每 ``--every`` 秒执行一次；
 - 每次运行结果写入 RunStore（复用 M2-5 SQLite 运行记录库）；
 - Ctrl+C / KeyboardInterrupt 干净退出：打印退出信息，退出码 0；
 - 内部用 ``threading.Event`` 提供可测试的停止机制；调度循环在主线程串行执行，
   可编程入口 :func:`run_scheduler` 供测试直接调用，CLI 只是薄封装。
 
-仅使用标准库（argparse / threading / time）。
+仅使用标准库（argparse / json / threading / time / urllib.request）。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 log = logging.getLogger("scheduler_app.scheduler")
 
+_ALERT_TIMEOUT = 5.0  # 告警 HTTP 超时（秒）
+
 
 def run_scheduler(
-    pipeline: str | Path,
+    pipeline: str | Path | Sequence[str | Path],
     every: float,
     *,
     registry: Any = None,
@@ -33,19 +39,26 @@ def run_scheduler(
     workdir: str | Path | None = None,
     cache_dir: str | Path | None = ".pipeline_cache",
     db: str | Path | None = None,
+    alert_webhook: str | None = None,
+    keep_runs: int | None = None,
     stop_event: threading.Event | None = None,
     logger: logging.Logger | None = None,
 ) -> int:
-    """按固定间隔反复执行流水线，返回**触发次数**。
+    """按固定间隔反复执行流水线，返回**累计触发次数**（每执行一条流水线计 1 次）。
 
     参数（全部透传给 :func:`op_pipeline.run`）：
-    - ``pipeline``：流水线配置文件路径；
+    - ``pipeline``：流水线配置文件路径；可为路径序列（每轮按顺序全部触发），
+      单个 ``str`` / ``Path`` 等价于只含一条的序列（v0.6 兼容）；
     - ``every``：触发间隔（秒），启动后立即执行一次；
     - ``registry``：``Registry`` 实例（None = 使用全局默认算子表）；
     - ``plugin``：插件**文件路径**元组（相对配置文件所在目录解析）；
     - ``plugin_modules``：插件**模块路径**元组（CLI ``--registry`` 映射到此）；
     - ``workdir`` / ``cache_dir``：工作目录与缓存目录；
     - ``db``：RunStore SQLite 路径；给定则每次运行结果落库，None = 不落库；
+    - ``alert_webhook``：告警 Webhook URL；运行状态非 success 或抛异常时 POST
+      ``{"pipeline","run_id","status","error"}``，发送失败只记 warning；
+    - ``keep_runs``：每轮结束后保留最近 N 条运行记录（``RunStore.prune``）；
+      ``None`` 或 ``<= 0`` 表示不清理；
     - ``stop_event``：置位后当前轮结束即退出循环（默认内部自建）；
     - ``logger``：日志器（默认 ``scheduler_app.scheduler``）。
 
@@ -55,6 +68,7 @@ def run_scheduler(
     """
     if every <= 0:
         raise ValueError(f"every 必须是正数，实际是 {every!r}")
+    pipelines = _normalize_pipelines(pipeline)
     logger = logger or log
     stop = stop_event if stop_event is not None else threading.Event()
     # 复用同一个 SQLite 连接（调度循环串行，连接只在主线程使用）；
@@ -65,17 +79,31 @@ def run_scheduler(
     count = 0
     try:
         while not stop.is_set():
-            _run_once(
-                pipeline,
-                registry=registry,
-                plugin=plugin,
-                plugin_modules=plugin_modules,
-                workdir=workdir,
-                cache_dir=cache_dir,
-                store=store,
-                logger=logger,
-            )
-            count += 1
+            for cfg in pipelines:
+                ok, info = _run_once(
+                    cfg,
+                    registry=registry,
+                    plugin=plugin,
+                    plugin_modules=plugin_modules,
+                    workdir=workdir,
+                    cache_dir=cache_dir,
+                    store=store,
+                    logger=logger,
+                )
+                count += 1
+                if not ok and alert_webhook:
+                    _send_alert(alert_webhook, cfg, info, logger)
+                if stop.is_set():
+                    break
+            # M6：每轮结束（全部流水线跑完）后按保留策略清理历史
+            if keep_runs is not None and keep_runs > 0 and store is not None:
+                try:
+                    deleted = store.prune(keep_runs)
+                except Exception as exc:  # noqa: BLE001 - 清理失败不中断守护进程
+                    logger.warning("历史清理失败：%s: %s", type(exc).__name__, exc)
+                else:
+                    if deleted:
+                        logger.info("历史清理：删除 %d 条较早的运行记录", deleted)
             # 间隔从本轮结束开始计时；stop 置位时 wait 立即返回并退出
             if stop.wait(every):
                 break
@@ -88,6 +116,47 @@ def run_scheduler(
     return count
 
 
+def _normalize_pipelines(
+    pipeline: str | Path | Sequence[str | Path],
+) -> list[str | Path]:
+    """把单路径或序列统一成列表（``str``/``Path`` 视为单条，v0.6 兼容）。"""
+    if isinstance(pipeline, (str, Path)):
+        return [pipeline]
+    items = list(pipeline)
+    if not items:
+        raise ValueError("pipeline 不能为空序列")
+    return items
+
+
+def _send_alert(
+    webhook: str,
+    pipeline: str | Path,
+    info: dict[str, str],
+    logger: logging.Logger,
+) -> None:
+    """POST JSON 告警；任何异常只记 warning，绝不影响调度循环。"""
+    payload = {
+        "pipeline": str(pipeline),
+        "run_id": info.get("run_id") or "",
+        "status": info.get("status") or "error",
+        "error": info.get("error") or "",
+    }
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            webhook,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=_ALERT_TIMEOUT) as response:
+            response.read()
+    except Exception as exc:  # noqa: BLE001 - 告警失败必须隔离
+        logger.warning(
+            "告警发送失败（不影响调度）：%s: %s", type(exc).__name__, exc
+        )
+
+
 def _run_once(
     pipeline: str | Path,
     *,
@@ -98,10 +167,12 @@ def _run_once(
     cache_dir: str | Path | None,
     store: RunStore | None,
     logger: logging.Logger,
-) -> None:
-    """执行一次流水线并落库；失败只记日志，不中断调度循环。
+) -> tuple[bool, dict[str, str]]:
+    """执行一次流水线并落库，返回 ``(是否成功, 运行摘要)``。
 
-    ``KeyboardInterrupt`` 原样向上传播（由循环层统一收口）。
+    失败只记日志，不中断调度循环；摘要供告警使用
+    （``run_id`` / ``status`` / ``error``）。``KeyboardInterrupt`` 原样向上传播
+    （由循环层统一收口）。
     """
     try:
         from op_pipeline import run
@@ -120,11 +191,26 @@ def _run_once(
             "触发成功：run_id=%s status=%s 耗时 %.2fs（%d 个节点）",
             report.run_id, report.status, report.duration, len(report.nodes),
         )
+        if report.status == "success":
+            return True, {"run_id": report.run_id, "status": report.status, "error": ""}
+        error = next(
+            (n.error for n in report.nodes if n.status == "failed" and n.error), ""
+        )
+        return False, {
+            "run_id": report.run_id,
+            "status": report.status,
+            "error": error,
+        }
     except KeyboardInterrupt:
         raise
     except Exception as exc:  # noqa: BLE001 - 单轮失败必须隔离，守护进程照常运转
         logger.error("本轮运行失败：%s: %s", type(exc).__name__, exc)
         logger.debug("失败详情：", exc_info=True)
+        return False, {
+            "run_id": "",
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -135,7 +221,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="scheduler_app.scheduler",
         description="op_pipeline 调度守护进程：定时执行流水线并把结果写入 RunStore。",
     )
-    parser.add_argument("--pipeline", required=True, help="流水线配置文件路径")
+    parser.add_argument(
+        "--pipeline", action="append", required=True, metavar="PATH",
+        help="流水线配置文件路径（可重复，每轮按顺序全部触发）",
+    )
     parser.add_argument(
         "--every", type=float, required=True, help="触发间隔（秒），启动后立即执行一次"
     )
@@ -155,6 +244,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--db", default=None, help="RunStore SQLite 路径（默认不落库）"
+    )
+    parser.add_argument(
+        "--alert-webhook", default=None, metavar="URL",
+        help="告警 Webhook：运行失败时 POST JSON 到该地址（默认不告警）",
+    )
+    parser.add_argument(
+        "--keep-runs", type=int, default=None, metavar="N",
+        help="每轮结束后仅保留最近 N 条运行记录（N<=0 表示不清理）",
     )
     return parser.parse_args(argv)
 
@@ -176,6 +273,8 @@ def main(argv: list[str] | None = None) -> int:
         workdir=args.workdir,
         cache_dir=args.cache_dir,
         db=args.db,
+        alert_webhook=args.alert_webhook,
+        keep_runs=args.keep_runs,
         stop_event=stop,
     )
     print(f"调度器已停止，共触发 {count} 次（退出码 0）。")

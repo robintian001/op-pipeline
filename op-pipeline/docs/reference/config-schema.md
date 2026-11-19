@@ -38,11 +38,23 @@
 | `when` | str | 无 | 布尔表达式，为假则跳过（下游连带跳过） |
 | `retries` | int | `0` | 失败重试次数（总尝试 = retries + 1） |
 | `retry_delay` | float | `0.0` | 退避基数：第 n 次重试前等待 `retry_delay * 2^(n-1)` 秒 |
+| `retry_on` | array\<str\> | `[]` | **v0.7 新增，可选**：仅当异常类型名（`type(exc).__name__`）在列表中时才重试；空列表 = 所有普通异常可重试；缺省/`null` 视为空列表；**只接受字符串数组**（单个字符串不是数组，报 `ConfigError`）；`ConfigError` / `ParamValidationError` 等配置类错误**永不重试**。缺省行为与旧版一致 |
 | `timeout` | float | 无（`0` 视为无） | 秒级超时：线程模式为**软超时**（到点标记失败、不强杀）；`executor="process"` 时为**硬超时**（terminate 子进程） |
 | `cache` | bool | `false` | 是否参与内容指纹缓存（算子须 `deterministic`） |
 | `allow_failure` | bool | `false` | 失败不视为硬失败；报告为 `partial`，下游仍因缺输入跳过 |
-| `executor` | `"thread"` / `"process"` | 无（先继承运行级，最终 `thread`） | 执行器选择（M2-2）：`process` 时算子在子进程执行（载荷须可 pickle，超时为硬超时）；未指定时沿用 `run(executor=...)` / CLI `--executor` |
+| `executor` | `"thread"` / `"process"` / `"queue"` | 无（先继承运行级，最终 `thread`） | 执行器选择（M2-2/M5-1）：`process` 时算子在子进程执行（载荷须可 pickle，超时为硬超时）；`queue` 时节点载荷经共享队列文件交给独立 worker 进程（需另启 `python -m op_pipeline worker`）；未指定时沿用 `run(executor=...)` / CLI `--executor`（同样接受 `"queue"` 或 `Executor` 实例） |
+| `concurrency_group` | str | `""` | **v0.7 新增，可选**：并发分组名；同组节点的同时执行数受运行级 `concurrency_limits[组名]` 限制（只限制实际执行，不含缓存命中）。空串或未配置的组不加限制，缺省行为与旧版一致 |
 | `description` | str | `""` | 备注（不参与执行） |
+
+### 2.1 运行级参数（v0.7 新增，可选）
+
+以下参数**不是配置文件字段**，通过库调用传入（`run(config, ..., concurrency_limits=...)` /
+`run_pipeline(..., concurrency_limits=...)` / `Engine(..., concurrency_limits=...)`）；
+不传时行为与旧版完全一致：
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `concurrency_limits` | dict\<str, int\> | `None`（不限） | 并发分组上限：键为节点 `concurrency_group`，值为该组同时执行的节点数上限（必须为正整数，否则 `ConfigError`）。只在当前运行/进程内生效，不跨 worker 聚合 |
 
 > **行为变更（M3-3，T15 治理）**：`table.select_columns` / `table.sort_rows` /
 > `table.derive_column` / `table.join` 的列判定从"首行代表全表列"改为**全表列集合并集**。

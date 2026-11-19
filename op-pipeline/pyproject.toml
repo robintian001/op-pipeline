@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "op-pipeline"
-version = "0.6.0"
+version = "0.7.0"
 description = "算子级、配置驱动的 Python 流水线框架（纯标准库）"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,7 +31,7 @@ mysql = ["pymysql"]  # M5-3：mysql 算子的可选依赖
 postgres = ["psycopg2"]  # M5-3：postgres 算子的可选依赖
 yaml = ["pyyaml"]
 otel = ["opentelemetry-api"]  # M3-6：observe.OtelHook 的可选 OTel bridge
-dev = ["pytest"]
+dev = ["pytest", "build"]
 
 [project.scripts]
 op-pipeline = "op_pipeline.cli:main"

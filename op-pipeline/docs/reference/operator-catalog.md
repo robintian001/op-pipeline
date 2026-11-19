@@ -1,6 +1,6 @@
 # 内置算子契约清单
 
-共 44 个算子，按 `ops/` 下的文件分组。字段约定：
+共 50 个算子（44 个零依赖内置 + 6 个可选依赖的 Parquet/Excel/Arrow 算子），按 `ops/` 下的文件分组。字段约定：
 
 - **入 / 出**：`名字:类型`，`?` 表示 optional（未接线时收到 `None`）；
 - **参数**：`*` 表示必填；未标默认值即必填；
@@ -226,7 +226,35 @@ pandas 为**可选依赖**（`pip install op-pipeline[dataframe]`），仅在 `r
 
 ---
 
-## 10. 示例插件算子（examples/plugins/demo_ops.py）
+## 10. Parquet / Excel / Arrow（parquet_ops.py + excel_ops.py，6 个，可选 extras）
+
+pyarrow（`pip install op-pipeline[parquet]`）与 openpyxl（`pip install op-pipeline[excel]`）均为
+**可选依赖**，仅在 `run()` 内延迟导入：未安装时算子照常注册，调用才报清晰错误
+（提示安装对应 extras）。行表统一为 `list[dict]`。
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `df.from_arrow`（`from_arrow`） | `table:list` | `arrow:any` `rows:int` `columns:list` | `columns=None` |
+| `df.to_arrow`（`to_arrow`） | `arrow:any` | `table:list` `rows:int` | — |
+| `io.read_parquet`（`read_parquet`） | — | `table:list` `rows:int` `path:str` | `path*` |
+| `io.write_parquet`（`write_parquet`） | `table:list` | `path:str` `rows:int` | `path*`、`compression="snappy"` |
+| `io.write_excel`（`write_excel`） | `table:list?` `sheets:dict?` | `path:str` `rows:int` | `path*`、`sheet="Sheet1"` |
+| `io.read_excel`（`read_excel`） | — | `table:list` `rows:int` `path:str` | `path*`、`sheet=None` |
+
+行为要点：
+
+- `df.from_arrow` / `df.to_arrow` 在行表与 pyarrow Table 之间双向转换；`arrow` 是运行时对象，
+  **不要对 `df.*` 节点开 `cache`**（缓存按 JSON 序列化会失败）；
+- `io.read_parquet` / `io.write_parquet` 直读/直写 Parquet 文件，`compression` 支持
+  `snappy`/`gzip`/`zstd` 等（由 pyarrow 决定可用集）；
+- `io.write_excel` 二选一：给 `table` 写单 sheet（名字取 `sheet`），或给 `sheets`
+  （`{sheet名: 行表}`）一次写多个 sheet；`io.read_excel` 按 `sheet` 读指定工作表，
+  `sheet=None` 读活动（首个）工作表，读后即 `close()` 释放文件句柄；
+- 所有路径都经 `ctx.resolve_path()`，相对路径基准是工作目录；写出前自动创建父目录。
+
+---
+
+## 11. 示例插件算子（examples/plugins/demo_ops.py）
 
 不属于内置算子，需 `--plugin plugins/demo_ops.py`（`--plugin` 路径相对配置文件所在目录解析）后可用：
 

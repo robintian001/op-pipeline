@@ -20,6 +20,13 @@ M5-1 起该执行器已接入引擎节点调度主循环：引擎把每个节点
   （对比 ``ProcessExecutor`` 的"回退线程"策略，队列模式无法回退，提前报错更诚实）；
 - 句柄必须可 pickle：``SharedHandleStore.put`` 对不可 pickle 的值同样抛
   ``RuntimeError``——跨进程没有内存退化的余地，绝不静默丢失数据。
+
+M6-3 起补充：
+- ``worker --workers N`` / ``consume_jobs(workers=N)``：用标准库线程池并发执行
+  已认领任务（认领与 offset 递增加锁）；``count`` 语义为"最多认领的任务数"；
+- 等待结果可取消：``_QueueTask`` 持有可选的 ``cancel_event``，取消置位后
+  ``result()`` 抛 ``concurrent.futures.CancelledError``（任务本身仍留在队列，
+  worker 侧可能继续执行——软取消，与线程路径的已知限制同语义）。
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -58,12 +66,24 @@ def _atomic_write(path: Path, data: dict[str, Any]) -> None:
 
 
 class _QueueTask:
-    """队列任务的 Future 鸭子类型：``done`` 是属性，``result``/``exception`` 读结果文件。"""
+    """队列任务的 Future 鸭子类型：``done`` 是属性，``result``/``exception`` 读结果文件。
 
-    def __init__(self, job_id: str, result_path: Path, poll: float) -> None:
+    ``cancel_event``（M6-3 Task 10）可选：置位后在等待循环中立即抛
+    ``concurrent.futures.CancelledError``——不再关心结果文件是否出现
+    （任务仍留在队列，worker 侧可能继续执行，结果文件稍后仍会原子写出）。
+    """
+
+    def __init__(
+        self,
+        job_id: str,
+        result_path: Path,
+        poll: float,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         self.job_id = job_id
         self._result_path = result_path
         self._poll = poll
+        self._cancel_event = cancel_event
         self._lock = threading.Lock()
         self._result: Any = None
         self._error: BaseException | None = None
@@ -89,9 +109,12 @@ class _QueueTask:
     def _wait_ready(self, timeout: float | None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
         while not self._resolved:
+            # 结果已落盘优先返回：取消只影响"继续等待"，不影响已就绪的结果
             if self._result_path.is_file():
                 self._read()
                 continue
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                raise CancelledError(f"任务 {self.job_id} 的等待已被取消")
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"任务 {self.job_id} 超时未完成")
             time.sleep(self._poll)
@@ -134,7 +157,13 @@ class QueueWorkerExecutor:
         """结果目录（引擎据此推导共享句柄目录，M5-1）。"""
         return self._out
 
-    def submit(self, fn: Callable[..., Any], /, *args: Any) -> _QueueTask:
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        cancel_event: threading.Event | None = None,
+    ) -> _QueueTask:
         if self._closed:
             raise RuntimeError("执行器已关闭，拒绝新任务")
         try:
@@ -145,7 +174,9 @@ class QueueWorkerExecutor:
         line = json.dumps({"job_id": job_id, "payload": payload}, ensure_ascii=False)
         with self._queue.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-        return _QueueTask(job_id, self._out / f"{job_id}.json", self._poll)
+        return _QueueTask(
+            job_id, self._out / f"{job_id}.json", self._poll, cancel_event=cancel_event
+        )
 
     def wait(self, futures: Iterable[Any], *, first_completed: bool = True) -> set[Any]:
         tasks = list(futures)
@@ -242,22 +273,35 @@ def _remote_run(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def consume_jobs(
-    queue: str | Path,
-    out: str | Path,
-    *,
-    count: int | None = None,
-    poll: float = 0.1,
-    stop_event: threading.Event | None = None,
-) -> list[dict[str, Any]]:
-    """worker 侧：增量消费 JSONL 队列并把每个任务的结果写回 ``out`` 目录。
+def _run_one(line: str, out: Path) -> dict[str, Any]:
+    """执行队列中的一行并原子写回结果文件，返回 ``{"job_id", "status"}``。
 
-    - ``count``：最多消费的任务数；``None`` 表示持续监听（直到 stop_event / Ctrl+C）；
-    - 返回已消费任务的 ``[{"job_id", "status"}]`` 列表，供 CLI 打印与测试断言。
+    任务失败不向调用方抛异常：错误打包进 ``<job_id>.json``（``status="error"``），
+    worker 继续消费后续任务。
     """
-    queue = Path(queue)
-    out = Path(out)
-    out.mkdir(parents=True, exist_ok=True)
+    item = json.loads(line)
+    job_id = item["job_id"]
+    try:
+        fn, args = _decode_value(item["payload"])
+        value = fn(*args)
+        status, result, error = "ok", _encode_value(value), None
+    except Exception as exc:  # noqa: BLE001 - 任务失败写回结果，worker 不退出
+        status, result, error = "error", None, f"{type(exc).__name__}: {exc}"
+    _atomic_write(out / f"{job_id}.json", {
+        "job_id": job_id, "status": status, "result": result, "error": error,
+    })
+    return {"job_id": job_id, "status": status}
+
+
+def _consume_sequential(
+    queue: Path,
+    out: Path,
+    *,
+    count: int | None,
+    poll: float,
+    stop_event: threading.Event | None,
+) -> list[dict[str, Any]]:
+    """单 worker 消费（M5-1 原循环）：逐行执行，行为与历史完全一致。"""
     offset = 0
     consumed = 0
     processed: list[dict[str, Any]] = []
@@ -274,20 +318,100 @@ def consume_jobs(
         for line in new_lines:
             if count is not None and consumed >= count:
                 break
-            item = json.loads(line)
-            job_id = item["job_id"]
-            try:
-                fn, args = _decode_value(item["payload"])
-                value = fn(*args)
-                status, result, error = "ok", _encode_value(value), None
-            except Exception as exc:
-                status, result, error = "error", None, f"{type(exc).__name__}: {exc}"
-            _atomic_write(out / f"{job_id}.json", {
-                "job_id": job_id, "status": status, "result": result, "error": error,
-            })
+            processed.append(_run_one(line, out))
             offset += 1
             consumed += 1
-            processed.append({"job_id": job_id, "status": status})
         if count is not None and consumed >= count:
             break
     return processed
+
+
+def _consume_parallel(
+    queue: Path,
+    out: Path,
+    *,
+    count: int | None,
+    poll: float,
+    stop_event: threading.Event | None,
+    workers: int,
+) -> list[dict[str, Any]]:
+    """多 worker 并发消费（M6-3 Task 10）：认领与 offset 递增加锁。
+
+    - 每个 worker 循环"认领一行 -> 执行 -> 写结果文件"；认领到的下标即
+      返回列表中的位置，因此返回顺序恒为认领顺序（单队列 FIFO = 提交顺序）；
+    - ``count`` 为"最多认领的任务数"：达到上限后所有 worker 退出；
+    - ``stop_event`` 置位后不再认领新任务，已认领的任务仍执行完并写结果。
+    """
+    lock = threading.Lock()
+    offset = 0
+    claimed = 0
+    processed: list[dict[str, Any] | None] = []
+
+    def _claim() -> tuple[tuple[int, str] | None, bool]:
+        """返回 ``((下标, 行), False)``；无新任务时 ``(None, 是否已达 count 上限)``。"""
+        nonlocal offset, claimed
+        with lock:
+            if count is not None and claimed >= count:
+                return None, True
+            lines = (
+                queue.read_text(encoding="utf-8").splitlines() if queue.exists() else []
+            )
+            if offset >= len(lines):
+                return None, False
+            line = lines[offset]
+            offset += 1
+            claimed += 1
+            index = len(processed)
+            processed.append(None)
+            return (index, line), False
+
+    def _worker() -> None:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            item, exhausted = _claim()
+            if item is None:
+                if exhausted:
+                    return
+                time.sleep(poll)
+                continue
+            index, line = item
+            processed[index] = _run_one(line, out)
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="op-worker") as pool:
+        for _ in range(workers):
+            pool.submit(_worker)
+        # 退出 with 时等待全部 worker 结束（与串行版的阻塞语义一致）
+    return [item for item in processed if item is not None]
+
+
+def consume_jobs(
+    queue: str | Path,
+    out: str | Path,
+    *,
+    count: int | None = None,
+    poll: float = 0.1,
+    stop_event: threading.Event | None = None,
+    workers: int = 1,
+) -> list[dict[str, Any]]:
+    """worker 侧：增量消费 JSONL 队列并把每个任务的结果写回 ``out`` 目录。
+
+    - ``count``：最多消费（认领）的任务数；``None`` 表示持续监听（直到
+      stop_event / Ctrl+C）；
+    - ``workers``（M6-3 Task 10）：并发执行任务的 worker 数，默认 1（保持原
+      串行循环行为）；``<= 0`` 抛 ``ValueError``。并发时认领与 offset 递增
+      在同一把锁内完成，结果仍按 ``<job_id>.json`` 原子写，返回顺序按认领顺序；
+    - 返回已消费任务的 ``[{"job_id", "status"}]`` 列表，供 CLI 打印与测试断言。
+    """
+    if workers <= 0:
+        raise ValueError(f"workers 必须是正整数，实际是 {workers}")
+    queue = Path(queue)
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    if workers == 1:
+        return _consume_sequential(
+            queue, out, count=count, poll=poll, stop_event=stop_event
+        )
+    return _consume_parallel(
+        queue, out, count=count, poll=poll, stop_event=stop_event, workers=workers
+    )

@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     error       TEXT,
     cache_key   TEXT,
     finished_at REAL NOT NULL,
+    duration    REAL DEFAULT 0,
     PRIMARY KEY (run_id, node_id)
 );
 """
@@ -54,7 +55,15 @@ class RunStore:
         if self._tables_ready:
             return
         self.conn.executescript(_SCHEMA)
+        self._migrate_nodes_duration()
         self._tables_ready = True
+
+    def _migrate_nodes_duration(self) -> None:
+        """M6：旧库 nodes 表补 ``duration`` 列（幂等；旧行取默认 0）。"""
+        columns = [row[1] for row in self.conn.execute("PRAGMA table_info(nodes)")]
+        if "duration" not in columns:
+            self.conn.execute("ALTER TABLE nodes ADD COLUMN duration REAL DEFAULT 0")
+            self.conn.commit()
 
     def record_run(
         self,
@@ -87,15 +96,46 @@ class RunStore:
         error: str | None,
         cache_key: str | None,
         finished_at: float,
+        duration: float = 0.0,
     ) -> None:
+        """写入单节点结果；``duration`` 为可选末尾参数（兼容既有位置调用）。"""
         self._ensure_tables()
         self.conn.execute(
             "INSERT OR REPLACE INTO nodes "
-            "(run_id, node_id, op, status, attempts, cached, error, cache_key, finished_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (run_id, node_id, op, status, attempts, int(cached), error, cache_key, finished_at),
+            "(run_id, node_id, op, status, attempts, cached, error, cache_key, "
+            "finished_at, duration) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, node_id, op, status, attempts, int(cached), error, cache_key,
+             finished_at, duration),
         )
         self.conn.commit()
+
+    def prune(self, keep_last: int) -> int:
+        """M6：仅保留最近 ``keep_last`` 条运行记录，返回删除的运行数。
+
+        排序为 ``started_at DESC, run_id DESC``（同一时间戳时用 run_id 兜底，
+        保证结果确定）；对应节点记录级联删除。``keep_last <= 0`` 抛 ValueError。
+        """
+        if keep_last <= 0:
+            raise ValueError(f"keep_last 必须是正数，实际是 {keep_last!r}")
+        self._ensure_tables()
+        cursor = self.conn.execute(
+            "DELETE FROM runs WHERE run_id NOT IN ("
+            " SELECT run_id FROM runs ORDER BY started_at DESC, run_id DESC LIMIT ?"
+            ")",
+            (keep_last,),
+        )
+        deleted = max(0, cursor.rowcount)
+        # nodes 可能只存在于外部手工库（无 nodes 表），此时跳过级联删除
+        has_nodes = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes'"
+        ).fetchone()
+        if has_nodes is not None:
+            self.conn.execute(
+                "DELETE FROM nodes WHERE run_id NOT IN (SELECT run_id FROM runs)"
+            )
+        self.conn.commit()
+        return deleted
 
     def query(self, sql: str, params: tuple[Any, ...] | None = None) -> list[tuple[Any, ...]]:
         self._ensure_tables()

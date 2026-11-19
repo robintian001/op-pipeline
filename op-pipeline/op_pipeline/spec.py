@@ -65,8 +65,24 @@ def _warn_unknown_keys(where: str, raw: Mapping[str, Any], known: frozenset[str]
     for key in raw:
         if key in known:
             continue
-        close = difflib.get_close_matches(key, known, n=1, cutoff=0.6)
-        hint = f"；是否想写 '{close[0]}'？" if close else ""
+        # 候选排序：前缀匹配优先，其次长度更短，再按 difflib 比率降序。
+        # 'retry' 的前缀候选是 'retry_on'/'retry_delay'，但最短近义键 'retries'
+        # 才是用户期望的提示（既有契约），因此长度优先于单纯的前缀归属。
+        prefix = [k for k in known if k.startswith(key)]
+        close = difflib.get_close_matches(key, known, n=len(known), cutoff=0.6)
+        candidates = list(dict.fromkeys(prefix + close))
+        candidate = (
+            min(
+                candidates,
+                key=lambda k: (
+                    len(k),
+                    -difflib.SequenceMatcher(None, key, k).ratio(),
+                ),
+            )
+            if candidates
+            else ""
+        )
+        hint = f"；是否想写 '{candidate}'？" if candidate else ""
         logger.warning("%s 含未知键 %r（将被忽略）%s", where, key, hint)
 
 
@@ -267,6 +283,9 @@ class NodeSpec:
     when: str | None = None
     retries: int = 0
     retry_delay: float = 0.0
+    # 条件重试（M6-3 Task 9）：非空时仅重试这些异常类型名（type(exc).__name__）；
+    # 空元组 = 不按类型过滤（现状：普通异常按 retries 重试）。
+    retry_on: tuple[str, ...] = ()
     timeout: float | None = None
     cache: bool = False
     allow_failure: bool = False
@@ -274,14 +293,17 @@ class NodeSpec:
     # "thread"=线程（软超时），"process"=子进程（硬超时），
     # "queue"=远程队列执行器（M5-1：节点级声明触发引擎自建 QueueWorkerExecutor）
     executor: str = ""
+    # 并发分组（M6-3 Task 8）："" = 未声明（不加组限流）；非空时若运行配置
+    # （concurrency_limits）给出该组上限，则同组节点最多 N 个同时执行。
+    concurrency_group: str = ""
     description: str = ""
 
     # from_dict 接受的合法键（dataclass 字段之外无类型注解，不会被当作字段）
     _KNOWN_KEYS = frozenset(
         {
             "id", "name", "op", "inputs", "outputs", "params", "when",
-            "retries", "retry_delay", "timeout", "cache", "allow_failure",
-            "executor", "description",
+            "retries", "retry_delay", "retry_on", "timeout", "cache",
+            "allow_failure", "executor", "concurrency_group", "description",
         }
     )
 
@@ -316,6 +338,27 @@ class NodeSpec:
             raise ConfigError(
                 f"节点 [{node_id}] 的 executor 只能是 thread/process/queue，实际是 {executor_raw!r}"
             )
+        # M6-3 Task 8：并发分组必须是字符串（空串 = 未声明，不加组限流）
+        group_raw = raw.get("concurrency_group", "")
+        if not isinstance(group_raw, str):
+            raise ConfigError(
+                f"节点 [{node_id}] 的 concurrency_group 必须是字符串"
+                f"（空串表示未声明），实际是 {type(group_raw).__name__}"
+            )
+        # M6-3 Task 9：retry_on 只接受字符串数组（单个字符串不是"数组"，明确报错）；
+        # 缺省 / null = 空元组（不做类型过滤，保持 v0.6.0 行为）。
+        retry_on_raw = raw.get("retry_on")
+        if retry_on_raw is None:
+            retry_on_raw = ()
+        if not isinstance(retry_on_raw, (list, tuple)):
+            raise ConfigError(
+                f"节点 [{node_id}] 的 retry_on 必须是异常类型名的字符串数组，"
+                f"实际是 {type(retry_on_raw).__name__}（{retry_on_raw!r}）"
+            )
+        if not all(isinstance(item, str) for item in retry_on_raw):
+            raise ConfigError(
+                f"节点 [{node_id}] 的 retry_on 元素必须都是字符串，实际是 {retry_on_raw!r}"
+            )
         return cls(
             id=str(node_id),
             op=str(op),
@@ -325,10 +368,12 @@ class NodeSpec:
             when=raw.get("when"),
             retries=int(merged["retries"] or 0),
             retry_delay=float(merged["retry_delay"] or 0.0),
+            retry_on=tuple(retry_on_raw),
             timeout=None if timeout_raw in (None, 0) else float(timeout_raw),
             cache=bool(merged["cache"] or False),
             allow_failure=bool(merged["allow_failure"] or False),
             executor=str(executor_raw),
+            concurrency_group=group_raw,
             description=str(raw.get("description") or ""),
         )
 
@@ -425,9 +470,11 @@ class PipelineSpec:
                     "when": n.when,
                     "retries": n.retries,
                     "retry_delay": n.retry_delay,
+                    "retry_on": list(n.retry_on),
                     "timeout": n.timeout,
                     "cache": n.cache,
                     "allow_failure": n.allow_failure,
+                    "concurrency_group": n.concurrency_group,
                 }
                 for n in self.nodes
             ],

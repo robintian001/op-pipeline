@@ -15,7 +15,10 @@
 | [design/extension-points.md](design/extension-points.md) | 扩展设计 | 算子作者、二次开发者 | 自定义算子、插件加载、替换执行器/缓存、演进路线落点、已知技术债 |
 | [design/development-plan.md](design/development-plan.md) | 开发计划 | 贡献者、维护者 | 里程碑（M1 正确性 / M1.5 库通用性 / M2 三抽象 / M3 生态）任务分解：改动落点、验收标准、技术债映射、DoD 与工程约定 |
 | [reference/config-schema.md](reference/config-schema.md) | 参考手册 | 流水线配置编写者 | 顶层/节点字段、引用语法、表达式子集、参数归一规则、CLI 与退出码 |
-| [reference/operator-catalog.md](reference/operator-catalog.md) | 参考手册 | 流水线配置编写者 | 34 个内置算子的输入/输出/参数契约与行为要点 |
+| [reference/operator-catalog.md](reference/operator-catalog.md) | 参考手册 | 流水线配置编写者 | 50 个内置算子的输入/输出/参数契约与行为要点 |
+| [reference/api.md](reference/api.md) | 参考手册 | 二次开发者、维护者 | 包顶层 `__all__` 公开 API、分组语义与稳定性承诺 |
+| [guides/quickstart.md](guides/quickstart.md) | 使用指南 | 首次使用者 | 安装、第一个流水线、Python 内嵌、自定义算子、常见错误 |
+| [guides/operations.md](guides/operations.md) | 使用指南 | 运维/接入方 | scheduler_app 调度与告警、Web UI、RunStore、远程 worker、故障排查 |
 
 ## 阅读路径建议
 

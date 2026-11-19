@@ -258,6 +258,67 @@ for attempt in 1..attempts:
 
 取消检查位于 `_dispatch` 决策顺序的第一步（§2.3），优先于 fail_fast 与依赖判断。
 
+### 3.6 并发分组限流（v0.7）
+
+节点可用 `concurrency_group` 声明所属分组，运行级 `concurrency_limits` 给每个组
+配置同时执行上限（`{组名: 最大并行数}`）。语义：
+
+- **惰性建信号量**：引擎按组名在首次遇到该组节点时创建
+  `threading.Semaphore(limit)`；同一份 `Plan` 一次运行的节点共享这些信号量；
+- **acquire / release 时机**：输入与参数解析、缓存查询完成后，节点**真正开始执行前**
+  acquire，执行结束（成功/失败/超时）在 `finally` 中 release，异常路径不会泄漏配额；
+- **只限制实际执行**：缓存命中的节点直接发布结果并返回，**不 acquire**，因此不占用
+  分组名额；
+- **未声明/未配置不限**：节点 `concurrency_group` 为空，或该组不在
+  `concurrency_limits` 中时，行为与旧版完全一致；
+- **非法配置报错**：组名必须是非空字符串、上限必须是**正整数**，否则在构造引擎时
+  抛 `ConfigError`（注意 `0` 不是"不限制"，而是非法值；不限制请直接不配置该组）；
+- **作用域是单次运行**：限流只在当前引擎/进程内生效，不跨 worker 进程或跨机器聚合。
+
+### 3.7 按异常类型重试（v0.7）
+
+`retry_on`（字符串列表）把重试从"所有普通异常"收窄为"指定异常类型"：
+
+```
+for attempt in 1..retries+1:
+    try: return execute_once(...)
+    except ConfigError: 直接失败（永不重试）
+    except Exception as exc:
+        if retry_on and type(exc).__name__ not in retry_on: 直接失败
+        if attempt == 最后一次: 失败
+        sleep(retry_delay * 2 ** (attempt - 1))
+```
+
+- **匹配方式**：精确匹配 `type(exc).__name__`（异常类名，如 `"TimeoutError"`），
+  **不做继承关系匹配**——想重试某个子类需显式写出子类名；
+- **与次数/退避的关系**：`retry_on` 只决定"这次失败要不要继续尝试"，总尝试次数仍是
+  `retries + 1`，退避仍是 `retry_delay * 2^(n-1)`；未命中的异常立即失败，
+  `attempts` 停在当次尝试；
+- **配置类错误优先级最高**：`ConfigError` 及其子类（含 `ParamValidationError`、
+  `RefResolutionError` 等）即使被写进 `retry_on` 也**永不重试**——配置写错不应被
+  重试掩盖；
+- **远程节点**：远程失败在引擎侧重试包装处表现为 `_RemoteFailure`（worker 打包的
+  原始类型名在错误文本里）；需要按类型重试远程异常时，`retry_on` 应写
+  `"_RemoteFailure"`，写 worker 侧原始类型名不会命中；
+- **缺省不变**：`retry_on` 为空（默认）时所有普通异常按 `retries` 重试，与旧版一致。
+
+### 3.8 远程节点取消传播（v0.7）
+
+队列执行器（`executor="queue"` / `QueueWorkerExecutor`）的节点在主进程中表现为
+"等待结果文件的线程任务"。取消语义分两种路径：
+
+- **远程节点：不再等待远端**。取消事件置位后，等待循环停止轮询结果文件并结束，
+  节点直接标记 `skipped`（note 记录取消原因），报告按 `partial` 聚合；
+  该节点已经过 `on_node_start`，因此 `on_node_finish` 会以 `status="skipped"` 触发
+  （与 `_dispatch` 中从未调度、不发钩子的 skipped 不同）；
+  队列任务本身**无法撤销**，worker 可能仍在执行并写出结果文件，引擎会忽略它，
+  该结果文件可按运维策略清理；
+- **本地线程节点：软取消**。已经在跑的节点自然结束（线程无法强杀，与软超时同理由），
+  其结果照常计入报告；尚未调度的节点在下一轮 `_dispatch` 开头标记 `skipped`。
+
+取消检查仍在 `_dispatch` 第一步（§2.3），远程与本地路径共享同一取消事件；
+远程模式下取消只影响"是否继续等"，不改变重试/缓存等其它语义。
+
 ---
 
 ## 4. 缓存语义

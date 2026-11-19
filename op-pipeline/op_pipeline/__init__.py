@@ -130,6 +130,7 @@ def run(
     run_store: Any = None,
     resume_run_id: str | None = None,
     hooks: list[Any] | None = None,
+    concurrency_limits: Mapping[str, int] | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。
 
@@ -150,6 +151,9 @@ def run(
       默认 None = 无钩子。
     - ``executor``（M5-1）：None / 字符串快捷方式（"thread"/"process"/"queue"）/
       任意 ``Executor`` 实例；"queue" 与实例语义详见 :func:`run_pipeline` docstring。
+    - ``concurrency_limits``（M6-3 Task 8）：节点并发分组上限
+      ``{组名: 正整数}``，与节点 ``concurrency_group`` 配合使用，透传给
+      ``run_pipeline``；默认 None = 不做组限流。
     """
     config_path = Path(config).expanduser().resolve()
     load_plugins(
@@ -173,6 +177,7 @@ def run(
         run_store=run_store,
         resume_run_id=resume_run_id,
         hooks=hooks,
+        concurrency_limits=concurrency_limits,
     )
 
 

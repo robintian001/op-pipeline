@@ -154,13 +154,21 @@ def cmd_describe(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    """M5-1 远程执行：消费共享队列文件并执行任务（配合 QueueWorkerExecutor）。"""
+    """M5-1 远程执行：消费共享队列文件并执行任务（配合 QueueWorkerExecutor）。
+
+    M6-3 Task 10：``--workers N`` 并发消费（默认 1 = 原串行行为），N<=0 报错。
+    """
     from .remote import consume_jobs
 
+    if args.workers <= 0:
+        print(f"--workers 必须是正整数，实际是 {args.workers}", file=sys.stderr)
+        return 2
     out = args.out or str(Path(args.queue).expanduser().resolve().parent / "results")
     print(f"worker 监听队列：{args.queue}\n结果目录：{out}")
     try:
-        processed = consume_jobs(args.queue, out, count=args.count, poll=args.poll)
+        processed = consume_jobs(
+            args.queue, out, count=args.count, poll=args.poll, workers=args.workers
+        )
     except KeyboardInterrupt:
         print("\nworker 已停止（Ctrl+C）")
         return 130
@@ -233,6 +241,10 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--out", default=None, help="结果目录（默认取队列同目录下的 results/）")
     worker.add_argument("--count", type=int, default=None, help="最多消费任务数（默认不限，持续监听）")
     worker.add_argument("--poll", type=float, default=0.1, help="队列轮询间隔（秒）")
+    worker.add_argument(
+        "--workers", type=int, default=1,
+        help="并发消费任务的 worker 数（默认 1；必须为正整数，M6-3）",
+    )
     worker.set_defaults(func=cmd_worker)
     return parser
 

@@ -3,6 +3,15 @@
 > 一句话：**算子是一个自描述的可复用单元，流水线只是算子之间的一份配置。**
 > 零第三方依赖（纯标准库，Python ≥ 3.11），可单独嵌入任何 Python 项目。
 
+## 文档导航
+
+| 文档 | 内容 |
+| --- | --- |
+| [快速上手](docs/guides/quickstart.md) | 安装、第一个流水线、Python 内嵌调用、自定义算子、常见错误 |
+| [运维指南](docs/guides/operations.md) | scheduler_app 调度/告警/保留策略、Web UI、RunStore、远程 worker 与故障排查 |
+| [API 参考](docs/reference/api.md) | 包顶层稳定 API 清单与稳定性承诺 |
+| [设计文档索引](docs/README.md) | 架构、运行时语义、扩展设计、配置规范与算子清单 |
+
 ---
 
 ## 1. 设计目标与取舍

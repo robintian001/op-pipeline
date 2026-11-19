@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # 最小依赖档必须全绿：内核是纯标准库，不装任何 extras 也应当完整通过。
+  minimal:
+    name: minimal (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装最小依赖（仅内核）
+        run: |
+          python -m pip install -U pip
+          pip install -e .
+      - name: 运行测试
+        run: python -m unittest discover -s tests -v
+
+  # full-extras 用于验证可选算子（pandas/pyarrow/openpyxl/pymysql/psycopg2/pyyaml/otel）。
+  # 该档失败说明是可选项依赖问题，不应误报为内核失败——内核是否健康以 minimal 档为准。
+  full-extras:
+    name: full-extras (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装全 extras
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[dataframe,parquet,excel,mysql,postgres,yaml,otel,dev]"
+      - name: 运行测试
+        run: python -m unittest discover -s tests -v

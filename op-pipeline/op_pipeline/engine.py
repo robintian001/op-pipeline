@@ -7,12 +7,17 @@
 2. **失败传播**：节点失败后，依赖它的下游节点标记为 ``skipped``，
    并行分支继续跑（除非 ``fail_fast=True``）。
 3. **``when`` 条件**：为假时节点跳过，下游同样跳过。
-4. **重试**：``retries`` 次指数退避式重试；配置类错误（写错了参数）不重试。
+4. **重试**：``retries`` 次指数退避式重试；配置类错误（写错了参数）不重试；
+   ``retry_on`` 非空时只重试列出的异常类型名（M6-3）。
 5. **超时**：``timeout`` 秒为软超时——到点标记失败，但底层线程无法强杀，
    这一点在 README 里作为已知限制写明。
 6. **缓存**：``cache=True`` 且算子声明确定性时，按内容指纹复用上次输出。
 7. **取消**：``cancel_event`` 置位或 :meth:`Engine.cancel` 之后，未调度节点标记
-   skipped、在跑节点自然结束，报告状态为 partial。
+   skipped、在跑节点自然结束，报告状态为 partial；远程（队列）节点不再等待
+   结果，同样标记 skipped 并写 note（M6-3）。
+8. **并发分组**（M6-3）：节点 ``concurrency_group`` 配合运行级
+   ``concurrency_limits`` 限制同组节点同时执行数；未声明组或未配置限制时
+   不加锁，行为与 v0.6.0 一致。acquire 在工作线程内（缓存判定之后），不阻塞调度。
 """
 from __future__ import annotations
 
@@ -24,7 +29,7 @@ import os
 import threading
 import time
 import traceback
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -196,7 +201,9 @@ class Hook(Protocol):
     - ``on_node_start(node_id, op)``：节点开始执行（含命中缓存提前返回前）；
     - ``on_node_finish(node_id, status, duration, cached)``：节点结果确定——
       成功、失败、缓存命中都触发；被跳过的节点（when 为假 / 上游失败 /
-      取消）从未开始执行，不触发任何钩子；
+      取消）从未开始执行，不触发任何钩子。例外：远程（队列）节点已进入
+      执行阶段、随后因取消而放弃等待时，会以 ``status="skipped"`` 触发
+      本钩子（M6-3）；
     - ``on_run_finish(report)``：运行汇总完毕（报告状态已定），总在最后。
 
     节点并行执行时钩子可能被多个线程并发调用，实现需自带同步
@@ -234,6 +241,7 @@ class Engine:
         run_store: Any = None,
         resume_run_id: str | None = None,
         hooks: list[Any] | None = None,
+        concurrency_limits: Mapping[str, int] | None = None,
     ) -> None:
         # M5-1：运行级执行器三元态——字符串选择器 / Executor 实例 / None（默认线程池）。
         if isinstance(executor, str) and executor not in ("thread", "process", "queue"):
@@ -355,6 +363,24 @@ class Engine:
         # M2-7：执行事件钩子——广播给全部钩子，异常只记告警
         self.hooks = list(hooks or [])
 
+        # M6-3 Task 8：节点并发分组限流——组名 -> 正整数上限。
+        # 非法配置（0 / 负数 / 非整数）在构造期即报 ConfigError，绝不静默忽略。
+        # 信号量按组惰性创建（见 _group_semaphore）：未声明组或未配置限制的节点
+        # 完全不加锁，行为与 v0.6.0 一致。
+        self._concurrency_limits: dict[str, int] = {}
+        for group, limit in (concurrency_limits or {}).items():
+            if not isinstance(group, str) or not group:
+                raise ConfigError(
+                    f"concurrency_limits 的组名必须是非空字符串，实际是 {group!r}"
+                )
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ConfigError(
+                    f"concurrency_limits[{group!r}] 必须是正整数，实际是 {limit!r}"
+                )
+            self._concurrency_limits[group] = limit
+        self._semaphores: dict[str, threading.Semaphore] = {}
+        self._semaphore_lock = threading.Lock()
+
     def _emit(self, event: str, *args: Any) -> None:
         """M2-7：把事件广播给全部钩子；钩子异常只记告警，不影响流水线。"""
         for hook in self.hooks:
@@ -373,6 +399,23 @@ class Engine:
         """
         self._cancel_reason = reason
         self._cancel_event.set()
+
+    def _group_semaphore(self, group: str) -> threading.Semaphore | None:
+        """取（惰性创建）并发分组信号量（M6-3 Task 8）。
+
+        未声明组（空串）或 ``concurrency_limits`` 里没有该组 → 返回 None，
+        调用方不加锁。信号量首次在**工作线程**执行该组节点时创建；创建过程
+        用锁保护，避免并发首建出多个信号量而突破上限。
+        """
+        limit = self._concurrency_limits.get(group) if group else None
+        if not limit:
+            return None
+        with self._semaphore_lock:
+            sem = self._semaphores.get(group)
+            if sem is None:
+                sem = threading.Semaphore(limit)
+                self._semaphores[group] = sem
+        return sem
 
     # ------------------------------------------------------------------ #
     def run(self) -> RunReport:
@@ -605,6 +648,7 @@ class Engine:
             result.error,
             result.cache_key or None,
             result.started_at + result.duration,
+            result.duration,
         )
 
     def _mark_skipped(self, node_id: str, note: str) -> None:
@@ -657,12 +701,20 @@ class Engine:
         队列任务无法强杀 worker 侧算子——软超时限制不因远程而消失：到点抛
         ``TimeoutError`` 交给重试包装按普通失败处理，worker 侧算子可能仍在
         运行（与线程路径"底层线程仍在跑"的已知限制同语义）。
+
+        M6-3 Task 10：等待期间轮询运行级 ``cancel_event``（经 ``_QueueTask``
+        的取消支持）；置位则抛内部 ``_RemoteCancelled``——该异常不参与重试，
+        由 :meth:`_run_remote_node` 把节点标记为 skipped（取消不是失败）。
         """
         payload = self._remote_payload(node, params, inputs)
         assert self._executor_instance is not None  # 仅 _remote 模式进入
-        task = self._executor_instance.submit(_remote_run, payload)
+        task = self._executor_instance.submit(
+            _remote_run, payload, cancel_event=self._cancel_event
+        )
         try:
             data = task.result(timeout=timeout)
+        except CancelledError:
+            raise _RemoteCancelled(node.spec.id) from None
         except TimeoutError:
             raise TimeoutError(
                 f"节点 {node.spec.id} 远程执行超过 {timeout}s"
@@ -736,12 +788,20 @@ class Engine:
                     return result
 
             result.cache_key = cache_key or ""
-            data = self._attempt_loop(
-                node,
-                ctx,
-                result,
-                lambda: self._remote_once(node, params, inputs, node.spec.timeout),
-            )
+            # M6-3 Task 8：远程节点同样受并发分组限流（acquire 在工作线程内）
+            sem = self._group_semaphore(node.spec.concurrency_group)
+            if sem is not None:
+                sem.acquire()
+            try:
+                data = self._attempt_loop(
+                    node,
+                    ctx,
+                    result,
+                    lambda: self._remote_once(node, params, inputs, node.spec.timeout),
+                )
+            finally:
+                if sem is not None:
+                    sem.release()
             result.status = SUCCESS
             # worker 已把输出原子发布进共享目录；引擎侧从同一目录读回实际值
             raw = {
@@ -751,6 +811,10 @@ class Engine:
             result.outputs = {k: _describe(v) for k, v in raw.items()}
             if cache_key is not None:
                 self.cache.store(cache_key, raw)
+        except _RemoteCancelled:
+            # M6-3 Task 10：取消不再等待远程结果——标记 skipped，不算失败
+            result.status = SKIPPED
+            result.note = f"取消：不再等待远程节点 {node.spec.id}"
         except _NodeFailure as failure:
             result.status = FAILED
             result.error = f"{type(failure.cause).__name__}: {failure.cause}"
@@ -769,6 +833,8 @@ class Engine:
             result.duration = time.time() - result.started_at
             if result.status == FAILED:
                 ctx.logger.error("节点 %s 失败：%s", node.spec.id, result.error)
+            elif result.status == SKIPPED:
+                ctx.logger.info("节点 %s 跳过：%s", node.spec.id, result.note)
             else:
                 ctx.logger.info(
                     "节点 %s 完成（%.2fs%s）",
@@ -846,7 +912,16 @@ class Engine:
                     return result
 
             result.cache_key = cache_key or ""
-            outputs = self._execute_with_retry(instance, ctx, inputs, node, result)
+            # M6-3 Task 8：并发分组限流——acquire 在工作线程内、缓存命中判定
+            # 之后、实际执行之前（不阻塞调度线程）；异常路径同样释放配额。
+            sem = self._group_semaphore(node.spec.concurrency_group)
+            if sem is not None:
+                sem.acquire()
+            try:
+                outputs = self._execute_with_retry(instance, ctx, inputs, node, result)
+            finally:
+                if sem is not None:
+                    sem.release()
             result.status = SUCCESS
             result.outputs = {k: _describe(v) for k, v in outputs.items()}
 
@@ -903,6 +978,13 @@ class Engine:
         ``once`` 是"单次执行"callable（线程/进程路径传 ``_execute_once``，
         远程路径传 ``_remote_once``）——重试策略与执行方式解耦；
         ``ConfigError``（含引用解析错误）重试也没意义，直接抛。
+
+        M6-3 Task 9：``node.spec.retry_on`` 非空时，仅当 ``type(exc).__name__``
+        在该元组内才继续重试；未命中立即失败（attempts 停在当前次）。
+        配置类错误（ConfigError/ParamValidationError 等子类）永远先走上面的
+        ``except ConfigError`` 分支，不受 ``retry_on`` 影响。
+        远程路径的异常在引擎侧是 ``_RemoteFailure``（worker 侧类型名为打包文本），
+        需要按类型重试远程异常时应在 ``retry_on`` 里写 ``_RemoteFailure``。
         """
         attempts = max(0, node.spec.retries) + 1
         last_error: BaseException | None = None
@@ -913,8 +995,14 @@ class Engine:
             except ConfigError as exc:
                 # 配置/契约错误重试也没意义，直接抛
                 raise _NodeFailure(exc) from exc
+            except _RemoteCancelled:
+                # M6-3 Task 10：取消不是失败——不重试、不包装，交给远程节点收口
+                raise
             except Exception as exc:
                 last_error = exc
+                # M6-3 Task 9：条件重试——未命中类型立即失败，不再退避
+                if node.spec.retry_on and type(exc).__name__ not in node.spec.retry_on:
+                    break
                 if attempt >= attempts:
                     break
                 delay = max(0.0, node.spec.retry_delay) * (2 ** (attempt - 1))
@@ -1022,6 +1110,19 @@ class _RemoteFailure(Exception):
         super().__init__(str(data.get("error") or "远程执行失败"))
 
 
+class _RemoteCancelled(Exception):
+    """远程等待被取消（M6-3 Task 10）。
+
+    运行级 ``cancel_event`` 置位时由 ``_remote_once`` 抛出；它不参与重试、
+    不算失败——``_run_remote_node`` 捕获后把节点标记为 ``skipped`` 并写 note。
+    队列中的任务本身不会被撤回（worker 侧可能继续执行，软取消语义）。
+    """
+
+    def __init__(self, node_id: str) -> None:
+        self.node_id = node_id
+        super().__init__(f"取消：不再等待远程节点 {node_id}")
+
+
 # --------------------------------------------------------------------------- #
 # 便捷入口
 # --------------------------------------------------------------------------- #
@@ -1042,6 +1143,7 @@ def run_pipeline(
     hooks: list[Any] | None = None,
     run_id: str | None = None,
     logger: logging.Logger | None = None,
+    concurrency_limits: Mapping[str, int] | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """编译 + 执行一步到位，返回值与句柄表。
 
@@ -1060,6 +1162,9 @@ def run_pipeline(
     worker 可预先启动常驻消费）；或任意 ``Executor`` 实例（如
     ``QueueWorkerExecutor(...)`` / ``ThreadExecutor(...)``），引擎把节点执行分发到
     该实例，实例生命周期归调用方、引擎不 shutdown。
+    ``concurrency_limits``（M6-3 Task 8）节点并发分组上限：``{组名: 正整数}``，
+    与节点 ``concurrency_group`` 配合限制同组节点同时执行数；未声明组或未配置
+    限制的节点不受影响；非法值（<=0 / 非整数）抛 ``ConfigError``。
 
     典型的库内调用::
 
@@ -1082,7 +1187,8 @@ def run_pipeline(
     engine = Engine(plan, context, cache_store=cache_store, max_workers=max_workers,
                     fail_fast=fail_fast, cancel_event=cancel_event, executor=executor,
                     handle_store=handle_store, run_store=run_store,
-                    resume_run_id=resume_run_id, hooks=hooks)
+                    resume_run_id=resume_run_id, hooks=hooks,
+                    concurrency_limits=concurrency_limits)
     report = engine.run()
     return report, dict(engine.store.snapshot())
 
@@ -1104,6 +1210,7 @@ async def run_pipeline_async(
     hooks: list[Any] | None = None,
     run_id: str | None = None,
     logger: logging.Logger | None = None,
+    concurrency_limits: Mapping[str, int] | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """async 宿主嵌入（M2-8）：把同步引擎抛到事件循环的默认执行器里跑。
 
@@ -1144,5 +1251,6 @@ async def run_pipeline_async(
             hooks=hooks,
             run_id=run_id,
             logger=logger,
+            concurrency_limits=concurrency_limits,
         ),
     )
