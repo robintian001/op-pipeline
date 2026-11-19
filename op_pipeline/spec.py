@@ -29,6 +29,7 @@
     ``${p.<name>}``                          -> 流水线参数
     ``${env.<NAME>}``                        -> 环境变量（运行期解析）
     ``${env:NAME}`` / ``${env:NAME:-默认}``  -> 环境变量（解析期注入，可带默认值）
+    ``${param:NAME}`` / ``${param:NAME:-默认}`` -> 运行级参数（解析期注入，可带默认值）
 字符串中可混排（``"${p.dir}/${p.name}.json"``）。
 """
 from __future__ import annotations
@@ -148,6 +149,128 @@ def _resolve_env_params(
                 where = f"节点 [{node_id}]"
                 node_copy["params"] = {
                     key: _substitute_env_value(value, where, env, sensitive)
+                    for key, value in node_params.items()
+                }
+            new_nodes.append(node_copy)
+        data["nodes"] = new_nodes
+
+    return data, tuple(sensitive)
+
+
+# M8-2 Task 1：解析期运行级参数注入。``${param:NAME}`` /
+# ``${param:NAME:-default}`` 与 ``${env:...}`` 同框架、互不干扰：
+# 冒号前缀区分两类占位符，同一字符串可混排多个占位符，嵌套结构递归替换。
+_PARAM_PLACEHOLDER = re.compile(r"\$\{param:([^{}]*)\}")
+_PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _resolve_param_body(
+    body: str, where: str, lookup: Mapping[str, Any], sensitive: list[str]
+) -> Any:
+    """解析单个 ``${param:...}`` 占位符体，返回运行级参数值。"""
+    if ":-" in body:
+        name, default = body.split(":-", 1)
+    else:
+        name, default = body, None
+    if not _PARAM_NAME.fullmatch(name):
+        raise SpecValidationError(
+            [
+                f"{where} 的 ${{param:...}} 占位符语法错误：变量名 {name!r} 不合法"
+                "（应匹配 [A-Za-z_][A-Za-z0-9_]*）"
+            ]
+        )
+    if name in lookup:
+        value = lookup[name]
+        if _SENSITIVE_ENV_NAME.search(name):
+            # 敏感键沿用 M7-2 打码机制：值进 sensitive_values，报告里显示 ***
+            sensitive.append(str(value))
+        return value
+    if default is not None:
+        return default
+    raise SpecValidationError(
+        [
+            f"{where} 引用的运行级参数 '{name}' 未注入（占位符 ${{param:{name}}}）；"
+            f"可写成 ${{param:{name}:-默认值}}"
+        ]
+    )
+
+
+def _substitute_param_text(
+    text: str, where: str, lookup: Mapping[str, Any], sensitive: list[str]
+) -> Any:
+    """替换单个字符串里的 ``${param:...}`` 占位符。
+
+    整串恰好是一个占位符时保留参数值原类型（如 int/list/dict）；
+    否则按字符串插值拼接。
+    """
+    whole = _PARAM_PLACEHOLDER.fullmatch(text)
+    if whole:
+        return _resolve_param_body(whole.group(1), where, lookup, sensitive)
+
+    def replace(match: re.Match[str]) -> str:
+        return str(_resolve_param_body(match.group(1), where, lookup, sensitive))
+
+    result = _PARAM_PLACEHOLDER.sub(replace, text)
+    if "${param:" in result:
+        raise SpecValidationError(
+            [f"{where} 的 ${{param:...}} 占位符语法错误：未闭合（缺少 '}}'）"]
+        )
+    return result
+
+
+def _substitute_param_value(
+    value: Any, where: str, lookup: Mapping[str, Any], sensitive: list[str]
+) -> Any:
+    """递归替换参数值中的运行级参数占位符（仅处理字符串）。"""
+    if isinstance(value, str):
+        return _substitute_param_text(value, where, lookup, sensitive)
+    if isinstance(value, list):
+        return [_substitute_param_value(item, where, lookup, sensitive) for item in value]
+    if isinstance(value, Mapping):
+        return {
+            key: _substitute_param_value(item, where, lookup, sensitive)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _resolve_param_refs(
+    raw: Mapping[str, Any], injected: Mapping[str, Any] | None
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """解析期替换顶层 ``params`` 与各节点 ``params`` 中的运行级参数占位符。
+
+    查找表 = 配置 ``[params]`` 段（已完成 env 替换）与注入的运行级参数合并，
+    注入优先。注入的参数随后合并进顶层 ``params``（同样注入优先），
+    使 ``build_plan(overrides=...)`` 与运行报告可见。
+    """
+    sensitive: list[str] = []
+    data = dict(raw)
+    injected = dict(injected) if injected else {}
+
+    config_params = data.get("params")
+    config_params = dict(config_params) if isinstance(config_params, Mapping) else {}
+    resolved_params = {
+        key: _substitute_param_value(
+            value, f"流水线参数 '{key}'", {**config_params, **injected}, sensitive
+        )
+        for key, value in config_params.items()
+    }
+    data["params"] = {**resolved_params, **injected}
+
+    nodes = data.get("nodes")
+    if isinstance(nodes, list):
+        new_nodes: list[Any] = []
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                new_nodes.append(node)
+                continue
+            node_copy = dict(node)
+            node_id = node.get("id") or node.get("name") or "?"
+            node_params = node_copy.get("params")
+            if isinstance(node_params, Mapping):
+                where = f"节点 [{node_id}]"
+                node_copy["params"] = {
+                    key: _substitute_param_value(value, where, data["params"], sensitive)
                     for key, value in node_params.items()
                 }
             new_nodes.append(node_copy)
@@ -504,6 +627,7 @@ class PipelineSpec:
         base_dir: str | Path | None = None,
         *,
         env: Mapping[str, str] | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> "PipelineSpec":
         if not isinstance(raw, Mapping):
             raise ConfigError("流水线配置根节点必须是对象")
@@ -513,6 +637,9 @@ class PipelineSpec:
         raw, sensitive_values = _resolve_env_params(
             raw, os.environ if env is None else env
         )
+        # M8-2 Task 1：${param:NAME} / ${param:NAME:-default} 运行级参数占位符
+        # 同样在解析期替换；注入的参数合并进顶层 params（注入优先）
+        raw, param_sensitive = _resolve_param_refs(raw, params)
         _warn_unknown_keys("流水线配置", raw, cls._KNOWN_KEYS)
         nodes_raw = raw.get("nodes") or []
         if not isinstance(nodes_raw, list):
@@ -532,7 +659,7 @@ class PipelineSpec:
             nodes=[NodeSpec.from_dict(n, defaults=defaults) for n in nodes_raw],
             outputs={str(k): str(v) for k, v in (raw.get("outputs") or {}).items()},
             defaults=defaults,
-            sensitive_values=sensitive_values,
+            sensitive_values=sensitive_values + param_sensitive,
         )
 
     # ------------------------------------------------------------------ #
@@ -559,11 +686,15 @@ class PipelineSpec:
 
     @classmethod
     def from_file(
-        cls, path: str | Path, *, env: Mapping[str, str] | None = None
+        cls,
+        path: str | Path,
+        *,
+        env: Mapping[str, str] | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> "PipelineSpec":
         path = Path(path).expanduser()
         data = _load_raw(path)
-        return cls.from_dict(data, base_dir=path.parent, env=env)
+        return cls.from_dict(data, base_dir=path.parent, env=env, params=params)
 
     def to_dict(self) -> dict[str, Any]:
         return {

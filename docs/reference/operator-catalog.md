@@ -1,6 +1,6 @@
 # 内置算子契约清单
 
-共 50 个算子（44 个零依赖内置 + 6 个可选依赖的 Parquet/Excel/Arrow 算子），按 `ops/` 下的文件分组。字段约定：
+共 59 个算子（53 个零依赖内置 + 6 个可选依赖的 Parquet/Excel/Arrow 算子），按 `ops/` 下的文件分组。字段约定：
 
 - **入 / 出**：`名字:类型`，`?` 表示 optional（未接线时收到 `None`）；
 - **参数**：`*` 表示必填；未标默认值即必填；
@@ -29,7 +29,7 @@
 
 ---
 
-## 2. 表（table_ops.py，11 个）
+## 2. 表（table_ops.py，12 个）
 
 | 算子 | 入 | 出 | 参数 |
 | --- | --- | --- | --- |
@@ -44,6 +44,7 @@
 | `table.join` | `left` `right` | `table:list` `matched:int` | `left_key*`、`right_key=None`、`how="inner"`（`inner`/`left`/`right`/`full`）、`suffix="_right"` |
 | `table.union` | `left` `right` | `table:list` | `distinct=false` |
 | `table.take_column` | `table` | `values:list` `count:int` | `column*`、`skip_null=true` |
+| `table.explode` | `table` | `table:list` `rows:int` | `column*`、`index_column=None`、`keep_empty=false` |
 
 行为要点与坑：
 
@@ -60,6 +61,9 @@
 - **derive_column**：`overwrite=false` 且列已存在时报错；表达式结果直接写入，不做类型推断。
 - **dedupe**：`keys=None` 时按整行（键排序后）判重；`keep="last"` 会原位替换。
 - **select_columns**：空表直接返回空表，不校验列名。
+- **explode**：把 list 列展开成多行（每个元素一行，其余列复制）；列不存在抛 `KeyError`、
+  值不是 list 抛 `ValueError`；`keep_empty=false`（默认）时空 list 的行被丢弃，
+  `true` 时保留一行、该列值为 `None`；`index_column` 给出时写入原始行索引（int，从 0 起）。
 
 ---
 
@@ -254,7 +258,103 @@ pyarrow（`pip install op-pipeline[parquet]`）与 openpyxl（`pip install op-pi
 
 ---
 
-## 11. 示例插件算子（examples/plugins/demo_ops.py）
+## 11. 时间（datetime_ops.py，3 个）
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `time.parse` | `text:str` | `datetime:str` `ts:float` | `format=None` |
+| `time.shift` | `text:str?` `ts:float?` | `datetime:str` `ts:float` | `days=0`、`hours=0`、`minutes=0`、`seconds=0` |
+| `time.now` | — | `datetime:str` `ts:float` `date:str` | — |
+
+行为要点：
+
+- **双视图约定**：`datetime` 是 ISO 8601 文本（`datetime.isoformat()`），`ts` 是 Unix 时间戳
+  （秒，float），同一时刻的两种等价形态；
+- `time.parse` 缺省按 `datetime.fromisoformat` 解析（Python ≥3.11 支持 `Z` 后缀），
+  给 `format` 时按 `strftime` 解析；非法输入抛 `ValueError`（可重试类错误）；
+- `time.shift` 的 `text` 与 `ts` 两个 optional 输入至少接一个（都接时优先用 `text`）；
+  朴素时间（无时区）按本地时区换算时间戳；
+- **`time.now` 标记 `deterministic=False`（外部状态）**：即使节点配置 `cache=True`
+  也永不落入节点缓存，与 http/db 算子同策略；`date` 为本地日期（YYYY-MM-DD）。
+
+---
+
+## 12. JSON 结构（json_ops.py，1 个）
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `json.flatten` | `data:dict` | `data:dict` `count:int` | `sep="."`、`max_depth=0`（0 表示不限） |
+
+行为要点：
+
+- 嵌套 dict 按 `sep` 拼接路径展开为一层：`{"a": {"b": 1}}` → `{"a.b": 1}`；
+- **list 值作为叶子原样保留，不展开**；空 dict 也保留为叶子（避免键被吞掉）；
+- `max_depth=N` 表示最多展开 N 层嵌套（`1` = 只展开顶层嵌套 dict 一层）；
+  输出键一律为字符串路径；`count` 是叶子数（= 扁平化后的键数）。
+
+---
+
+## 13. 数据质量（quality_ops.py，3 个）
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `quality.null_check` | `table:list` | `table:list` `violations:list` | `columns*`（str 或 list）、`max_null_ratio=0.0`、`mode="error"`（`error`/`warn`） |
+| `quality.unique` | `table:list` | `table:list` `violations:list` | `keys*`（str 或 list）、`mode="error"`（`error`/`warn`） |
+| `quality.schema_check` | `table:list` | `table:list` `violations:list` | `expected*:dict`、`strict_columns=false`、`mode="error"`（`error`/`warn`） |
+
+行为要点：
+
+- 三算子契约统一：**`table` 原样透传**，违例明细进 `violations`
+  （dict 形态，含违例类型、列名、行索引与样例行等上下文）；
+- `mode` 双模式：`"error"` 发现违例抛 `AssertionError`（与 `control.assert` 同类，
+  会按 `retries` 重试——质检门禁场景建议 `retries=0`）；`"warn"` 只输出明细不抛错；
+- 空值定义：`None` 与空白字符串算空值（`0`/`False` 不算）；空值率 = 空值行数 / 总行数
+  （空表恒为 0，不算违例）；`null_check` 的列不存在抛 `KeyError`；
+- `unique` 按 keys 组合判重，`violations` 最多列前 10 组重复键（含重复次数与样例行）；
+- `schema_check` 类型名白名单 `str|int|float|bool|list|dict|any`，非法名抛 `ValueError`
+  （配置错误）；**`None` 值跳过类型检查**（空值归 `null_check` 管）；`bool` 是 `int` 的子类，
+  声明 `"int"` 时 bool 视为类型不符，int 也不当作 float；`strict_columns=true` 时表缺列
+  也算违例；空表不产生违例。
+
+---
+
+## 14. 编排（pipeline_ops.py，1 个）
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `pipeline.run` | — | `result:any` `report:dict` `run_id:str` | `config*`（str）、`node*`（str）、`handle=None`（str）、`params=None`（dict）、`plugins=None`（list）、`on_error="propagate"`（str） |
+
+行为要点：
+
+- 在节点内执行另一份子流水线配置（经顶层 `run()` 惰性调用），把子配置
+  当作"大算子"编排复用；`config` 相对本流水线工作目录解析；
+- `result` 取子流水线中 `node` 指定节点的输出句柄值；`handle=None` 时取该
+  节点**第一个输出端口**（按算子 ports 声明顺序）；节点若重命名了输出
+  （`outputs` 映射），按映射后的句柄名取值；
+- `report` 是子 run 摘要 dict：`run_id`/`status`/`duration`/`node_count`
+  （节点数）/`failed_nodes`（失败节点 id 列表）；`run_id` 端口单独给出。
+  **子 run 的完整报告不并入父报告与 artifacts**，只保留摘要；
+- `params` 注入子流水线运行级参数，子配置中的 `${param:NAME}` /
+  `${param:NAME:-默认}` 占位符在解析期替换；`plugins` 为子配置插件文件
+  路径列表（相对子配置所在目录解析），透传给子 run；
+- **防环**：thread-local 执行栈记录正在执行的子配置绝对路径（经子 run 的
+  `on_node_start` 钩子跨线程传递），目标配置已在栈中即抛 `ConfigError`，
+  信息含完整循环链路（如 `a.json -> b.json -> a.json`）；
+- **深度上限 5**：`pipeline.run` 最多同时嵌套 5 层，超限抛 `ConfigError`
+  （信息含当前深度与上限）；子进程执行器无法继承进程内存，防环仅在
+  进程内生效；
+- 子 run 失败（`status != success`）→ 父节点失败：抛 `RuntimeError`，
+  错误信息含子 run_id、状态与失败节点 id 列表（并附失败详情便于排障）；
+- 目标节点不存在、`handle` 不在该节点输出中 → `ConfigError`（含配置路径、
+  节点 id、可用端口），且在执行子流水线**之前**预检，错配置尽早失败；
+- `on_error` 仅支持 `"propagate"`（子失败即父失败），其他值抛 `ValueError`；
+- **`deterministic=False`**：子流水线可能含任意（含非确定性）算子，结果
+  永不落入节点缓存——即使节点声明 `cache=true`，每次运行都会真实执行
+  子流水线。
+
+---
+
+## 15. 示例插件算子（examples/plugins/demo_ops.py）
 
 不属于内置算子，需 `--plugin plugins/demo_ops.py`（`--plugin` 路径相对配置文件所在目录解析）后可用：
 

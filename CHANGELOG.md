@@ -5,6 +5,47 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-19
+
+### Added
+
+- 编排组合与参数化（M8-1）：配置字符串参数支持解析期 `${param:NAME}` /
+  `${param:NAME:-default}` 运行级注入（`PipelineSpec.from_dict/from_file` 新增 `params`
+  参数，注入优先于配置顶层 `[params]` 段；缺失且无默认值抛 `SpecValidationError`），
+  CLI `run` 新增 `--param key=value`（可重复、后者覆盖、值尝试 JSON 解析，敏感键沿用
+  M7-2 打码规则）；新增子流水线算子 `pipeline.run`（`config`/`node`/`handle`/`params`/
+  `plugins`/`on_error`，thread-local 执行栈防循环引用、嵌套深度上限 5、永不缓存，
+  子 run 失败按 `on_error` 传播含摘要）。
+- 调度器依赖触发（M8-1）：`pipeline` 条目支持 `str | {"path", "after"}`，每轮按拓扑
+  触发——依赖本轮全部 success 才执行，否则跳过并记 info 日志；依赖名未知启动期
+  warning；`run_scheduler` 新增 CLI `--after name=dep1,dep2`（可重复）；无 `after`
+  时行为与 v0.8.0 一致。
+- 开发者体验（M8-2）：CLI `run` 新增 `--sample N` 采样预览——输入解析处对 list 句柄
+  截断为前 N 行，dict/str 原样，采样模式下缓存读写禁用，报告 run 级 `sample_rows`
+  与节点级 `sampled` 标注；新增节点行数血缘 `rows_in`/`rows_out`（`lineage=False`
+  可关）；新增 `explain <cfg> [--param ...] [--node] [--json]` 只读解析预览
+  （不执行节点、零文件产出）。
+- 观测性深化（M8-3）：Web UI 详情页新增甘特式节点执行时间线（内联 SVG/CSS 零外部
+  资源）与节点表 In/Out 行数列，`/compare` 新增行数差异列（`+/-` 标注，单侧标注
+  "仅 A/仅 B"）；新增 `events <file.jsonl>` 事件流查询 CLI（按 run/node/event 过滤、
+  `--last N`、`--summary` 聚合表格、损坏行容错）；`RunStore` nodes 表补
+  `rows_in`/`rows_out` 列（旧库幂等自动迁移）。
+- 算子库存扩展（M8-4）：新增时间算子 `time.parse` / `time.shift` / `time.now`
+  （`ops/datetime_ops.py`）、JSON 扁平化 `json.flatten` 与列展开 `table.explode`
+  （`ops/json_ops.py` 新模块 + table_ops）、数据质量算子 `quality.null_check` /
+  `quality.unique` / `quality.schema_check`（`ops/quality_ops.py`，error/warn 双模式），
+  全部零第三方依赖。
+
+### Changed
+
+- 算子总数 50 → 59（53 个零依赖内置 + 6 个可选依赖）；新增示例
+  `examples/pipeline_subpipeline.json` + `examples/pipeline_subpipeline_child.json`
+  演示父调子与参数注入。
+- 兼容性：报告 schema 变更全部为加法（run 级 `sample_rows`、节点级
+  `sampled`/`rows_in`/`rows_out`），未改动或删除任何既有键；新参数全部可选
+  （`params`/`sample_rows`/`lineage`/`--param`/`--sample`/`after` 等），
+  默认行为与 v0.8.0 一致。
+
 ## [0.8.0] - 2026-11-19
 
 ### Added

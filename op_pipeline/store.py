@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     cache_key   TEXT,
     finished_at REAL NOT NULL,
     duration    REAL DEFAULT 0,
+    rows_in     TEXT,
+    rows_out    TEXT,
     PRIMARY KEY (run_id, node_id)
 );
 """
@@ -56,6 +58,7 @@ class RunStore:
             return
         self.conn.executescript(_SCHEMA)
         self._migrate_nodes_duration()
+        self._migrate_nodes_rows()
         self._tables_ready = True
 
     def _migrate_nodes_duration(self) -> None:
@@ -63,6 +66,19 @@ class RunStore:
         columns = [row[1] for row in self.conn.execute("PRAGMA table_info(nodes)")]
         if "duration" not in columns:
             self.conn.execute("ALTER TABLE nodes ADD COLUMN duration REAL DEFAULT 0")
+            self.conn.commit()
+
+    def _migrate_nodes_rows(self) -> None:
+        """M8 Task 9.1：旧库 nodes 表补 ``rows_in``/``rows_out`` 列（幂等；旧行取 NULL）。"""
+        columns = [row[1] for row in self.conn.execute("PRAGMA table_info(nodes)")]
+        added = False
+        if "rows_in" not in columns:
+            self.conn.execute("ALTER TABLE nodes ADD COLUMN rows_in TEXT")
+            added = True
+        if "rows_out" not in columns:
+            self.conn.execute("ALTER TABLE nodes ADD COLUMN rows_out TEXT")
+            added = True
+        if added:
             self.conn.commit()
 
     def record_run(
@@ -97,16 +113,30 @@ class RunStore:
         cache_key: str | None,
         finished_at: float,
         duration: float = 0.0,
+        rows_in: Mapping[str, int] | None = None,
+        rows_out: Mapping[str, int] | None = None,
     ) -> None:
-        """写入单节点结果；``duration`` 为可选末尾参数（兼容既有位置调用）。"""
+        """写入单节点结果；``duration``/``rows_in``/``rows_out`` 为可选末尾参数（兼容既有位置调用）。
+
+        ``rows_in``/``rows_out`` 为行数血缘（M8 Task 9.1）：None 或空 dict 写 NULL，
+        非空 dict 以 JSON 文本落库——与报告"无键 ↔ NULL"语义对应。
+        """
         self._ensure_tables()
+        rows_in_json = (
+            json.dumps(rows_in, ensure_ascii=False, sort_keys=True) if rows_in else None
+        )
+        rows_out_json = (
+            json.dumps(rows_out, ensure_ascii=False, sort_keys=True)
+            if rows_out
+            else None
+        )
         self.conn.execute(
             "INSERT OR REPLACE INTO nodes "
             "(run_id, node_id, op, status, attempts, cached, error, cache_key, "
-            "finished_at, duration) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "finished_at, duration, rows_in, rows_out) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (run_id, node_id, op, status, attempts, int(cached), error, cache_key,
-             finished_at, duration),
+             finished_at, duration, rows_in_json, rows_out_json),
         )
         self.conn.commit()
 

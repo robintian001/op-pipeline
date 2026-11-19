@@ -18,7 +18,7 @@
 | `name` | str | `"pipeline"` | 流水线名，进入报告 |
 | `version` | str | `"1"` | 流水线版本，进入报告 |
 | `description` | str | `""` | 备注 |
-| `params` | object | `{}` | 流水线参数；可被 `--param` 覆盖；值中可用 `${env.X}`（运行期解析）或 `${env:NAME}`（解析期替换，见 §3.1） |
+| `params` | object | `{}` | 流水线参数；可被 `--param` 覆盖；值中可用 `${env.X}`（运行期解析）、`${env:NAME}`（解析期替换，见 §3.1）或 `${param:NAME}`（解析期运行级注入，见 §3.2） |
 | `nodes` | array | 必填 | 节点列表，**顺序无关**（执行由引用推导的依赖决定） |
 | `outputs` | object | `{}` | 流水线对外产物：名字 → `${...}` 引用 |
 | `includes` | array\<str\> | `[]` | **配置组合**（M3-7）：相对本文件所在目录的配置文件路径数组，按顺序加载并合并（`params`/`defaults`/`outputs` 逐键覆盖、`nodes` 拼接），主配置优先；节点 id 跨文件重复报错；子配置自身也可 `includes`（按自身目录解析）；循环引用报错；仅 `from_file` 或显式 `base_dir` 可用 |
@@ -58,12 +58,36 @@
 | `cache_max_entries` | int | `None`（不限） | **v0.8 新增，可选**：缓存条目上限，每次写入后按 mtime 淘汰最旧 `*.pkl`（等价于 `CacheStore(max_entries=...)`）；须为正整数，否则 `ValueError` |
 | `cache_max_bytes` | int | `None`（不限） | **v0.8 新增，可选**：缓存总字节上限，与条目上限同时生效（等价于 `CacheStore(max_bytes=...)`）；须为正整数，否则 `ValueError` |
 | `spill_warn_bytes` | int | `None`（不告警） | **v0.8 新增，可选**：运行结束时 spill 落盘目录占用告警阈值（字节），超过只向 `report.warnings` 追加中文提示，不改变 status/outputs |
+| `params` | dict | `None` | **v0.9 新增，可选**：运行级参数注入 map（`PipelineSpec.from_dict/from_file(params=...)` / `run(config, params=...)` / CLI `--param KEY=VALUE`），解析期与配置顶层 `[params]` 合并、**注入优先**，供 `${param:NAME}` 占位符解析；注入的键随后合并进顶层 `params`；缺失且无默认值的占位符抛 `SpecValidationError`（见 §3.2） |
+| `sample_rows` | int | `None`（不采样） | **v0.9 新增，可选**：采样预览行数（`run(config, sample_rows=N)` / CLI `--sample N`，须 ≥1 整数否则 `ValueError`）：输入解析处把 list 句柄截断为前 N 行，dict/str/其他类型原样；采样模式下缓存读写全部禁用；报告 run 级 `sample_rows` 与节点级 `sampled` 标注（语义详见 runtime-semantics §采样） |
+| `lineage` | bool | `True` | **v0.9 新增，可选**：节点行数血缘开关（`run(config, lineage=False)` 可关）。开启时报告 nodes[] 平铺 `rows_in`/`rows_out` 两个 dict（端口名 → list 句柄行数）；`False` 时报告中不含这两个键，行为与 v0.8.0 一致 |
 
 > **行为变更（M3-3，T15 治理）**：`table.select_columns` / `table.sort_rows` /
 > `table.derive_column` / `table.join` 的列判定从"首行代表全表列"改为**全表列集合并集**。
 > 影响：列只在非首行出现的参差行不再丢字段或误报——例如
 > `select_columns(missing="error")` 不再因目标列"不在首行"而报错，会保留该列并给缺失行补 `None`；
 > `sort_rows` 的排序键出现在任何一行即有效。正常（列齐整）表的执行结果不变。
+
+### 2.2 `pipeline.run` 子流水线节点（v0.9）
+
+`pipeline.run` 把一份子配置当作"大算子"在节点内执行：父流水线节点参数见下表，
+输出端口为 `result`（子节点取到的句柄值，可任意类型）/ `report`（子 run 摘要
+dict：`run_id`/`status`/`duration`/`node_count`/`failed_nodes`）/ `run_id`（子运行标识）。
+完整示例见 `examples/pipeline_subpipeline.json`（父）+ `examples/pipeline_subpipeline_child.json`（子）：
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `config` | str | 必填 | 子配置文件路径，经 `ctx.resolve_path()` 解析（相对父流水线工作目录，即父配置所在目录） |
+| `node` | str | 必填 | 子流水线中取输出的节点 id |
+| `handle` | str | `None` | 子节点的输出端口名；`None` 表示取第一个输出端口（按算子端口声明顺序） |
+| `params` | dict | `None` | 注入子流水线的运行级参数（等价于给子配置传 `--param`），值可含 `${param:NAME}` 占位符 |
+| `plugins` | list | `None` | 子配置插件文件路径列表（相对子配置所在目录解析） |
+| `on_error` | str | `"propagate"` | 子 run 失败的处理策略，仅支持 `propagate`（子失败即父节点失败，错误含子 run_id/状态/失败节点列表） |
+
+约束：thread-local 执行栈防循环引用（如 a → b → a 报 `ConfigError` 且含完整引用链路）；
+嵌套深度上限 5 层；`deterministic=False`，子流水线结果**永不落入节点缓存**；
+子 run 完整报告与 artifacts 不并入父报告。目标节点/端口不存在或子配置缺失在执行前
+预检报错（不产生子 run 副作用）。
 
 ---
 
@@ -76,6 +100,8 @@
 | `${stats.stats.最长行}` | 句柄下钻：dict 键 / list 下标，最长前缀优先 | 运行期 |
 | `${p.min_amount}` / `${params.x}` | 流水线参数 | 编译期（参数表）/ 运行期 |
 | `${env.HOME}` | 环境变量 | 编译期（参数表）/ 运行期 |
+| `${env:NAME}` / `${env:NAME:-默认值}` | 解析期环境变量替换（§3.1） | 解析期 |
+| `${param:NAME}` / `${param:NAME:-默认值}` | 运行级参数注入（§3.2，v0.9） | 解析期 |
 | `"${p.dir}/report.md"` | 字符串混排，逐段替换并转字符串 | 取决于所在字段 |
 
 补充规则：
@@ -97,6 +123,26 @@
   "单引用保留原始类型"等规则；冒号形式只在解析期做文本替换，二者互不干扰。
 - **敏感值打码**：变量名匹配 `TOKEN|SECRET|PASSWORD|KEY`（不区分大小写）时，替换值记为敏感值；
   运行报告 `RunReport.params` 中键名命中该规则、或值包含敏感值的参数显示 `***`（执行期真实值不变）。
+
+### 3.2 解析期运行级参数：`${param:NAME}` / `${param:NAME:-默认值}`（v0.9）
+
+- **语法**：与 `${env:...}` 同框架、互不干扰——`${param:NAME}` 取运行级参数 `NAME`；
+  `${param:NAME:-默认值}` 在未提供时使用 `:-` 之后的默认值。变量名须匹配
+  `[A-Za-z_][A-Za-z0-9_]*`，占位符未闭合/空名/变量名非法报语法错误。
+- **注入来源**：`PipelineSpec.from_dict/from_file(params=...)`、`run(config, params=...)` 或
+  CLI `run --param KEY=VALUE`（可重复、后者覆盖、值先尝试 `json.loads` 失败按字符串）。
+- **解析时机与优先级**：在 `PipelineSpec.from_dict` **解析期**完成替换（覆盖顶层 `params`
+  与各节点 `params`，递归展开 `list`/`dict` 内的字符串），早于编译与执行；查找顺序为
+  **运行级注入优先于配置顶层 `[params]` 段**；注入的键随后合并进顶层 `params`
+  （同名覆盖），因此对 `build_plan` 而言是"已定义参数"，仍可被 `overrides` 再次覆盖。
+- **类型**：整个字符串**恰为一个** `${param:...}` 占位符时保留注入值的原始类型
+  （如 CLI `--param LIMIT=3` 后 `"${param:LIMIT}"` 得到 int `3`）；`:-` 默认值字面量
+  是字符串，经 `Param` 归一落到声明类型（如 `n = "${param:LIMIT:-5}"` → int `5`）；
+  字符串混排逐段替换并转 str（如 `where = "v >= ${param:LIMIT:-5}"`）。
+- **错误**：缺失且无默认值抛 `SpecValidationError`，消息含变量名与位置
+  （`流水线参数 'x'` 或 `节点 [id]`）。
+- **敏感值打码**：沿用 M7-2 规则——注入键名匹配 `TOKEN|SECRET|PASSWORD|KEY`
+  （不区分大小写）时，`RunReport.params` 中显示 `***`。
 
 ---
 
@@ -187,6 +233,9 @@ python -m op_pipeline scaffold op <name> [--dir <path>]
 python -m op_pipeline graph    <config> [--format mermaid|dot|ascii]
 python -m op_pipeline ops      [--json]
 python -m op_pipeline describe <op_name>
+python -m op_pipeline explain  <config> [--param KEY=VALUE ...] [--node <id>] [--json]
+python -m op_pipeline events   <file.jsonl> [--run-id ID] [--node ID]
+                               [--event node_start|node_finish|run_finish] [--last N] [--summary]
 python -m op_pipeline worker   --queue <file> [选项]
 python -m op_pipeline queue compact --queue <file> --out <dir> [--archive <file>]
 ```
@@ -194,7 +243,8 @@ python -m op_pipeline queue compact --queue <file> --out <dir> [--archive <file>
 `run` 选项：`--workdir`、`--workers`、`--cache-dir`（默认 `.pipeline_cache`）、`--no-cache`、
 `--cache-max-entries`、`--cache-max-bytes`、`--spill-warn-bytes`、`--fail-fast`、`--dry-run`、
 `--json PATH`、`--runs DB`、`--resume RUN_ID`、`--executor {thread,process,queue}`、
-`--plugin PATH`（可多次，相对配置文件所在目录解析）、`--param KEY=VALUE`（可多次）、`-v`。
+`--plugin PATH`（可多次，相对配置文件所在目录解析）、`--param KEY=VALUE`（可多次）、
+`--sample N`（v0.9 采样预览，语义见 §2.1）、`-v`。
 
 `validate` 只加载/编译/契约校验，不执行、不写输出；`--json` 输出
 `{"ok","errors","warnings","nodes":[{"id","op"}]}`。
@@ -285,4 +335,6 @@ groups = "${agg.groups}"
 ```
 
 更完整的示例见仓库 `examples/` 目录（`pipeline_orders.json` 18 节点含 fan-out，
-`pipeline_orders.toml` 11 节点主链路，`pipeline_text.toml` 插件 + 重试 + 句柄下钻）。
+`pipeline_orders.toml` 11 节点主链路，`pipeline_text.toml` 插件 + 重试 + 句柄下钻，
+`pipeline_subpipeline.json` + `pipeline_subpipeline_child.json` 子流水线编排与
+`${param:...}` 运行级参数注入）。

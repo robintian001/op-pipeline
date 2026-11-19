@@ -118,6 +118,7 @@ def run(
     *,
     workdir: str | Path | None = None,
     overrides: Mapping[str, Any] | None = None,
+    params: Mapping[str, Any] | None = None,
     cache_dir: str | Path | None = ".pipeline_cache",
     max_workers: int | None = None,
     fail_fast: bool = False,
@@ -134,6 +135,8 @@ def run(
     cache_max_entries: int | None = None,
     cache_max_bytes: int | None = None,
     spill_warn_bytes: int | None = None,
+    sample_rows: int | None = None,
+    lineage: bool = True,
 ) -> tuple[RunReport, dict[str, Any]]:
     """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。
 
@@ -161,6 +164,11 @@ def run(
       写入后按 mtime 淘汰最旧条目；默认 None = 不限。
     - ``spill_warn_bytes``（M7-4 Task 12）：spill 落盘目录占用告警阈值，
       运行结束超过时写入 ``report.warnings``；默认 None = 不告警。
+    - ``params``（M8-2 Task 1）：运行级参数注入 map，配置里的
+      ``${param:NAME}`` / ``${param:NAME:-默认}`` 占位符在解析期用它与配置
+      ``[params]`` 段合并（注入优先）替换；注入的键随后合并进顶层 params。
+    - ``sample_rows``（M8-2 Task 4）：采样预览行数，语义详见 :func:`run_pipeline`。
+    - ``lineage``（M8-2 Task 5）：行数血缘开关（默认开启）。
     """
     config_path = Path(config).expanduser().resolve()
     load_plugins(
@@ -169,7 +177,7 @@ def run(
         base_dir=config_path.parent,
         registry=registry,
     )
-    spec = PipelineSpec.from_file(config_path)
+    spec = PipelineSpec.from_file(config_path, params=params)
     return run_pipeline(
         spec,
         registry=registry if registry is not None else default_registry,
@@ -188,6 +196,8 @@ def run(
         cache_max_entries=cache_max_entries,
         cache_max_bytes=cache_max_bytes,
         spill_warn_bytes=spill_warn_bytes,
+        sample_rows=sample_rows,
+        lineage=lineage,
     )
 
 

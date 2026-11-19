@@ -121,9 +121,15 @@ class NodeResult:
     cache_key: str = ""
     # M2-6：断点续跑命中（缓存条目 + 参考 run 的成功记录 + key 一致）时为 True
     resumed: bool = False
+    # M8-2 Task 5：行数血缘——list 类型端口在输入解析后（含采样截断）与输出
+    # 发布时的实际行数；非 list 端口不记录。lineage=False 时不采集。
+    rows_in: dict[str, int] = field(default_factory=dict)
+    rows_out: dict[str, int] = field(default_factory=dict)
+    # M8-2 Task 4：采样预览模式运行时为 True（报告标注；非采样不出现该键）
+    sampled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "id": self.node_id,
             "op": self.op,
             "status": self.status,
@@ -136,6 +142,12 @@ class NodeResult:
             "note": self.note,
             "traceback": self.traceback,
         }
+        if self.rows_in or self.rows_out:
+            data["rows_in"] = dict(self.rows_in)
+            data["rows_out"] = dict(self.rows_out)
+        if self.sampled:
+            data["sampled"] = True
+        return data
 
 
 @dataclass
@@ -151,6 +163,8 @@ class RunReport:
     warnings: list[str] = field(default_factory=list)
     params: dict[str, Any] = field(default_factory=dict)
     artifacts_dir: str = ""
+    # M8-2 Task 4：采样预览行数；None = 非采样模式（报告不出现该字段）
+    sample_rows: int | None = None
 
     @property
     def duration(self) -> float:
@@ -167,7 +181,7 @@ class RunReport:
         raise KeyError(node_id)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "pipeline": self.pipeline,
             "version": self.version,
             "run_id": self.run_id,
@@ -176,9 +190,13 @@ class RunReport:
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self.started_at)),
             "params": self.params,
             "outputs": self.outputs,
-            "warnings": self.warnings,            "artifacts_dir": self.artifacts_dir,
+            "warnings": self.warnings,
+            "artifacts_dir": self.artifacts_dir,
             "nodes": [n.to_dict() for n in self.nodes],
         }
+        if self.sample_rows is not None:
+            data["sample_rows"] = self.sample_rows
+        return data
 
     def to_json(self, path: str | Path) -> Path:
         import json
@@ -272,6 +290,8 @@ class Engine:
         resume_run_id: str | None = None,
         hooks: list[Any] | None = None,
         concurrency_limits: Mapping[str, int] | None = None,
+        sample_rows: int | None = None,
+        lineage: bool = True,
     ) -> None:
         # M5-1：运行级执行器三元态——字符串选择器 / Executor 实例 / None（默认线程池）。
         if isinstance(executor, str) and executor not in ("thread", "process", "queue"):
@@ -282,9 +302,24 @@ class Engine:
                 "Executor 协议（submit/wait/shutdown）的实例，"
                 f"实际是 {type(executor).__name__}"
             )
+        # M8-2 Task 4：采样预览——sample_rows 必须是 ≥1 的整数（bool 不算）；
+        # None = 正常运行（默认行为与 v0.8.0 一致）
+        if sample_rows is not None and (
+            isinstance(sample_rows, bool)
+            or not isinstance(sample_rows, int)
+            or sample_rows < 1
+        ):
+            raise ValueError(f"sample_rows 必须是 ≥1 的整数，实际是 {sample_rows!r}")
         self.plan = plan
         self.context = context
-        self.cache = cache_store or CacheStore(None)
+        # M8-2 Task 5：行数血缘开关（默认开启）；False 时报告节点不含 rows_in/rows_out
+        self.lineage = lineage
+        self.sample_rows = sample_rows
+        # M8-2 Task 4：采样模式下缓存读写全部禁用——预览结果不落缓存，
+        # 也不读旧缓存（调用方传入的 cache_store 被替换为禁用实例）
+        self.cache = (
+            CacheStore(None) if sample_rows is not None else (cache_store or CacheStore(None))
+        )
         self.max_workers = max_workers or min(8, max(1, (os.cpu_count() or 2)))
         self.fail_fast = fail_fast
         # 告警先于执行器形态判定初始化：节点级声明被忽略时要在这里留痕
@@ -518,6 +553,13 @@ class Engine:
             if node_id in self._results:
                 report.nodes.append(self._results[node_id])
 
+        # M8-2 Task 4：采样预览模式标注——run 级 sample_rows 字段 +
+        # 节点级 sampled 标记（to_dict 仅在采样模式输出这两个字段）
+        if self.sample_rows is not None:
+            report.sample_rows = self.sample_rows
+            for node_result in report.nodes:
+                node_result.sampled = True
+
         for name, ref in self.plan.pipeline_outputs.items():
             try:
                 report.outputs[name] = RefResolver(self.plan.params, self.store).resolve(ref)
@@ -701,6 +743,10 @@ class Engine:
             result.cache_key or None,
             result.started_at + result.duration,
             result.duration,
+            # M8 Task 9.1：行数血缘透传——空 dict 视同未采集写 NULL，
+            # 与报告"节点无 rows_in/rows_out 键 ↔ DB NULL"语义一致
+            rows_in=result.rows_in or None,
+            rows_out=result.rows_out or None,
         )
 
     def _mark_skipped(self, node_id: str, note: str) -> None:
@@ -796,6 +842,10 @@ class Engine:
             inputs = {
                 port: resolver.resolve(ref) for port, ref in node.spec.inputs.items()
             }
+            # M8-2 Task 4/5：远程路径同样在输入解析收敛处采样截断并记录行数
+            inputs = self._sample_inputs(inputs)
+            if self.lineage:
+                result.rows_in = self._row_counts(inputs)
             params = resolver.resolve(node.spec.params)
             ctx.params = params
 
@@ -855,6 +905,9 @@ class Engine:
                     for port, handle in (data.get("outputs") or {}).items()
                 }
                 result.outputs = {k: _describe(v) for k, v in raw.items()}
+                # M8-2 Task 5：行数血缘——远程路径输出读回处记录 list 端口行数
+                if self.lineage:
+                    result.rows_out = self._row_counts(raw)
                 if cache_key is not None:
                     self.cache.store(cache_key, raw)
             finally:
@@ -904,6 +957,27 @@ class Engine:
     # ------------------------------------------------------------------ #
     # 单节点执行
     # ------------------------------------------------------------------ #
+    def _sample_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """M8-2 Task 4：采样模式——list 类型输入句柄截断为前 sample_rows 行。
+
+        在输入解析收敛处统一做：实际传给算子的句柄即截断后的句柄；
+        dict/str/其他类型原样不动。非采样模式原样返回。
+        """
+        if self.sample_rows is None:
+            return inputs
+        return {
+            port: value[: self.sample_rows] if isinstance(value, list) else value
+            for port, value in inputs.items()
+        }
+
+    def _row_counts(self, values: Mapping[str, Any]) -> dict[str, int]:
+        """M8-2 Task 5：行数血缘——仅统计 list 类型端口的行数（键为端口名）。"""
+        return {
+            port: len(value)
+            for port, value in values.items()
+            if isinstance(value, list)
+        }
+
     def _run_node(self, node: PlanNode) -> NodeResult:
         ctx = self.context.for_node(node.spec.id, node.spec.op)
         result = NodeResult(node_id=node.spec.id, op=node.spec.op, started_at=time.time())
@@ -918,6 +992,12 @@ class Engine:
                 port: resolver.resolve(ref)
                 for port, ref in node.spec.inputs.items()
             }
+            # M8-2 Task 4：采样截断在输入解析收敛处统一做——传给算子的句柄
+            # 即截断后的句柄（缓存 key、行数血缘都基于截断后的输入）
+            inputs = self._sample_inputs(inputs)
+            # M8-2 Task 5：行数血缘——记录截断后（实际传入规模）的输入行数
+            if self.lineage:
+                result.rows_in = self._row_counts(inputs)
             params = resolver.resolve(node.spec.params)
             ctx.params = params
             instance = node.operator if node.operator is not None else node.operator_cls(**params)
@@ -968,6 +1048,9 @@ class Engine:
                         sem.release()
                 result.status = SUCCESS
                 result.outputs = {k: _describe(v) for k, v in outputs.items()}
+                # M8-2 Task 5：行数血缘——输出发布处记录 list 端口行数
+                if self.lineage:
+                    result.rows_out = self._row_counts(outputs)
 
                 if cache_key is not None:
                     self.cache.store(cache_key, outputs)
@@ -1023,6 +1106,9 @@ class Engine:
         result.status = SUCCESS
         result.duration = time.time() - result.started_at
         result.outputs = {k: _describe(v) for k, v in outputs.items()}
+        # M8-2 Task 5：行数血缘——缓存命中后反序列化的输出若为 list 也记录行数
+        if self.lineage:
+            result.rows_out = self._row_counts(outputs)
         # M2-6：参考 run 里该节点成功且 cache_key 一致才算续跑命中
         prev = self._resume_map.get(node.spec.id)
         if prev is not None and prev[0] == SUCCESS and prev[1] == cache_key:
@@ -1272,6 +1358,8 @@ def run_pipeline(
     cache_max_entries: int | None = None,
     cache_max_bytes: int | None = None,
     spill_warn_bytes: int | None = None,
+    sample_rows: int | None = None,
+    lineage: bool = True,
 ) -> tuple[RunReport, dict[str, Any]]:
     """编译 + 执行一步到位，返回值与句柄表。
 
@@ -1297,6 +1385,11 @@ def run_pipeline(
     写入后按 mtime 淘汰最旧条目；默认 None = 不限（与 v0.7.0 一致）。
     ``spill_warn_bytes``（M7-4 Task 12）：spill 落盘目录占用告警阈值，运行结束
     超过阈值时向 ``report.warnings`` 追加中文提示；默认 None = 不告警。
+    ``sample_rows``（M8-2 Task 4）：采样预览行数——非 None 时进入采样模式，
+    每个节点解析输入后把 list 类型句柄截断为前 N 行（dict/str 原样），
+    缓存读写全部禁用；必须是 ≥1 的整数（bool 不算），非法抛 ``ValueError``。
+    ``lineage``（M8-2 Task 5）：行数血缘开关（默认开启）；False 时报告节点
+    不含 rows_in/rows_out，其余行为不变。
 
     典型的库内调用::
 
@@ -1315,8 +1408,10 @@ def run_pipeline(
         logger=logger,
         cache=None,
     )
+    # M8-2 Task 4：采样预览模式不构造缓存上下文——cache_dir 传 None，
+    # 连目录都不创建；引擎内会再替换为禁用缓存实例（读写全部禁用）
     cache_store = CacheStore(
-        cache_dir,
+        cache_dir if sample_rows is None else None,
         base_dir=workdir,
         max_entries=cache_max_entries,
         max_bytes=cache_max_bytes,
@@ -1325,7 +1420,8 @@ def run_pipeline(
                     fail_fast=fail_fast, cancel_event=cancel_event, executor=executor,
                     handle_store=handle_store, run_store=run_store,
                     resume_run_id=resume_run_id, hooks=hooks,
-                    concurrency_limits=concurrency_limits)
+                    concurrency_limits=concurrency_limits,
+                    sample_rows=sample_rows, lineage=lineage)
     report = engine.run()
     # M7-4 Task 12：运行结束统计缓存/spill 目录占用，超阈值追加中文告警
     report.warnings.extend(
@@ -1357,6 +1453,8 @@ async def run_pipeline_async(
     run_id: str | None = None,
     logger: logging.Logger | None = None,
     concurrency_limits: Mapping[str, int] | None = None,
+    sample_rows: int | None = None,
+    lineage: bool = True,
 ) -> tuple[RunReport, dict[str, Any]]:
     """async 宿主嵌入（M2-8）：把同步引擎抛到事件循环的默认执行器里跑。
 
@@ -1398,5 +1496,7 @@ async def run_pipeline_async(
             run_id=run_id,
             logger=logger,
             concurrency_limits=concurrency_limits,
+            sample_rows=sample_rows,
+            lineage=lineage,
         ),
     )

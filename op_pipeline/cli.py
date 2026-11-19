@@ -11,11 +11,11 @@ from typing import Any
 
 from .cache import CacheStore
 from .context import RunContext
-from .engine import Engine, storage_warnings
-from .errors import SpecValidationError
+from .engine import Engine, _masked_params, storage_warnings
+from .errors import RefResolutionError, SpecValidationError
 from .graph import to_ascii, to_dot, to_mermaid
 from .registry import default_registry, load_plugins
-from .spec import PipelineSpec, build_plan
+from .spec import PipelineSpec, RefResolver, build_plan
 from .store import RunStore
 
 log = logging.getLogger("op_pipeline.cli")
@@ -43,8 +43,12 @@ def _parse_overrides(items: list[str] | None) -> dict[str, Any]:
     return out
 
 
-def _load(path: str, plugins: list[str] | None) -> PipelineSpec:
-    spec = PipelineSpec.from_file(path)
+def _load(
+    path: str,
+    plugins: list[str] | None,
+    params: dict[str, Any] | None = None,
+) -> PipelineSpec:
+    spec = PipelineSpec.from_file(path, params=params)
     base_dir = Path(path).expanduser().resolve().parent
     load_plugins(paths=plugins or (), base_dir=base_dir)
     return spec
@@ -77,14 +81,20 @@ class _WarningCollector(logging.Handler):
 
 # --------------------------------------------------------------------------- #
 def cmd_run(args: argparse.Namespace) -> int:
-    spec = _load(args.config, args.plugin)
     overrides = _parse_overrides(args.param)
+    # M8-2 Task 1：--param 值同时作为运行级参数注入（${param:...} 解析期替换）
+    spec = _load(args.config, args.plugin, params=overrides)
     plan = build_plan(spec, default_registry, overrides=overrides)
 
     if args.dry_run:
         # 在创建 RunContext/CacheStore 之前返回：不建产物目录与缓存目录
         print(to_ascii(plan))
         return 0
+
+    # M8-2 Task 4：--sample N 采样预览；非法值在创建上下文之前就拒绝
+    if args.sample is not None and args.sample < 1:
+        print("--sample 必须是 ≥1 的整数", file=sys.stderr)
+        return 2
 
     workdir = args.workdir or str(Path(args.config).expanduser().resolve().parent)
     context = RunContext.create(
@@ -113,7 +123,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     engine = Engine(plan, context, cache_store=cache_store, max_workers=args.workers,
                     fail_fast=args.fail_fast, executor=args.executor, run_store=run_store,
-                    resume_run_id=args.resume)
+                    resume_run_id=args.resume, sample_rows=args.sample)
 
     report = engine.run()
     if run_store is not None:
@@ -153,12 +163,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
     plan = None
     try:
         try:
-            spec = _load(args.config, args.plugin)
+            # M8-2 Task 1：--param 值同时作为运行级参数注入（${param:...} 解析期替换）
+            overrides = _parse_overrides(args.param)
+            spec = _load(args.config, args.plugin, params=overrides)
             result["nodes"] = [{"id": n.id, "op": n.op} for n in spec.nodes]
             try:
-                plan = build_plan(
-                    spec, default_registry, overrides=_parse_overrides(args.param)
-                )
+                plan = build_plan(spec, default_registry, overrides=overrides)
             except SpecValidationError as exc:
                 result["errors"].extend(exc.problems)
             except Exception as exc:  # noqa: BLE001 配置类错误统一转为校验失败
@@ -518,10 +528,259 @@ def cmd_scaffold_op(args: argparse.Namespace) -> int:
 
 
 def cmd_graph(args: argparse.Namespace) -> int:
-    spec = _load(args.config, args.plugin)
-    plan = build_plan(spec, default_registry, overrides=_parse_overrides(args.param))
+    overrides = _parse_overrides(args.param)
+    spec = _load(args.config, args.plugin, params=overrides)
+    plan = build_plan(spec, default_registry, overrides=overrides)
     renderer = {"mermaid": to_mermaid, "dot": to_dot, "ascii": to_ascii}[args.format]
     print(renderer(plan))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# M8-2 Task 6：explain —— 输出解析后的最终生效配置（不执行节点、零文件产出）
+# --------------------------------------------------------------------------- #
+def _explain_value(value: Any, resolver: RefResolver) -> Any:
+    """尽力就地解析节点参数里的 ``${p.x}`` / ``${env.X}`` 引用。
+
+    句柄引用（``${node.port}``，运行期才能求值）解析失败时保持原样。
+    """
+    if isinstance(value, str):
+        try:
+            return resolver.resolve(value)
+        except RefResolutionError:
+            return value
+    if isinstance(value, list):
+        return [_explain_value(item, resolver) for item in value]
+    if isinstance(value, dict):
+        return {k: _explain_value(v, resolver) for k, v in value.items()}
+    return value
+
+
+def _explain_node(node: Any, resolver: RefResolver) -> dict[str, Any]:
+    """单个节点的生效配置片段（与 --json 结构一致）。"""
+    spec = node.spec
+    return {
+        "id": spec.id,
+        "op": spec.op,
+        "params": _explain_value(dict(spec.params), resolver),
+        "inputs": dict(spec.inputs),
+        "when": spec.when,
+        "policy": {
+            "retries": spec.retries,
+            "timeout": spec.timeout,
+            "executor": spec.executor,
+            "cache": spec.cache,
+            "concurrency_group": spec.concurrency_group,
+            "allow_failure": spec.allow_failure,
+        },
+        "depends_on": list(node.depends_on),
+    }
+
+
+def _fmt_value(value: Any) -> str:
+    """explain 文本输出里的参数值格式化（配置值来自 JSON/TOML/YAML）。"""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        return repr(value)
+
+
+def _print_explain_text(result: dict[str, Any]) -> None:
+    """explain 文本输出：每节点一段，人读友好。"""
+    print(f"生效配置：{result['pipeline']} (v{result['version']})")
+    print("\n参数：")
+    if result["params"]:
+        for key, value in result["params"].items():
+            print(f"  {key} = {_fmt_value(value)}")
+    else:
+        print("  （无）")
+    for node in result["nodes"]:
+        print(f"\n节点 [{node['id']}]  op={node['op']}")
+        print("  inputs:")
+        if node["inputs"]:
+            for port, ref in node["inputs"].items():
+                print(f"    {port} = {ref}")
+        else:
+            print("    （无）")
+        print("  params:")
+        if node["params"]:
+            for key, value in node["params"].items():
+                print(f"    {key} = {_fmt_value(value)}")
+        else:
+            print("    （无）")
+        print(f"  when: {node['when'] or '（无条件）'}")
+        policy = " ".join(f"{k}={node['policy'][k]!r}" for k in node["policy"])
+        print(f"  policy: {policy}")
+        deps = ", ".join(node["depends_on"]) or "（无上游依赖）"
+        print(f"  depends_on: {deps}")
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    """M8-2 Task 6：输出解析后的最终生效配置，不执行节点、不产生任何输出文件。
+
+    加载阶段完成 includes 合并、defaults 合并、``${env:...}`` 与
+    ``${param:...}`` 占位符替换（与 validate 共用同一套加载路径与
+    ``_WarningCollector`` 模式）；``${p.x}`` 参数引用尽力就地解析，
+    句柄引用保持原样。退出码：成功 0；配置非法或 ``--node`` 不存在为 1。
+    """
+    result: dict[str, Any] = {
+        "pipeline": "",
+        "version": "",
+        "params": {},
+        "nodes": [],
+        "warnings": [],
+    }
+    errors: list[str] = []
+    collector = _WarningCollector()
+    pipeline_logger = logging.getLogger("op_pipeline")
+    pipeline_logger.addHandler(collector)
+    plan = None
+    try:
+        try:
+            overrides = _parse_overrides(args.param)
+            spec = _load(args.config, args.plugin, params=overrides)
+            plan = build_plan(spec, default_registry)
+        except SpecValidationError as exc:
+            errors.extend(exc.problems)
+        except Exception as exc:  # noqa: BLE001 加载/解析失败统一按配置非法处理
+            errors.append(str(exc))
+        else:
+            resolver = RefResolver(plan.params, {})
+            selected = plan.nodes
+            if args.node is not None:
+                selected = [n for n in plan.nodes if n.spec.id == args.node]
+                if not selected:
+                    errors.append(f"节点不存在：{args.node}")
+            if not errors:
+                result["pipeline"] = plan.spec.name
+                result["version"] = plan.spec.version
+                # 敏感打码沿用 M7-2 机制
+                result["params"] = _masked_params(plan.params, plan.spec.sensitive_values)
+                result["nodes"] = [_explain_node(n, resolver) for n in selected]
+    finally:
+        pipeline_logger.removeHandler(collector)
+
+    result["warnings"] = list(collector.messages)
+    if errors:
+        if args.json:
+            result["errors"] = errors
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print("✗ 无法生成生效配置", file=sys.stderr)
+            for problem in errors:
+                print(f"  - {problem}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        _print_explain_text(result)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# M8-3 Task 8：events —— 查询/过滤/聚合 JsonlHook 事件流（零第三方依赖）
+#
+# JsonlHook（op_pipeline/observe.py）实际事件字段：
+#   node_start  : {event, ts(ISO 字符串), node_id, op}
+#   node_finish : {event, ts, node_id, status, duration(秒，float，4 位舍入), cached}
+#   run_finish  : {event, ts, pipeline, version, run_id, status, duration, ok}
+# 即 node_id 只在节点事件行出现、run_id 只在 run_finish 行出现。
+# --------------------------------------------------------------------------- #
+def _event_matches(
+    ev: dict[str, Any],
+    run_id: str | None,
+    node: str | None,
+    event_type: str | None,
+) -> bool:
+    """AND 语义过滤：三个条件全部满足才命中（未指定的条件视为通过）。
+
+    注意：``node_start``/``node_finish`` 行不携带 ``run_id`` 字段，
+    因此 ``--run-id`` 只能命中 ``run_finish`` 行（严格 AND 语义）。
+    """
+    if run_id is not None and ev.get("run_id") != run_id:
+        return False
+    if node is not None and ev.get("node_id") != node:
+        return False
+    if event_type is not None and ev.get("event") != event_type:
+        return False
+    return True
+
+
+def _print_events_summary(kept: list[tuple[str, dict[str, Any]]]) -> None:
+    """--summary 文本表格：按节点聚合执行次数/总耗时/失败数（取自 node_finish 事件）。"""
+    stats: dict[str, dict[str, Any]] = {}
+    for _text, ev in kept:
+        if ev.get("event") != "node_finish":
+            continue
+        node_id = str(ev.get("node_id", "（缺失）"))
+        row = stats.setdefault(node_id, {"count": 0, "duration": 0.0, "failed": 0})
+        row["count"] += 1
+        duration = ev.get("duration")
+        if isinstance(duration, (int, float)):
+            row["duration"] += duration
+        if ev.get("status") == "failed":
+            row["failed"] += 1
+    if not stats:
+        print("（无 node_finish 事件，汇总为空）")
+        return
+    width = max(len("节点"), *(len(k) for k in stats))
+    print(f"{'节点':<{width}}  {'执行次数':>6}  {'总耗时(s)':>10}  {'失败数':>6}")
+    for node_id, row in stats.items():
+        print(
+            f"{node_id:<{width}}  {row['count']:>6}  "
+            f"{row['duration']:>10.4f}  {row['failed']:>6}"
+        )
+
+
+def cmd_events(args: argparse.Namespace) -> int:
+    """M8-3 Task 8：查询/过滤/聚合 ``JsonlHook`` 导出的事件 JSONL 文件。
+
+    逐行读取并按 ``--run-id`` / ``--node`` / ``--event``（AND 语义）过滤，
+    命中行按**原文本**输出（不做重排序）；``--last N`` 只保留过滤后最后 N 行；
+    ``--summary`` 输出每节点聚合表格（与明细输出互斥）。损坏行（非 JSON /
+    非 dict / 缺 event 字段）记 warn 后跳过，不中断。
+    退出码：正常（含空文件、过滤后无匹配）0；文件不存在/无法读取 1。
+    """
+    if args.last is not None and args.last < 0:
+        print("--last 必须是 ≥0 的整数", file=sys.stderr)
+        return 2
+    path = Path(args.file).expanduser()
+    if not path.is_file():
+        print(f"事件文件不存在：{path}", file=sys.stderr)
+        return 1
+    kept: list[tuple[str, dict[str, Any]]] = []  # (原始行文本, 解析后事件)
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for lineno, raw in enumerate(fh, 1):
+                text = raw.strip()
+                if not text:  # 空行静默跳过（常见于文件末尾多余换行）
+                    continue
+                try:
+                    ev = json.loads(text)
+                except ValueError:
+                    log.warning(
+                        "第 %d 行不是合法 JSON，已跳过：%s", lineno, text[:80]
+                    )
+                    continue
+                if not isinstance(ev, dict) or not ev.get("event"):
+                    log.warning(
+                        "第 %d 行不是事件对象或缺少 event 字段，已跳过", lineno
+                    )
+                    continue
+                if not _event_matches(ev, args.run_id, args.node, args.event):
+                    continue
+                kept.append((raw.rstrip("\n"), ev))
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"事件文件无法读取：{exc}", file=sys.stderr)
+        return 1
+
+    if args.last is not None:
+        kept = kept[-args.last:] if args.last > 0 else []
+    if args.summary:
+        _print_events_summary(kept)
+    else:
+        for text, _ev in kept:
+            print(text)
     return 0
 
 
@@ -654,6 +913,11 @@ def build_parser() -> argparse.ArgumentParser:
              "成功段复用缓存并标记 [resumed]（需同时指定 --runs）",
     )
     run.add_argument("--json", default=None, help="把运行报告写成 JSON")
+    run.add_argument(
+        "--sample", type=int, default=None,
+        help="M8-2 采样预览：每个节点解析输入后把 list 类型句柄截断为前 N 行，"
+             "缓存读写全部禁用；必须是 ≥1 的整数（默认不采样）",
+    )
     run.set_defaults(func=cmd_run)
 
     validate = sub.add_parser("validate", help="只校验配置，不执行")
@@ -685,6 +949,43 @@ def build_parser() -> argparse.ArgumentParser:
     common(graph)
     graph.add_argument("--format", choices=("mermaid", "dot", "ascii"), default="mermaid")
     graph.set_defaults(func=cmd_graph)
+
+    explain = sub.add_parser(
+        "explain", help="M8-2：输出解析后的最终生效配置（不执行节点、零文件产出）"
+    )
+    common(explain)
+    explain.add_argument("--node", default=None, help="只输出指定 id 的节点")
+    explain.add_argument(
+        "--json", action="store_true",
+        help="输出 JSON：{pipeline, version, params, nodes, warnings}",
+    )
+    explain.set_defaults(func=cmd_explain)
+
+    events = sub.add_parser(
+        "events", help="M8-3：查询/过滤/聚合 JsonlHook 事件流（JSONL 文件）"
+    )
+    events.add_argument("file", help="JsonlHook 导出的事件 JSONL 文件路径")
+    events.add_argument(
+        "--run-id", default=None,
+        help="只输出 run_id 匹配的事件（仅 run_finish 行携带 run_id，AND 语义）",
+    )
+    events.add_argument(
+        "--node", default=None,
+        help="只输出 node_id 匹配的节点事件（对应 node_start/node_finish 行）",
+    )
+    events.add_argument(
+        "--event", choices=("node_start", "node_finish", "run_finish"), default=None,
+        help="只输出指定类型的事件",
+    )
+    events.add_argument(
+        "--last", type=int, default=None,
+        help="过滤后只保留最后 N 行（必须是 ≥0 的整数）",
+    )
+    events.add_argument(
+        "--summary", action="store_true",
+        help="输出每节点聚合文本表格（执行次数/总耗时/失败数），不输出明细",
+    )
+    events.set_defaults(func=cmd_events)
 
     ops = sub.add_parser("ops", help="列出已注册算子")
     ops.add_argument("--json", action="store_true")

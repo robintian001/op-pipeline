@@ -1,0 +1,41 @@
+{
+  "name": "subpipeline_child",
+  "version": "1.0",
+  "description": "子流水线示例：由父流水线 pipeline_subpipeline.json 经 pipeline.run 调用，LIMIT 由运行级参数注入（默认 5）",
+  "nodes": [
+    {
+      "id": "source",
+      "op": "control.const",
+      "params": {
+        "value": [
+          {"key": "k01", "v": 1},
+          {"key": "k02", "v": 2},
+          {"key": "k03", "v": 3},
+          {"key": "k04", "v": 4},
+          {"key": "k05", "v": 5},
+          {"key": "k06", "v": 6},
+          {"key": "k07", "v": 7},
+          {"key": "k08", "v": 8},
+          {"key": "k09", "v": 9},
+          {"key": "k10", "v": 10}
+        ]
+      }
+    },
+    {
+      "id": "capped",
+      "op": "table.limit",
+      "inputs": {"table": "${source.value}"},
+      "params": {"n": "${param:LIMIT:-5}"}
+    },
+    {
+      "id": "filtered",
+      "op": "table.filter_rows",
+      "inputs": {"table": "${capped.table}"},
+      "params": {"where": "v >= ${param:LIMIT:-5}"}
+    }
+  ],
+  "outputs": {
+    "rows": "${filtered.table}",
+    "picked": "${capped.table}"
+  }
+}

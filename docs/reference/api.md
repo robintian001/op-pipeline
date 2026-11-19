@@ -9,7 +9,9 @@
 - **内部/实验**：已导出便于高级用法，但接口细节可能随版本调整，不承诺兼容。
 
 > 便捷函数 `op_pipeline.run(config, ...)` 未列入 `__all__`，但属于稳定 API：
-> 从配置文件路径直接执行（自动按配置目录加载插件），等价于"加载 + `run_pipeline`"。
+> 从配置文件路径直接执行（自动按配置目录加载插件），等价于"加载 + `run_pipeline`"；
+> v0.9 起新增可选参数 `params`（运行级参数注入，解析期 `${param:...}` 替换）、
+> `sample_rows`（采样预览行数）、`lineage`（节点行数血缘开关，默认 True）。
 > 观测扩展 `op_pipeline.observe.JsonlHook` / `OtelHook` 见 README §8 与运行时语义。
 
 ---
@@ -18,7 +20,7 @@
 
 | 符号 | 用途 | 稳定性 |
 | --- | --- | --- |
-| `run_pipeline` | 执行一个已解析的 `PipelineSpec`，返回 `(RunReport, dict[str, Any])`（报告 + 全部句柄值）；支持缓存、重试、并发分组限流、钩子、运行记录与各类执行器。 | 稳定 API，破坏性变更升 minor |
+| `run_pipeline` | 执行一个已解析的 `PipelineSpec`，返回 `(RunReport, dict[str, Any])`（报告 + 全部句柄值）；支持缓存、重试、并发分组限流、钩子、运行记录与各类执行器；v0.9 起新增可选 `params` / `sample_rows` / `lineage`（与 `run()` 语义一致）。 | 稳定 API，破坏性变更升 minor |
 | `run_pipeline_async` | `run_pipeline` 的 async 宿主桥接：把同步引擎放到事件循环默认线程执行器，`await` 期间不阻塞循环，参数/返回值一致。 | 稳定 API，破坏性变更升 minor |
 | `Engine` | 单次运行的执行器，接收编译后的 `Plan`；需要自定义句柄存储、执行器或直接驱动调度时使用（一个实例只跑一次）。 | 稳定 API，破坏性变更升 minor |
 | `CacheStore` | 内容指纹缓存实现；`cache_dir=None` 即禁用；v0.8 起可选 `max_entries`/`max_bytes` 容量上限（按 mtime 淘汰、命中刷新 mtime）与 `key_lock(key)` 同 key 单飞锁，也可替换为同鸭子类型对象。 | 稳定 API（弱契约，可替换） |
@@ -43,7 +45,7 @@
 
 | 符号 | 用途 | 稳定性 |
 | --- | --- | --- |
-| `PipelineSpec` | 流水线配置的解析结果（参数、节点、输出、`includes`、`defaults`）；`from_file()` 支持 JSON/TOML/YAML。 | 稳定 API，破坏性变更升 minor |
+| `PipelineSpec` | 流水线配置的解析结果（参数、节点、输出、`includes`、`defaults`）；`from_file()` 支持 JSON/TOML/YAML；v0.9 起 `from_dict` / `from_file` 新增 `params=` 运行级参数注入（解析期与顶层 `[params]` 合并、注入优先，供 `${param:...}` 占位符解析）。 | 稳定 API，破坏性变更升 minor |
 | `NodeSpec` | 单个节点规格（`op`、`inputs`/`outputs`、`params`、`when`、重试/超时/缓存/执行器策略）。 | 稳定 API，破坏性变更升 minor |
 | `Plan` | `build_plan()` 产出的已校验执行计划（节点、拓扑序、句柄归属、合并后的参数）。 | 稳定 API，破坏性变更升 minor |
 | `PlanNode` | 计划中的节点（节点规格 + 依赖 + 句柄映射）；引擎按它调度。 | 稳定 API，破坏性变更升 minor |
@@ -62,11 +64,27 @@
 | `op` | 注册装饰器：`@op("namespace.name")` 把算子类注册进当前/全局注册表（支持别名）。 | 稳定 API，破坏性变更升 minor |
 | `Param` | 参数声明：类型、默认值、必填、`choices`、`minimum/maximum` 与文档。 | 稳定 API，破坏性变更升 minor |
 | `Registry` | 算子注册表：注册、按名/别名查找、`describe()` 与独立注册表隔离运行。 | 稳定 API，破坏性变更升 minor |
-| `default_registry` | 全局默认注册表（导入 `op_pipeline` 时自动加载 50 个内置算子）。 | 稳定 API，破坏性变更升 minor |
+| `default_registry` | 全局默认注册表（导入 `op_pipeline` 时自动加载 59 个内置算子）。 | 稳定 API，破坏性变更升 minor |
 | `load_plugins` | 加载算子插件：模块路径、文件路径、已安装包入口点，支持白名单与哈希清单校验。 | 稳定 API，破坏性变更升 minor |
 | `register_function` | 向安全表达式白名单注册纯函数，供 `when`、表算子行级表达式、`control.assert` 使用。 | 稳定 API，破坏性变更升 minor |
 | `evaluate` | 按 AST 白名单求值单个表达式，返回结果。 | 内部/实验 |
 | `evaluate_condition` | 按 AST 白名单求值布尔条件（`when` / `control.assert` 内部使用）。 | 内部/实验 |
+
+### 3.1 v0.9 新增算子（9 个，一句话契约）
+
+完整输入/输出/参数契约见[算子清单](operator-catalog.md)；此处仅一句话语义：
+
+| 算子 | 用途 |
+| --- | --- |
+| `time.parse` | 解析时间文本（缺省 ISO 8601，可给 strftime `format`），输出 datetime ISO 文本与时间戳 |
+| `time.shift` | 时间偏移：ISO 文本或时间戳输入按 days/hours/minutes/seconds 平移（可为负） |
+| `time.now` | 输出当前时间的 datetime / 时间戳 / 日期三视图（`deterministic=False` 永不缓存） |
+| `json.flatten` | 嵌套 dict 扁平化：键按路径拼接（`a.b.c`）展开为一层，list 值作为叶子 |
+| `table.explode` | 把 list 列展开成多行（每个元素一行、其余列复制；`keep_empty` 控制空列表丢弃/保留，`index_column` 记录原始行索引） |
+| `quality.null_check` | 空值率检查：None/空白占比超过 `max_null_ratio` 即违例（error 抛错 / warn 出明细） |
+| `quality.unique` | 按 `keys` 列组合查重复行，重复即违例（error 抛错 / warn 出明细） |
+| `quality.schema_check` | 逐行类型检查：按 `expected` 列名→类型名声明校验（error 抛错 / warn 出明细） |
+| `pipeline.run` | 子流水线编排：运行另一份配置文件并取其某个输出句柄（防环、深度上限 5、永不缓存） |
 
 ---
 
@@ -91,7 +109,7 @@
 
 | 符号 | 用途 | 稳定性 |
 | --- | --- | --- |
-| `RunStore` | 可选 SQLite 运行记录：`record_run` / `record_node` / `query` / `prev_node`；v0.7 起节点记录含 `duration`，并提供 `prune(keep_last)` 历史清理。 | 稳定 API，破坏性变更升 minor |
+| `RunStore` | 可选 SQLite 运行记录：`record_run` / `record_node` / `query` / `prev_node`；v0.7 起节点记录含 `duration`，并提供 `prune(keep_last)` 历史清理；v0.9 起 `record_node` 新增 `rows_in`/`rows_out`（端口行数血缘 JSON，缺省 NULL），nodes 表缺列时构造即幂等自动迁移。 | 稳定 API，破坏性变更升 minor |
 
 ---
 
@@ -113,22 +131,28 @@
 
 | 符号 | 用途 | 稳定性 |
 | --- | --- | --- |
-| `scheduler_app.scheduler.run_scheduler` | 调度循环；v0.8 起新增 `alert_silence`（秒，同 pipeline 窗口内失败只告警一次），其余参数与 v0.7 一致。 | 稳定 API，破坏性变更升 minor |
-| `scheduler_app.web.create_server` | 只读 Web UI；v0.8 起新增 `/compare`、`/api/runs`、`/api/runs/<id>` 与 `/metrics` 路由。 | 稳定 API，破坏性变更升 minor |
+| `scheduler_app.scheduler.run_scheduler` | 调度循环；v0.8 起新增 `alert_silence`（秒，同 pipeline 窗口内失败只告警一次）；v0.9 起新增 `after`（名 -> 依赖列表映射，本轮依赖全部 success 才触发，否则跳过记 info），条目支持 `{"path": ..., "after": [...]}`。 | 稳定 API，破坏性变更升 minor |
+| `scheduler_app.web.create_server` | 只读 Web UI；v0.8 起新增 `/compare`、`/api/runs`、`/api/runs/<id>` 与 `/metrics` 路由；v0.9 起详情页新增节点执行时间线与 In/Out 行数列，`/compare` 新增行数差列。 | 稳定 API，破坏性变更升 minor |
 
 ### 7.2 CLI 子命令
 
 | 子命令 | 用途 |
 | --- | --- |
-| `run <cfg>` | 执行流水线；v0.8 新增 `--cache-max-entries` / `--cache-max-bytes` / `--spill-warn-bytes`（均可选） |
+| `run <cfg>` | 执行流水线；v0.8 新增 `--cache-max-entries` / `--cache-max-bytes` / `--spill-warn-bytes`（均可选）；v0.9 新增 `--param KEY=VALUE`（运行级参数注入，可重复）与 `--sample N`（采样预览） |
 | `validate <cfg> [--json]` | 只加载/编译/契约校验；`--json` 输出 `{"ok","errors","warnings","nodes"}` |
 | `init <dir> [--template minimal\|data\|scheduler]` | 生成脚手架项目；目标目录非空时拒绝 |
 | `scaffold op <name> [--dir PATH]` | 生成算子与测试骨架；非法名或文件已存在时拒绝 |
+| `graph <cfg> [--format mermaid\|dot\|ascii]` | 输出依赖图 |
+| `ops [--json]` / `describe <op_name>` | 列出全部算子 / 查看单算子契约 |
+| `explain <cfg> [--param KEY=VALUE ...] [--node ID] [--json]` | **v0.9 新增**：输出解析后的最终生效配置（不执行节点、零文件产出） |
+| `events <file.jsonl> [--run-id ID] [--node ID] [--event TYPE] [--last N] [--summary]` | **v0.9 新增**：查询/过滤/聚合 JsonlHook 事件流（损坏行容错） |
 | `worker --queue <file>` | 消费共享队列；v0.8 新增 `--lease-seconds` / `--max-attempts` / `--owner` |
 | `queue compact --queue <file> --out <dir> [--archive <file>]` | 全部任务完成后归档历史行并清空活跃队列 |
 
-> 以上均为加法，向后兼容：所有新参数可选，缺省行为与 v0.7.0 一致；RunStore schema
-> 与算子数量（50）不变，不构成破坏性变更。
+> 以上均为加法，向后兼容：所有新参数可选，缺省行为与上一版本一致。v0.9 的报告
+> schema 变更为纯加法（run 级 `sample_rows`、节点级 `sampled`/`rows_in`/`rows_out`），
+> RunStore nodes 表补 `rows_in`/`rows_out` 列（自动迁移），算子数量 50 → 59
+> （53 个零依赖内置 + 6 个可选依赖），不构成破坏性变更。
 
 ---
 

@@ -186,6 +186,64 @@ finally: duration = now - started_at
 > `_completed` 才提交，所以在"只引用声明依赖"的前提下，快照读是安全的。
 > 这是一条必须保持的不变量——若将来允许"引用即依赖"之外的隐式读取，需要加锁或改成按需读取。
 
+### 2.6 采样预览（v0.9）
+
+`run(config, sample_rows=N)` / CLI `run --sample N` 进入采样模式，用于"不上全量数据
+先看链路通不通"：
+
+- **截断点**：只发生在**输入解析收敛处**（`_sample_inputs`，线程与远程路径一致）——
+  解析后的输入值若为 `list` 且长度超过 `N`，截断为**前 N 行**；`dict` / `str` /
+  其他类型原样透传。节点自身的输出不截断——下游拿到的是"上游被截断后的真实产物"，
+  因此报告里的行数血缘（§2.7）能如实反映每一步实际流过的行数；
+- **参数不截断**：`params` 不做采样，`${param:...}` 注入值原样生效；
+- **缓存整体禁用**：采样模式下引擎用 `CacheStore(None)` 替换缓存存储（读写全部关闭）——
+  采样结果不代表全量数据，落缓存会污染后续全量运行；
+- **校验**：`sample_rows` 必须是 `≥1` 的整数（`bool` 不算整数），否则构造期抛
+  `ValueError`；
+- **报告标注**：run 级 `RunReport.sample_rows = N`；节点级每个 `NodeResult.sampled = True`
+  （采样模式下全量标注，`to_dict()`/`to_json()` 仅在采样模式输出这两个字段）。
+  未采样（`None`）时报告不含 `sample_rows`，节点不含 `sampled`，与 v0.8.0 输出一致。
+
+### 2.7 节点行数血缘（v0.9）
+
+`lineage=True`（默认）时，每个节点的 `NodeResult` 记录两个 dict：
+
+- **`rows_in`**：输入端口名 → 该端口 list 句柄的行数。采集点在**输入解析与采样截断
+  之后**——采样模式下记录的是截断后的实际行数；
+- **`rows_out`**：输出端口名 → 发布句柄的行数。采集点在 **`_publish`**（含缓存命中
+  的发布路径 `_finish_cache_hit`）。非 list 端口不记录（dict/str/标量不计行数）；
+- **空值即缺席**：`lineage=False` 或端口不是 list 时对应 dict 为空，
+  `to_dict()`/`to_json()` 不输出 `rows_in`/`rows_out` 键，SQLite nodes 表写 `NULL`
+  （报告"无键 ↔ DB NULL"语义一致）；
+- **默认行为**：`lineage` 默认开启，报告节点平铺这两个键；`run(config, lineage=False)`
+  可关——关闭后报告与 v0.8.0 完全一致（纯加法回退）。
+
+### 2.8 子流水线编排（v0.9）：`pipeline.run`
+
+`pipeline.run` 算子把"运行另一份配置文件"封装成普通节点，语义边界如下：
+
+- **执行位置**：在父引擎的工作线程内同步调用 `op_pipeline.run()`——子流水线拥有
+  自己的 `RunContext` / `CacheStore` / 报告与 run_id，其完整报告与 artifacts
+  **不并入**父运行；父节点只保留三个输出端口：`result`（子节点取到的句柄值）、
+  `report`（子 run 摘要：`run_id` / `status` / `duration` / `node_count` /
+  `failed_nodes`）、`run_id`；
+- **防环**：`pipeline.run` 维护 thread-local 执行栈（当前线程已进入而未退出的子
+  配置路径集合），同一栈内重复出现同一配置即循环引用，报 `ConfigError` 且消息含
+  完整引用链路（如 `a → b → a`）；
+- **深度上限**：嵌套层数最多 **5** 层（`_MAX_SUB_DEPTH`，第 6 层拒绝执行），超出抛
+  `ConfigError`——防止配置互相套娃失控；
+- **预检先行**：子配置缺失、目标节点/端口不存在在执行前预检报错（读取子配置并编译
+  校验），不产生子 run 副作用；
+- **永不缓存**：`deterministic=False`——子流水线可能含时间/外部 IO，且子 run 自身
+  落自己的缓存，父层不重复落；
+- **参数传递**：`params` dict 经 `run(config, params=...)` 注入子流水线（等价于子
+  配置的 `--param`），值可含父层的 `${param:...}` 占位符，实现"父参数下传"；
+- **失败传播**：子 run 非 success 时按 `on_error` 处理（当前仅 `propagate`）——
+  父节点 failed，错误文本含子 run_id / 子状态 / 失败节点列表，下游照常 skipped。
+
+完整示例：`examples/pipeline_subpipeline.json`（父，`--param LIMIT=3`）+
+`examples/pipeline_subpipeline_child.json`（子，`${param:LIMIT:-5}` 默认值）。
+
 ---
 
 ## 3. 失败语义
@@ -425,7 +483,8 @@ status = "failed"   if hard_failures
 | `outputs` | 流水线级输出（引用解析结果，失败则进 `warnings`） |
 | `warnings` | 输出解析告警 + 引擎告警（取消告警、端口软类型告警） |
 | `artifacts_dir` | 本次运行产物根目录 |
-| `nodes[]` | 每节点 `status / duration / attempts / cached / outputs（类型摘要）/ error / note / traceback（失败时截断堆栈）` |
+| `sample_rows` | **v0.9 新增**：采样预览行数（`--sample N` / `run(sample_rows=N)`）；未采样时无此字段 |
+| `nodes[]` | 每节点 `status / duration / attempts / cached / outputs（类型摘要）/ error / note / traceback（失败时截断堆栈）`；**v0.9 加法**：采样模式下每节点增 `sampled: true`，`lineage` 开启（默认）时增 `rows_in` / `rows_out`（端口名 → list 行数，见 §2.7），未采样/关闭时不输出这些键 |
 
 `outputs` 在节点表中是**类型摘要**（`_describe`，例如 `list[18]`、`str('...')`），
 不是完整数据；完整数据通过 `run_pipeline()` 返回的 `handles` 获取。
@@ -472,16 +531,18 @@ workdir/                                  # 默认 = 配置文件所在目录
   | 表 | 字段 |
   | --- | --- |
   | `runs` | `run_id`(PK), `pipeline`, `version`, `status`, `started_at`, `finished_at`, `params_json` |
-  | `nodes` | `run_id`+`node_id`(PK), `op`, `status`, `attempts`, `cached`, `error`, `cache_key`, `finished_at` |
+  | `nodes` | `run_id`+`node_id`(PK), `op`, `status`, `attempts`, `cached`, `error`, `cache_key`, `finished_at`, `duration`（v0.7）, `rows_in`/`rows_out`（v0.9，JSON 文本；无血缘写 NULL） |
 
-- 写入点：
+- **写入点**：
   - 节点：`Engine._collect`（真实执行收口，**含缓存命中早退**）与 `_mark_skipped`
     （跳过节点也入库）——nodes 表与 `RunReport` 节点列表一一对应；
   - 运行：`run()` 末尾一条 `runs`（`INSERT OR REPLACE`，同 `run_id` 重跑可覆盖）；
 - `NodeResult.cache_key`：命中缓存时记录算出的 key；未启用缓存或未命中为
   `NULL`。这是 M2-6 断点续跑比对"上次成功节点是否可复用"的依据；
 - 连接生命周期由调用方管理（`close()` / `with`）；`query(sql)` 返回原始行；
-- `params` 以 `json.dumps(default=str)` 存 JSON 文本。
+- `params` 以 `json.dumps(default=str)` 存 JSON 文本；
+- **列自动迁移**：旧库缺列时构造 `RunStore` 即幂等 `ALTER TABLE` 补齐（v0.7 补
+  `duration`，v0.9 补 `rows_in`/`rows_out`，旧行取默认值/NULL），无需手工迁移。
 
 ### 6.1 断点续跑（M2-6）：`--resume <run_id>`
 
@@ -750,3 +811,35 @@ v0.7 及以前的队列投递是"至少一次"：worker 认领后崩溃，任务
   [--archive <file>]` 仅当**全部** job_id 都已有结果文件时，把原始队列行追加到归档
   （默认 `<队列 stem>.archive.jsonl`），再用同目录临时文件 + `os.replace` 原子清空
   活跃队列；存在未完成任务（或无法解析的行）时拒绝改动任何文件并返回非 0 退出码。
+
+---
+
+## 10. 调度器依赖触发（v0.9）：`--pipeline` 的 `after` 声明
+
+`scheduler_app.scheduler.run_scheduler` 的多流水线条目（v0.8 起支持
+`--pipeline` 可重复）自 v0.9 起支持两种形态：
+
+```
+--pipeline a.toml                          # 等价 {"path": "a.toml"}，无依赖
+--pipeline '{"path": "b.toml", "after": ["a"]}'   # dict 条目，依赖 pipeline 名
+--after b=a                                # CLI 追加依赖（可重复，与条目声明合并）
+```
+
+pipeline 名 = 配置文件去扩展名的 stem（`a.toml` → `a`）；CLI `--after` 按名匹配
+追加到对应条目，排在条目自身 `after` 声明之后。每轮触发语义：
+
+- **单轮拓扑顺序**：启动时对条目做一次拓扑排序——无依赖条目按声明序在前，
+  有依赖条目按拓扑序随后；依赖成环启动即抛 `ConfigError`（信息含环链路）；
+  仅**已知条目名**的依赖参与排序（未知依赖不构成环）；
+- **触发条件**：轮内维护"本轮各流水线状态表"（`success` / `failed` / `error` /
+  `skipped`），条目仅当**全部依赖本轮已运行且 status == success** 才触发；
+  依赖本轮未运行、非 success、或被连锁跳过时，本条目跳过本轮并记
+  **info** 日志（"跳过 pipeline=x：依赖未满足（…）"），自身记 `skipped`；
+- **失败不中断**：依赖本轮 `failed` 时下游只跳过本轮，下一轮重新按各自实际
+  结果判定——上一轮的失败不会跨轮累积；
+- **启动期校验**：依赖名不在当前流水线集合时记 **warning**（不 fail，向后兼容；
+  该依赖永远无法满足，条目将每轮跳过）；
+- **兼容性**：无 `after` 的条目每轮照常触发（无依赖条目不受本轮状态表影响），
+  行为与 v0.8.0 完全一致；告警/静默/keep-runs/落库等其余语义不变。
+
+操作手册见 [operations.md §调度器](../guides/operations.md)。

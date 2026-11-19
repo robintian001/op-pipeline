@@ -1,0 +1,51 @@
+{
+  "name": "subpipeline_parent",
+  "version": "1.0",
+  "description": "父流水线示例：pipeline.run 节点调用同目录子配置，LIMIT 经运行级参数注入子流水线（无 --param 时取默认值 5）",
+  "nodes": [
+    {
+      "id": "child",
+      "op": "pipeline.run",
+      "params": {
+        "config": "pipeline_subpipeline_child.json",
+        "node": "filtered",
+        "handle": "table",
+        "params": {"LIMIT": "${param:LIMIT:-5}"}
+      }
+    },
+    {
+      "id": "gate",
+      "op": "control.assert",
+      "inputs": {"value": "${child.result}"},
+      "params": {
+        "that": "len(value) > 0",
+        "message": "子流水线返回空结果，请检查 LIMIT 注入值"
+      }
+    },
+    {
+      "id": "count_rows",
+      "op": "stats.count_rows",
+      "inputs": {"table": "${child.result}"}
+    },
+    {
+      "id": "report",
+      "op": "report.markdown",
+      "params": {
+        "title": "子流水线编排报告",
+        "meta": {"LIMIT": "${param:LIMIT:-5}", "子 run_id": "${child.run_id}"},
+        "blocks": [
+          {"heading": "子流水线输出", "level": 2},
+          {"table": "${child.result}", "title": "过滤后的行", "limit": 10},
+          {"heading": "子运行摘要", "level": 2},
+          {"text": "子 run_id：${child.run_id}；状态：${child.report.status}；子节点数：${child.report.node_count}；输出行数：${count_rows.count}"}
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "rows": "${child.result}",
+    "count": "${count_rows.count}",
+    "sub_report": "${child.report}",
+    "sub_run_id": "${child.run_id}"
+  }
+}

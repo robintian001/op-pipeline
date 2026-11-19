@@ -452,6 +452,38 @@
 
 ---
 
+## 7.7 M8：编排组合、开发者体验与观测性（v0.9）
+
+目标：把"一份配置自上而下跑一遍"补成"可组合、可预览、可观测"——子流水线编排与
+运行级参数注入、采样与行数血缘的开发者体验、Web/CLI 观测深化，以及零依赖算子库存
+扩展；内核语义与默认行为保持不变，全部为可选加法。
+
+| 编号 | 方向 | 关键交付 |
+| --- | --- | --- |
+| M8-1 | 编排组合与参数化 | 配置字符串解析期 `${param:NAME}` / `${param:NAME:-默认值}` 运行级注入（`from_dict/from_file(params=...)`、CLI `--param`，注入优先于顶层 params）；`pipeline.run` 子流水线算子（thread-local 防环、深度上限 5、永不缓存、子失败按 `on_error` 传播含摘要）；调度器 `pipeline` 条目支持 `after` 依赖声明（拓扑触发、依赖本轮全部 success 才执行）+ CLI `--after` |
+| M8-2 | 开发者体验 | `run()` / CLI `--sample N` 采样预览（输入解析处 list 截断、采样模式缓存读写禁用、报告 run 级 `sample_rows` + 节点级 `sampled`）；节点行数血缘 `rows_in`/`rows_out`（`lineage` 开关，默认开启，`lineage=False` 回到 v0.8.0 报告）；`explain` 子命令（输出解析后的最终生效配置，不执行节点、零文件产出） |
+| M8-3 | 观测性深化 | Web 详情页甘特式节点执行时间线（纯 CSS 零外部资源）与 In/Out 行数列、`/compare` 行数差异列（`+/-` 标注、单侧"仅 A/仅 B"）；`events` 事件流查询 CLI（过滤 / `--last` / `--summary`、损坏行容错）；`RunStore` nodes 表补 `rows_in`/`rows_out` 列（幂等自动迁移） |
+| M8-4 | 算子库存扩展 | 新增时间算子 `time.parse` / `time.shift` / `time.now`、结构算子 `json.flatten` / `table.explode`、质量算子 `quality.null_check` / `quality.unique` / `quality.schema_check`（`datetime_ops.py` / `json_ops.py` / `quality_ops.py` 新模块，全零依赖）；算子数 50→59 |
+
+**M8 完成定义（DoD）**：全量回归全绿（v0.8.0 基线 358 + M8 新增 164 = 522 用例）；
+主示例（含 `--sample 5`）、插件示例与新增子流水线示例端到端通过；`pyproject.toml` 升
+`0.9.0`；`CHANGELOG` 归档 0.9.0；配置规范/运行时语义/运维指南/API 清单/算子清单与实现
+对齐，报告 schema 变更全部为加法。
+
+> **M8 已完成并关闭（v0.9.0，2026-11-19）**：M8-1 ~ M8-4 全部落地，无 BREAKING——
+> 所有新增参数可选（`params`/`sample_rows`/`lineage`/`--param`/`--sample`/`after` 等），
+> 默认行为与 v0.8.0 一致；报告 schema 纯加法（run 级 `sample_rows`、节点级
+> `sampled`/`rows_in`/`rows_out`），RunStore nodes 表补列自动迁移；算子总数 50→59
+> （53 零依赖内置 + 6 可选依赖）；新增示例 `examples/pipeline_subpipeline.json` +
+> `examples/pipeline_subpipeline_child.json`。
+> 文档同步：配置规范（`${param:...}` 语法与优先级、`pipeline.run` 节点参数表、
+> `params`/`sample_rows`/`lineage` 运行级参数）、运行时语义（§2.6 采样、§2.7 行数
+> 血缘、§2.8 子流水线、§10 调度器依赖触发）、运维指南（§1.5 `after` 依赖触发、
+> §2 时间线与行数列、§5 `explain`/`events`）、稳定 API 清单（`run()` 新参数与
+> 9 个新算子一句话契约）与算子清单（新增时间/JSON/质量/编排小节，总数复核 59）。
+
+---
+
 ## 8. 技术债映射
 
 [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口) 的 T1–T15 与本计划的对应关系：

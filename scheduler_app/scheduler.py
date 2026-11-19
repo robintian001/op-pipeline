@@ -6,6 +6,11 @@
   在运行失败时 POST JSON 告警；``--keep-runs`` 每轮结束后清理历史运行记录；
 - M7-3：``--alert-silence <秒>`` 告警静默窗口：同一 pipeline 在窗口内失败只发送
   一次告警（内存记录上次发送时刻，进程内有效，多 pipeline 互不影响）；
+- M8-1：``--pipeline`` 条目支持 ``{"path": ..., "after": [...]}`` 依赖声明（pipeline
+  名 = 配置文件去扩展名的 stem），CLI ``--after name=dep1,dep2``（可重复）追加依赖；
+  依赖本轮全部运行且 success 才触发，否则跳过本轮并记 info 日志；依赖名未知启动期
+  记 warning（不 fail），``after`` 成环抛 ``ConfigError``；无 ``after`` 的条目行为
+  与 v0.8.0 完全一致；
 - 启动后立即执行一次，之后每 ``--every`` 秒执行一次；
 - 每次运行结果写入 RunStore（复用 M2-5 SQLite 运行记录库）；
 - Ctrl+C / KeyboardInterrupt 干净退出：打印退出信息，退出码 0；
@@ -23,16 +28,35 @@ import sys
 import threading
 import time
 import urllib.request
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 log = logging.getLogger("scheduler_app.scheduler")
 
 _ALERT_TIMEOUT = 5.0  # 告警 HTTP 超时（秒）
 
 
+@dataclass(frozen=True)
+class _PipelineEntry:
+    """单条调度条目（M8-1）：配置路径 + 依赖的 pipeline 名列表。
+
+    ``path`` 保留调用方传入的 ``str``/``Path`` 原样（透传给 :func:`op_pipeline.run`）；
+    pipeline 名 = 配置文件去扩展名的 stem（如 ``a.toml`` → ``a``）。
+    """
+
+    path: str | Path
+    after: tuple[str, ...] = ()
+
+    @property
+    def name(self) -> str:
+        """pipeline 名：配置文件去扩展名的 stem。"""
+        return Path(self.path).stem
+
+
 def run_scheduler(
-    pipeline: str | Path | Sequence[str | Path],
+    pipeline: str | Path | Sequence[str | Path | dict[str, Any]],
     every: float,
     *,
     registry: Any = None,
@@ -44,14 +68,19 @@ def run_scheduler(
     alert_webhook: str | None = None,
     alert_silence: float | None = None,
     keep_runs: int | None = None,
+    after: Mapping[str, Sequence[str]] | None = None,
     stop_event: threading.Event | None = None,
     logger: logging.Logger | None = None,
 ) -> int:
     """按固定间隔反复执行流水线，返回**累计触发次数**（每执行一条流水线计 1 次）。
 
     参数（全部透传给 :func:`op_pipeline.run`）：
-    - ``pipeline``：流水线配置文件路径；可为路径序列（每轮按顺序全部触发），
-      单个 ``str`` / ``Path`` 等价于只含一条的序列（v0.6 兼容）；
+    - ``pipeline``：流水线配置文件路径；可为**条目序列**（每轮按顺序全部触发），
+      单个 ``str`` / ``Path`` 等价于只含一条的序列（v0.6 兼容）。条目（M8-1）支持
+      ``str | Path``（无依赖）与 ``dict{"path": ..., "after": [...]}``：
+      ``after`` 为依赖的 pipeline 名列表（名 = 配置文件去扩展名的 stem），
+      仅当所有依赖**本轮已运行且 status == success** 才触发，否则跳过本轮并记
+      info 日志；无 ``after`` 的条目每轮照常触发，行为与 v0.8.0 完全一致；
     - ``every``：触发间隔（秒），启动后立即执行一次；
     - ``registry``：``Registry`` 实例（None = 使用全局默认算子表）；
     - ``plugin``：插件**文件路径**元组（相对配置文件所在目录解析）；
@@ -64,8 +93,15 @@ def run_scheduler(
       时长时跳过告警，``None`` 或 ``<= 0`` 表示不静默（与 M6 行为一致）；
     - ``keep_runs``：每轮结束后保留最近 N 条运行记录（``RunStore.prune``）；
       ``None`` 或 ``<= 0`` 表示不清理；
+    - ``after``（M8-1）：CLI ``--after`` 的解析结果（名 -> 依赖列表），按 stem
+      匹配追加到对应条目的依赖（排在条目自身声明之后）；默认 None = 不追加；
     - ``stop_event``：置位后当前轮结束即退出循环（默认内部自建）；
     - ``logger``：日志器（默认 ``scheduler_app.scheduler``）。
+
+    启动期校验（M8-1）：``after`` 引用的依赖名不在当前流水线集合时记 warning
+    （不 fail，向后兼容）；依赖声明成环抛 ``ConfigError``（信息含环链路）。
+    每轮按拓扑顺序触发：无依赖条目按声明序先行，有依赖条目按拓扑序随后；
+    依赖条目被跳过时，依赖它的条目连锁跳过。
 
     返回累计触发次数。单次运行失败不中断循环：异常记入日志，等待下一轮。
     调度循环在主线程串行执行；``KeyboardInterrupt`` 会在循环层被捕获，
@@ -73,8 +109,10 @@ def run_scheduler(
     """
     if every <= 0:
         raise ValueError(f"every 必须是正数，实际是 {every!r}")
-    pipelines = _normalize_pipelines(pipeline)
     logger = logger or log
+    entries = _normalize_pipelines(pipeline, after=after)
+    _warn_unknown_deps(entries, logger)
+    order = _resolve_order(entries)  # 依赖成环在此抛 ConfigError
     stop = stop_event if stop_event is not None else threading.Event()
     # 复用同一个 SQLite 连接（调度循环串行，连接只在主线程使用）；
     # op_pipeline 延迟导入：CLI --help 等轻量场景不加载内核
@@ -86,9 +124,20 @@ def run_scheduler(
     count = 0
     try:
         while not stop.is_set():
-            for cfg in pipelines:
+            # M8-1：本轮各流水线的触发状态（名 -> success/failed/error/skipped），
+            # 供 after 依赖判断；无依赖条目照常触发，行为与 v0.8.0 一致。
+            ran_status: dict[str, str] = {}
+            for entry in order:
+                unmet = _unmet_deps(entry, ran_status)
+                if unmet:
+                    logger.info(
+                        "跳过 pipeline=%s：依赖未满足（%s）",
+                        entry.name, "；".join(unmet),
+                    )
+                    ran_status[entry.name] = "skipped"
+                    continue
                 ok, info = _run_once(
-                    cfg,
+                    entry.path,
                     registry=registry,
                     plugin=plugin,
                     plugin_modules=plugin_modules,
@@ -98,9 +147,10 @@ def run_scheduler(
                     logger=logger,
                 )
                 count += 1
+                ran_status[entry.name] = info["status"]
                 if not ok and alert_webhook:
                     _maybe_alert(
-                        alert_webhook, cfg, info, alert_silence,
+                        alert_webhook, entry.path, info, alert_silence,
                         last_alert_at, logger,
                     )
                 if stop.is_set():
@@ -127,15 +177,131 @@ def run_scheduler(
 
 
 def _normalize_pipelines(
-    pipeline: str | Path | Sequence[str | Path],
-) -> list[str | Path]:
-    """把单路径或序列统一成列表（``str``/``Path`` 视为单条，v0.6 兼容）。"""
+    pipeline: str | Path | Sequence[str | Path | dict[str, Any]],
+    *,
+    after: Mapping[str, Sequence[str]] | None = None,
+) -> list[_PipelineEntry]:
+    """把单路径或条目序列统一成调度条目列表（``str``/``Path`` 视为单条，v0.6 兼容）。
+
+    条目（M8-1）支持 ``str | Path``（等价于无依赖的 dict 条目）与
+    ``dict{"path": ..., "after": [...]}``（``after`` 为依赖的 pipeline 名列表）。
+    ``after``（CLI ``--after`` 的解析结果，名 -> 依赖列表）按 stem 匹配追加到
+    对应条目的依赖，且排在条目自身声明的依赖之后。
+    """
     if isinstance(pipeline, (str, Path)):
-        return [pipeline]
-    items = list(pipeline)
-    if not items:
-        raise ValueError("pipeline 不能为空序列")
-    return items
+        items: list[str | Path | dict[str, Any]] = [pipeline]
+    else:
+        items = list(pipeline)
+        if not items:
+            raise ValueError("pipeline 不能为空序列")
+    # CLI 追加的依赖（按 pipeline 名匹配，名 = 配置文件 stem）
+    extra: dict[str, tuple[str, ...]] = {
+        name: tuple(deps) for name, deps in (after or {}).items()
+    }
+    entries: list[_PipelineEntry] = []
+    for item in items:
+        if isinstance(item, (str, Path)):
+            path: str | Path = item
+            declared: tuple[str, ...] = ()
+        elif isinstance(item, Mapping):
+            path = item.get("path")
+            if not isinstance(path, (str, Path)):
+                raise ValueError(f"dict 条目缺少合法的 path 字段，实际是 {item!r}")
+            deps = item.get("after") or ()
+            if isinstance(deps, str) or not isinstance(deps, Sequence):
+                raise ValueError(f"dict 条目的 after 必须是字符串数组，实际是 {deps!r}")
+            declared = tuple(deps)
+        else:
+            raise ValueError(f"pipeline 条目必须是 str/Path/dict，实际是 {item!r}")
+        name = Path(path).stem
+        entries.append(
+            _PipelineEntry(path=path, after=declared + extra.get(name, ()))
+        )
+    return entries
+
+
+def _warn_unknown_deps(entries: list[_PipelineEntry], logger: logging.Logger) -> None:
+    """M8-1 启动期校验：依赖名不在当前流水线集合时 warning（不 fail，向后兼容）。"""
+    names = {entry.name for entry in entries}
+    for entry in entries:
+        for dep in entry.after:
+            if dep not in names:
+                logger.warning(
+                    "流水线 %s 声明的依赖 %r 不在当前流水线集合中，"
+                    "该依赖永远无法满足（将每轮跳过）",
+                    entry.name, dep,
+                )
+
+
+def _resolve_order(entries: list[_PipelineEntry]) -> list[_PipelineEntry]:
+    """计算单轮触发顺序：无依赖条目按声明序在前，有依赖条目按拓扑序随后。
+
+    仅**已知条目名**的依赖参与拓扑排序（未知依赖启动期已 warning，永远无法
+    满足，不参与排序也不构成环）；依赖声明成环抛 :class:`ConfigError`
+    （信息含环链路，与内核 includes 防环风格一致）。
+    """
+    # op_pipeline 延迟导入：CLI --help 等轻量场景不加载内核
+    from op_pipeline import ConfigError
+
+    plain = [entry for entry in entries if not entry.after]
+    dep_entries = [entry for entry in entries if entry.after]
+    by_name: dict[str, _PipelineEntry] = {entry.name: entry for entry in entries}
+    dep_names = {entry.name for entry in dep_entries}
+    graph: dict[str, list[str]] = {
+        entry.name: [d for d in entry.after if d in by_name] for entry in dep_entries
+    }
+    order: list[_PipelineEntry] = []
+    state: dict[str, int] = {}  # 0=未访问 1=访问中 2=已完成
+    visiting: list[str] = []
+
+    def visit(entry: _PipelineEntry) -> None:
+        state[entry.name] = 1
+        visiting.append(entry.name)
+        for dep in graph[entry.name]:
+            if dep not in dep_names:  # 依赖无 after 的条目：已在 plain 段先行触发
+                continue
+            mark = state.get(dep, 0)
+            if mark == 1:
+                chain = " -> ".join(visiting[visiting.index(dep):] + [dep])
+                raise ConfigError(f"调度依赖存在循环引用：{chain}")
+            if mark == 0:
+                visit(by_name[dep])
+        visiting.pop()
+        state[entry.name] = 2
+        order.append(entry)
+
+    for entry in dep_entries:
+        if state.get(entry.name, 0) == 0:
+            visit(entry)
+    return plain + order
+
+
+def _unmet_deps(entry: _PipelineEntry, ran_status: dict[str, str]) -> list[str]:
+    """返回本轮未满足的依赖描述列表（空列表 = 全部满足，可以触发）。"""
+    reasons: list[str] = []
+    for dep in entry.after:
+        if dep not in ran_status:
+            reasons.append(f"{dep}(本轮未运行)")
+        elif ran_status[dep] != "success":
+            reasons.append(f"{dep}(状态 {ran_status[dep]})")
+    return reasons
+
+
+def _parse_after_specs(specs: Sequence[str]) -> dict[str, list[str]]:
+    """解析 CLI ``--after NAME=dep1,dep2``（可重复）为名 -> 依赖列表的映射。
+
+    同名多次声明按出现顺序追加；逗号分隔的空项忽略；缺 ``=`` 或名为空抛
+    ``ValueError``。
+    """
+    result: dict[str, list[str]] = {}
+    for spec in specs:
+        name, sep, deps = spec.partition("=")
+        if not sep or not name.strip():
+            raise ValueError(f"--after 参数格式必须是 NAME=dep1,dep2，实际是 {spec!r}")
+        result.setdefault(name.strip(), []).extend(
+            d.strip() for d in deps.split(",") if d.strip()
+        )
+    return result
 
 
 def _maybe_alert(
@@ -265,6 +431,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="流水线配置文件路径（可重复，每轮按顺序全部触发）",
     )
     parser.add_argument(
+        "--after", action="append", default=[], metavar="NAME=DEPS",
+        help="流水线依赖（可重复）：NAME=dep1,dep2 表示名为 NAME 的流水线（按配置"
+             "文件名去扩展名匹配）须在 dep1/dep2 本轮全部成功后才触发，否则跳过；"
+             "与 dict 条目已声明的 after 合并（CLI 追加在后）",
+    )
+    parser.add_argument(
         "--every", type=float, required=True, help="触发间隔（秒），启动后立即执行一次"
     )
     parser.add_argument(
@@ -319,6 +491,7 @@ def main(argv: list[str] | None = None) -> int:
         alert_webhook=args.alert_webhook,
         alert_silence=args.alert_silence,
         keep_runs=args.keep_runs,
+        after=_parse_after_specs(args.after),
         stop_event=stop,
     )
     print(f"调度器已停止，共触发 {count} 次（退出码 0）。")

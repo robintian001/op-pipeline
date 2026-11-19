@@ -3,8 +3,11 @@
 - 列表页 ``/``：run_id / status / 时间 / 节点数（HTML 表格，全部动态文本转义防注入）；
   M6 支持 ``?page=N&size=M&status=S`` 分页与状态筛选（SQL LIMIT/OFFSET 参数化）；
 - 详情页 ``/run/<run_id>``：该次运行各节点状态 / 完成时间 / **耗时** / 错误摘要；
+  M8-3 新增**节点执行时间线**：每节点一行的甘特式条形（内联 CSS，零外部资源）；
+  M8 Task 9.2 新增 **In/Out 行数列**（``端口=行数`` 紧凑展示，旧行 NULL 显示为空）；
 - 对比页 ``/compare?a=<run_id>&b=<run_id>``（M7-3 Task 7）：两份运行的总耗时与
   节点级差异（状态 / 耗时 / 缓存 / 耗时差），节点按 id 取并集并标注"仅 A/仅 B"；
+  M8 Task 9.2 新增**行数差（A-B）列**（基于两侧 ``rows_out`` 求和，``+/-`` 标注）。
 - 只读 JSON API（M7-3 Task 8）：``/api/runs``（分页/筛选）、``/api/runs/<run_id>``；
 - 指标 ``/metrics``（M7-3 Task 8）：Prometheus ``text/plain; version=0.0.4`` 文本；
 - :func:`create_server(db_path, port=0)`` 返回 server（port=0 自动分配）便于测试；
@@ -31,6 +34,7 @@ _ERROR_CLIP = 300  # 错误摘要截断长度（字符）
 _PAGE_SIZE_DEFAULT = 50  # 列表页默认每页条数
 _PAGE_SIZE_MAX = 200  # 每页条数上限
 _ALLOWED_STATUSES = ("success", "failed", "partial", "skipped")
+_TIMELINE_MIN_WINDOW = 1e-9  # 时间线窗口下限（各节点偏移全为 0 时防除零）
 
 
 def create_server(db_path: str | Path, port: int = 0) -> ThreadingHTTPServer:
@@ -126,9 +130,13 @@ def _query_nodes(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
     columns = [row[1] for row in conn.execute("PRAGMA table_info(nodes)")]
     # 旧库（未走 RunStore 初始化）可能没有 duration 列：回退常量 0.0，页面不报错
     duration_expr = "duration" if "duration" in columns else "0.0 AS duration"
+    # M8 Task 9.2：行数列同理——旧库没有 rows_in/rows_out 列时回退 NULL，展示为空
+    rows_in_expr = "rows_in" if "rows_in" in columns else "NULL AS rows_in"
+    rows_out_expr = "rows_out" if "rows_out" in columns else "NULL AS rows_out"
     return list(conn.execute(
         f"SELECT node_id, op, status, attempts, cached, error, finished_at, "
-        f"{duration_expr} FROM nodes WHERE run_id = ? ORDER BY finished_at",
+        f"{duration_expr}, {rows_in_expr}, {rows_out_expr} "
+        f"FROM nodes WHERE run_id = ? ORDER BY finished_at",
         (run_id,),
     ))
 
@@ -180,6 +188,40 @@ def _clip(text: str | None, limit: int = _ERROR_CLIP) -> str:
     return html.escape(f"...（前 {len(text) - limit} 字符已省略）...\n{text[-limit:]}")
 
 
+def _parse_rows(text: str | None) -> dict[str, int] | None:
+    """行数 JSON 文本 → ``dict[端口名, 行数]``（M8 Task 9.2）。
+
+    - NULL / 空串 / 非法 JSON / 非 dict / 无整数值 → 返回 None（旧行或坏数据，
+      展示层一律显示为空，不猜 0、不报错）；
+    - 值仅保留 ``int``（bool 是 int 子类，显式排除）；非整数值的端口跳过。
+    """
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    rows: dict[str, int] = {}
+    for port, value in data.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        rows[port] = value
+    return rows or None
+
+
+def _fmt_rows(text: str | None) -> str:
+    """行数 dict 紧凑展示：``端口=行数`` 按端口名排序、逗号+空格分隔。
+
+    旧行（NULL）/空串/非法 JSON 返回空字符串；端口名（动态文本）HTML 转义。
+    """
+    rows = _parse_rows(text)
+    if rows is None:
+        return ""
+    return ", ".join(f"{html.escape(port)}={rows[port]}" for port in sorted(rows))
+
+
 _PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -196,9 +238,27 @@ tr:nth-child(even) {{ background: #fafafa; }}
 .status-failed {{ color: #c62828; }}
 .status-skipped {{ color: #777; }}
 .status-partial {{ color: #b26a00; }}
+/* M8 Task 9.2：对比页行数差为正（A 比 B 多）标绿，为负用普通减号不加色 */
+.rows-up {{ color: #1a7f37; }}
 pre {{ background: #f5f5f5; padding: 8px; font-size: 0.85rem; white-space: pre-wrap; }}
 a {{ color: #1565c0; text-decoration: none; }}
 .meta {{ color: #666; font-size: 0.9rem; margin-bottom: 1rem; }}
+/* M8-3：详情页节点执行时间线（甘特式条形，纯 CSS 实现，零外部资源） */
+.timeline {{ margin-top: 1rem; }}
+.tl-scale {{ display: flex; justify-content: space-between; font-size: 0.75rem;
+  color: #888; border-bottom: 1px solid #ddd; padding-bottom: 2px; }}
+.tl-row {{ display: flex; align-items: center; margin-top: 4px; }}
+.tl-label {{ flex: none; width: 220px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 0.85rem; }}
+.tl-track {{ position: relative; flex: 1; height: 14px; background: #f7f7f7;
+  border: 1px solid #eee; overflow: hidden; }}
+.tl-bar {{ position: absolute; top: 2px; height: 10px; min-width: 2px;
+  border-radius: 2px; }}
+.tl-success {{ background: #1a7f37; }}
+.tl-failed {{ background: #c62828; }}
+.tl-cached {{ background: #9e9e9e; }}
+.tl-skipped {{ background: #d5d5d5; }}
+.tl-other {{ background: #b26a00; }}
 </style>
 </head>
 <body>
@@ -248,6 +308,69 @@ def _render_index(
     return _PAGE.format(title="运行历史", body=body)
 
 
+def _timeline_bar_class(status: str, cached: bool) -> str:
+    """时间条颜色分类：cached（命中缓存的成功节点）优先于普通 success。"""
+    if status == "success" and cached:
+        return "tl-cached"
+    return {
+        "success": "tl-success",
+        "failed": "tl-failed",
+        "skipped": "tl-skipped",
+    }.get(status, "tl-other")
+
+
+def _render_timeline(run: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
+    """节点执行时间线（M8-3 Task 7）：每节点一行的甘特式条形，纯 CSS 实现。
+
+    - 起点 = ``finished_at - duration`` 相对 run ``started_at`` 的偏移（秒），
+      条长 ∝ duration；窗口总时长 = max(各节点完成偏移, 最小值防除零)；
+    - 顶部为相对刻度标尺（0%–100%，简洁起见不标注绝对秒数）；
+    - 颜色语义：success 绿 / failed 红 / cached 灰 / skipped 淡灰（``.tl-*``）；
+    - 异常数据健壮：duration=0 走 CSS ``min-width`` 保持可见；缺 ``finished_at``
+      的旧行跳过；无节点 / 全失败 run 仍正常渲染；偏移与宽度越界一律收拢到
+      [0%, 100%] 区间。数据源只用 nodes 表既有列，不新增列。
+    """
+    started = float(run["started_at"])
+    valid = [
+        (n, float(n["finished_at"]), max(0.0, float(n["duration"] or 0.0)))
+        for n in nodes if n["finished_at"] is not None
+    ]
+    window = max(
+        (max(0.0, fin - started) for _, fin, _ in valid), default=0.0
+    )
+    window = max(window, _TIMELINE_MIN_WINDOW)
+    bars = []
+    for n, fin, duration in valid:
+        start_offset = max(0.0, fin - duration - started)
+        left = min(100.0, start_offset / window * 100.0)
+        width = min(100.0 - left, duration / window * 100.0)
+        tip = f"{n['node_id']} · {n['status']} · {duration:.2f}s"
+        bars.append(
+            "<div class='tl-row'>"
+            f"<span class='tl-label'>{html.escape(n['node_id'])}</span>"
+            "<div class='tl-track'>"
+            f"<div class='tl-bar {_timeline_bar_class(n['status'], bool(n['cached']))}' "
+            f"style='left:{left:.3f}%;width:{width:.3f}%' "
+            f"title='{html.escape(tip)}'></div>"
+            "</div></div>"
+        )
+    scale = (
+        "<div class='tl-scale'><span>0%</span><span>25%</span><span>50%</span>"
+        "<span>75%</span><span>100%</span></div>"
+    )
+    empty_note = "" if bars else "<div class='meta'>该运行无可用时间线数据</div>"
+    legend = (
+        "<p class='meta'>时间线按节点完成顺序排列：条形左端为节点开始执行时刻"
+        "（finished_at − duration）相对运行开始的偏移，条长与耗时成正比；"
+        "绿=success、红=failed、灰=缓存命中、淡灰=skipped。</p>"
+    )
+    return (
+        f"<h2>节点执行时间线</h2>"
+        f"<div class='timeline'>{scale}{''.join(bars)}{empty_note}</div>"
+        f"{legend}"
+    )
+
+
 def _render_detail(conn: sqlite3.Connection, run_id: str) -> str:
     run = _query_run(conn, run_id)
     nodes = _query_nodes(conn, run_id)
@@ -259,6 +382,8 @@ def _render_detail(conn: sqlite3.Connection, run_id: str) -> str:
         f"<td>{'是' if n['cached'] else '否'}</td>"
         f"<td>{_fmt_time(n['finished_at'])}</td>"
         f"<td>{float(n['duration'] or 0.0):.1f}s</td>"
+        f"<td>{_fmt_rows(n['rows_in'])}</td>"
+        f"<td>{_fmt_rows(n['rows_out'])}</td>"
         f"<td>{_clip(n['error'])}</td></tr>"
         for n in nodes
     )
@@ -270,10 +395,12 @@ def _render_detail(conn: sqlite3.Connection, run_id: str) -> str:
 总耗时 {_fmt_duration(run['started_at'], run['finished_at'])}
 </div>
 <table>
-<tr><th>节点</th><th>算子</th><th>状态</th><th>尝试</th><th>缓存</th><th>完成时间</th><th>耗时</th><th>错误摘要</th></tr>
-{node_rows or "<tr><td colspan='8' style='color:#999'>该运行无节点记录</td></tr>"}
+<tr><th>节点</th><th>算子</th><th>状态</th><th>尝试</th><th>缓存</th><th>完成时间</th><th>耗时</th><th>In</th><th>Out</th><th>错误摘要</th></tr>
+{node_rows or "<tr><td colspan='10' style='color:#999'>该运行无节点记录</td></tr>"}
 </table>
-<p class="meta">错误摘要为节点 error 字段（截断展示）；耗时为单节点执行时长。</p>"""
+{_render_timeline(run, nodes)}
+<p class="meta">错误摘要为节点 error 字段（截断展示）；耗时为单节点执行时长；
+In/Out 为各 list 端口行数血缘（``端口=行数`` 按端口名排序，旧行未采集显示为空）。</p>"""
     return _PAGE.format(title=f"运行详情 {run_id}", body=body)
 
 
@@ -304,6 +431,31 @@ def _node_cell(node: sqlite3.Row | None, missing_label: str) -> str:
     )
 
 
+def _rows_diff_cell(node_a: sqlite3.Row | None,
+                    node_b: sqlite3.Row | None) -> str:
+    """行数差异单元格（M8 Task 9.2）：两侧节点 ``rows_out`` 总行数之差（A−B）。
+
+    - 节点仅一侧存在 → "仅 A"/"仅 B"（与状态列口径一致：按节点存在性标注）；
+    - 两侧节点齐备但任一侧无行数（旧行 NULL / 坏数据）→ 空，不猜 0；
+    - 两侧都有行数 → ``+N``（A 多，绿色标注）/ ``-N``（B 多，普通减号避免
+      特殊字符问题）/ ``0``（相同）。差值基于各端口行数求和。
+    """
+    if node_a is None:
+        return "<span class='meta'>仅 B</span>"
+    if node_b is None:
+        return "<span class='meta'>仅 A</span>"
+    rows_a = _parse_rows(node_a["rows_out"])
+    rows_b = _parse_rows(node_b["rows_out"])
+    if rows_a is None or rows_b is None:
+        return ""
+    delta = sum(rows_a.values()) - sum(rows_b.values())
+    if delta > 0:
+        return f"<span class='rows-up'>+{delta}</span>"
+    if delta < 0:
+        return f"-{-delta}"
+    return "0"
+
+
 def _render_compare(conn: sqlite3.Connection, run_a: sqlite3.Row,
                     run_b: sqlite3.Row) -> str:
     """渲染两 run 对比页：概览 + 节点级差异表（并集，SQL 分 run 查询）。"""
@@ -327,7 +479,8 @@ def _render_compare(conn: sqlite3.Connection, run_a: sqlite3.Row,
             f"<td>{'—' if b_dur is None else f'{b_dur:.1f}s'}</td>"
             f"<td>{html.escape(_cached_label(a))}</td>"
             f"<td>{html.escape(_cached_label(b))}</td>"
-            f"<td>{diff}</td></tr>"
+            f"<td>{diff}</td>"
+            f"<td>{_rows_diff_cell(a, b)}</td></tr>"
         )
     body = f"""<h1>运行对比</h1>
 <div class="meta">A：<a href='/run/{html.escape(run_a['run_id'])}'>{html.escape(run_a['run_id'])}</a>
@@ -343,11 +496,13 @@ def _render_compare(conn: sqlite3.Connection, run_a: sqlite3.Row,
 </table>
 <table>
 <tr><th>节点</th><th>A 状态</th><th>B 状态</th><th>A 耗时</th><th>B 耗时</th>
-<th>A 缓存/续跑</th><th>B 缓存/续跑</th><th>耗时差（A-B）</th></tr>
-{''.join(rows) or "<tr><td colspan='8' style='color:#999'>两次运行均无节点记录</td></tr>"}
+<th>A 缓存/续跑</th><th>B 缓存/续跑</th><th>耗时差（A-B）</th><th>行数差（A-B）</th></tr>
+{''.join(rows) or "<tr><td colspan='9' style='color:#999'>两次运行均无节点记录</td></tr>"}
 </table>
 <p class="meta">节点按 id 取并集；仅一侧存在时标注"仅 A"/"仅 B"；
-耗时差为正表示 A 更慢。nodes 表仅持久化 cached，故"缓存/续跑"列以缓存标记展示。</p>
+耗时差为正表示 A 更慢；行数差基于两侧节点 ``rows_out`` 各端口求和（A−B），
+为正标绿、为负用普通减号、任一侧旧行未采集则显示为空。
+nodes 表仅持久化 cached，故"缓存/续跑"列以缓存标记展示。</p>
 <p><a href="/">← 返回运行历史</a></p>"""
     return _PAGE.format(
         title=f"运行对比 {html.escape(run_a['run_id'])} vs "

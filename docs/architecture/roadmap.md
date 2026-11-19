@@ -207,6 +207,33 @@
 原则仍是"加法、可选、默认不变"：所有新增参数缺省时行为与 v0.7.0 一致，
 RunStore schema 与算子数（50）不变，零第三方依赖与可嵌入定位保持。
 
+### 阶段 6：编排组合、开发者体验与观测性（对应版本 0.9）— **已完成（v0.9.0，2026-11-19）**
+
+定位：**把"一份配置自上而下跑一遍"补成"可组合、可预览、可观测"**，内核语义与默认
+行为不变，全部为可选加法。四条方向：
+
+- **编排组合与参数化**（M8-1）：配置字符串解析期 `${param:NAME}` /
+  `${param:NAME:-默认值}` 运行级注入（注入优先于顶层 params，CLI `--param`）；
+  `pipeline.run` 子流水线算子——把一份子配置当"大算子"执行（thread-local 防环、
+  嵌套深度上限 5、永不缓存，子失败按 `on_error` 传播含摘要）；调度器 `pipeline`
+  条目支持 `after` 依赖声明（拓扑触发、依赖本轮全部 success 才执行，否则跳过记
+  info）+ CLI `--after`；
+- **开发者体验**（M8-2）：`--sample N` 采样预览（输入解析处 list 截断、采样模式
+  缓存读写禁用、报告 run 级 `sample_rows` + 节点级 `sampled`）；节点行数血缘
+  `rows_in`/`rows_out`（`lineage` 开关默认开，关闭即回到 v0.8.0 报告）；`explain`
+  子命令输出解析后的最终生效配置（不执行节点、零文件产出）；
+- **观测性深化**（M8-3）：Web 详情页甘特式节点执行时间线（纯 CSS 零外部资源）与
+  In/Out 行数列、`/compare` 行数差异列；`events` 事件流查询 CLI（过滤 / `--last` /
+  `--summary`、损坏行容错）；RunStore nodes 表补 `rows_in`/`rows_out` 列（幂等迁移）；
+- **算子库存扩展**（M8-4）：时间 `time.parse`/`time.shift`/`time.now`、结构
+  `json.flatten`/`table.explode`、质量 `quality.null_check`/`quality.unique`/
+  `quality.schema_check`、编排 `pipeline.run` 共 9 个新算子，全部零第三方依赖，
+  算子数 50→59（53 零依赖内置 + 6 可选依赖）。
+
+原则仍是"加法、可选、默认不变"：所有新增参数可选且缺省行为与 v0.8.0 一致，
+报告 schema 变更为纯加法（run 级 `sample_rows`、节点级 `sampled`/`rows_in`/`rows_out`），
+零第三方依赖与可嵌入定位保持。
+
 ---
 
 ## 6. 优先级结论

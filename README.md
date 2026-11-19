@@ -78,7 +78,8 @@ op_pipeline/
 ├── expression.py      安全表达式求值（AST 白名单）
 ├── graph.py           Mermaid / Graphviz / ASCII 渲染
 ├── cli.py             python -m op_pipeline
-└── ops/               内置算子（34 个）
+└── ops/               内置算子（59 个，分组见 §8）
+    └── pipeline_ops.py    子流水线编排算子 pipeline.run（M8）
 examples/
 ├── pipeline_orders.json / .toml    订单汇总（18 节点，含 fan-out 并行）
 ├── pipeline_text.toml              文本摘要（插件算子 + 重试 + 句柄下钻）
@@ -246,14 +247,18 @@ load_plugins(entry_points=True)  # 扫描已安装插件包入口点
 
 ---
 
-## 8. 内置算子（50 个）
+## 8. 内置算子（59 个）
 
 | 分组 | 算子 | 说明 |
 | --- | --- | --- |
 | IO | `io.read_csv` `io.write_csv` `io.read_json` `io.write_json` `io.read_text` `io.write_text` | 表格以 `list[dict]` 为通用交换格式 |
-| 表 | `table.filter_rows` `select_columns` `rename_columns` `drop_columns` `derive_column` `sort_rows` `dedupe` `limit` `join` `union` `take_column` | 哈希连接、表达式派生列；列判定按全表并集 |
+| 表 | `table.filter_rows` `select_columns` `rename_columns` `drop_columns` `derive_column` `sort_rows` `dedupe` `limit` `join` `union` `take_column` `explode` | 哈希连接、表达式派生列、list 列展开；列判定按全表并集 |
 | 统计 | `stats.aggregate` `count_rows` `value_counts` `describe` | `sum/mean/count/min/max/median/std/nunique/first/last` |
 | 文本 | `text.template` `split_lines` `join_lines` `regex_extract` `replace_regex` | 模板用 `{{key}}`，避开 `${}` |
+| 时间 | `time.parse` `time.shift` `time.now` | ISO/strftime 解析、偏移与当前时间；now 永不缓存 |
+| JSON 结构 | `json.flatten` | 嵌套 dict 扁平化（list 值作为叶子） |
+| 数据质量 | `quality.null_check` `quality.unique` `quality.schema_check` | 空值率/重复/类型检查；error 抛错、warn 出明细，table 原样透传 |
+| 编排 | `pipeline.run` | 子流水线编排：节点内执行子配置并取回子节点输出；防环与深度上限 5，结果永不落缓存（M8） |
 | 报告 | `report.markdown` `report.html` | 单文件 HTML，无前端依赖 |
 | 控制 | `control.const` `if_else` `switch` `assert` `passthrough` `merge_dicts` | 常量注入、分支、数据质量门禁 |
 | HTTP | `http.request` | GET/POST、json/text 双视图、超时与重试 |

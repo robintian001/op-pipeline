@@ -315,3 +315,50 @@ class TakeColumn(Operator):
         if skip_null:
             values = [v for v in values if v is not None]
         return {"values": values, "count": len(values)}
+
+
+@op("table.explode")
+class Explode(Operator):
+    """把 list 列展开成多行：每个元素一行，其余列复制（列值不变的"逆聚合"）。
+
+    - 列不存在或某行该列的值不是 list 时报错（KeyError/ValueError）；
+    - ``keep_empty=false``（默认）：空 list 的行被丢弃；
+    - ``keep_empty=true``：空 list 保留一行、该列值置 ``None``；
+    - ``index_column`` 给出时，展开出的每行写入原始行索引（int，从 0 起）。
+    """
+
+    description = "把 list 列展开成多行"
+    inputs = ["table"]
+    outputs = [("table", list), ("rows", int)]
+    params = {
+        "column": Param(str, doc="要展开的列，其值必须是 list"),
+        "index_column": Param(str, default=None, doc="给出时写入原始行索引（int）"),
+        "keep_empty": Param(bool, default=False, doc="空 list 行为：false 丢弃，true 保留一行且该列为 None"),
+    }
+
+    def run(self, ctx, table, column, index_column, keep_empty):
+        rows = list(table or [])
+        out: list[dict[str, Any]] = []
+        for i, row in enumerate(rows):
+            if column not in row:
+                raise KeyError(f"表中不存在列 '{column}'（第 {i} 行）；可用列：{', '.join(sorted(row))}")
+            values = row[column]
+            if not isinstance(values, list):
+                raise ValueError(
+                    f"列 '{column}' 第 {i} 行的值不是 list（实际 {type(values).__name__}），无法展开"
+                )
+            if not values and keep_empty:
+                new_row = dict(row)
+                new_row[column] = None
+                if index_column:
+                    new_row[index_column] = i
+                out.append(new_row)
+                continue
+            for element in values:
+                new_row = dict(row)
+                new_row[column] = element
+                if index_column:
+                    new_row[index_column] = i
+                out.append(new_row)
+        ctx.log(f"展开列 '{column}'：{len(rows)} -> {len(out)} 行")
+        return {"table": out, "rows": len(out)}

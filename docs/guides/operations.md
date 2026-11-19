@@ -26,7 +26,8 @@ python -m scheduler_app.scheduler --pipeline examples/pipeline_orders.json --eve
 
 | 参数 | 说明 |
 | --- | --- |
-| `--pipeline` | 流水线配置文件路径（必填）；**v0.7 起可重复**，每轮按给定顺序依次触发全部流水线 |
+| `--pipeline` | 流水线配置文件路径（必填）；**v0.7 起可重复**，每轮按给定顺序依次触发全部流水线；**v0.9 起条目支持 `{"path": ..., "after": [...]}`**（见 §1.5） |
+| `--after` | **v0.9 新增**：`NAME=dep1,dep2`（可重复）——给名为 `NAME` 的流水线（按配置文件名去扩展名匹配）追加依赖，与 dict 条目声明的 `after` 合并（CLI 追加在后） |
 | `--every` | 触发间隔秒数（必填，必须为正数） |
 | `--db` | RunStore SQLite 路径；不传则不落库（零副作用） |
 | `--plugin` | 插件**文件路径**，可重复；相对配置文件所在目录解析 |
@@ -94,6 +95,27 @@ python -m scheduler_app.scheduler --pipeline pipeline.json --every 60 --db runs.
 - 静默记录只存在调度进程内存中，重启后重置；程序化调用为
   `run_scheduler(..., alert_webhook=..., alert_silence=1800)`。
 
+### 1.5 依赖触发：`after` 声明与 `--after`（v0.9）
+
+```powershell
+python -m scheduler_app.scheduler `
+  --pipeline examples/etl_load.json `
+  --pipeline examples/etl_report.json `
+  --after etl_report=etl_load `
+  --every 300 --db runs.db
+```
+
+- pipeline 名 = 配置文件去扩展名的 stem（`etl_load.json` → `etl_load`）；
+  条目可用 `--pipeline '{"path": "etl_report.json", "after": ["etl_load"]}'`
+  直接声明依赖，也可用 `--after NAME=dep1,dep2`（可重复）追加；
+- **触发规则**：每轮按拓扑顺序触发——依赖**本轮已运行且全部 `success`** 才执行，
+  否则跳过本轮并记 info 日志（下游连锁跳过）；依赖本轮 `failed` 只影响本轮，
+  下一轮按各自实际结果重新判定；
+- **启动期校验**：依赖名不在当前流水线集合记 warning（不 fail）；`after` 成环
+  启动即抛 `ConfigError`；
+- 兼容性：不使用 `after` 的条目每轮照常触发，行为与 v0.8.0 完全一致；
+  完整触发语义见 [运行时语义 §10](../architecture/runtime-semantics.md)。
+
 ---
 
 ## 2. Web UI：`scheduler_app.web`
@@ -122,6 +144,13 @@ v0.7 起的能力（M6 Task 7）：
 旧库没有 `nodes.duration` 列时页面照常渲染，不会报错；该列由 v0.7 的 RunStore
 在建表/补列时写入，新产生的运行才有耗时可展示。
 
+v0.9 起的能力（M8-3）：
+
+| 能力 | 说明 |
+| --- | --- |
+| 节点执行时间线 | 详情页新增甘特式时间线（纯 CSS，零外部资源）：每节点一行，条形位置 = `finished_at − duration` 相对运行开始的偏移，条长 ∝ 耗时；顶部 0%–100% 相对刻度；绿=success、红=failed、灰=缓存命中、淡灰=skipped；旧行缺 `finished_at` 自动跳过，全部异常数据都不会让页面报错 |
+| In/Out 行数列 | 详情页节点表新增 In / Out 两列（`端口=行数` 紧凑展示，端口名排序）：来自 v0.9 的 `nodes.rows_in` / `rows_out` 血缘列，旧行 NULL 显示为空 |
+
 ### 2.1 运行对比页：`/compare`（v0.8）
 
 ```text
@@ -131,7 +160,10 @@ GET /compare?a=<run_id>&b=<run_id>
 - 缺任一参数返回 **400** 纯文本；run 不存在返回 **404** 并列出缺失的 run_id；
 - 页面展示两次运行的状态、总耗时，以及节点级并集差异：仅一侧存在的节点标注"仅 A/仅 B"，
   共有节点展示各自耗时与差值（`+` / `-`）；
-- `nodes` 表没有 `resumed` 列，因此对比页只按 `cached` 展示「缓存/—」。
+- **v0.9 新增行数差（A−B）列**：基于两侧节点 `rows_out` 各端口求和之差，
+  `+` / `-` 标注变化量，仅一侧存在时同样标注"仅 A/仅 B"；
+- `nodes` 表没有 `resumed` 列，因此对比页只按 `cached` 展示「缓存/—」；
+  旧库没有 `rows_in`/`rows_out` 列时行数差展示为空。
 
 ### 2.2 只读 JSON API 与指标（v0.8）
 
@@ -175,7 +207,7 @@ RunStore 是**可选**的 SQLite 运行记录（`--db` / `--runs` / `run_store=.
 | 表 | 关键字段 |
 | --- | --- |
 | `runs` | `run_id`(PK)、`pipeline`、`version`、`status`、`started_at`、`finished_at`、`params_json` |
-| `nodes` | `run_id`+`node_id`(PK)、`op`、`status`、`attempts`、`cached`、`error`、`cache_key`、`finished_at`、`duration`（v0.7 新增） |
+| `nodes` | `run_id`+`node_id`(PK)、`op`、`status`、`attempts`、`cached`、`error`、`cache_key`、`finished_at`、`duration`（v0.7 新增）、`rows_in`/`rows_out`（v0.9 新增，JSON 文本；未采集/关闭血缘写 NULL） |
 
 - `nodes.duration` 为单节点执行耗时（秒，`REAL DEFAULT 0`）；**v0.7 起**写入，
   供 Web UI 详情页展示与事后分析；
@@ -286,7 +318,46 @@ python -m op_pipeline queue compact `
 
 ---
 
-## 5. 故障排查清单
+## 5. 只读观测工具：`explain` 与 `events`（v0.9）
+
+### 5.1 解析预览：`explain`
+
+```powershell
+python -m op_pipeline explain examples/pipeline_orders.json
+python -m op_pipeline explain examples/pipeline_subpipeline.json --param LIMIT=3 --json
+python -m op_pipeline explain pipeline.json --node clean
+```
+
+- **只读**：执行完整加载链（includes 合并 → defaults 合并 → `${env:}` /
+  `${param:}` 替换 → 编译 `build_plan`），但**不执行任何节点、零文件产出**
+  （不建 RunContext、不建缓存目录）——适合发布前核对参数注入结果；
+- 默认输出**最终生效配置**：`params`（敏感值打码）与每节点的 op / 输入 /
+  参数摘要——`${p.x}` 参数引用尽力就地解析，句柄引用保持原样；
+  `--node <id>` 只看单个节点（不存在报错退出码 1）；`--json` 输出
+  `{pipeline, version, params, nodes, warnings}`；
+- `--param KEY=VALUE` 与 `run` 语义一致（可重复、后者覆盖、值先尝试 JSON 解析），
+  配置非法（缺参/语法错/编译错）以退出码 1 打印中文问题列表。
+
+### 5.2 事件流查询：`events`
+
+```powershell
+python -m op_pipeline events .op_pipeline/events/20260101-120000-ab12.jsonl
+python -m op_pipeline events events.jsonl --run-id 20260101-120000-ab12 --node clean
+python -m op_pipeline events events.jsonl --event node_finish --last 10
+python -m op_pipeline events events.jsonl --summary
+```
+
+- 输入为 JSONL 事件流文件（每行一个事件 dict，含 `event` 字段）；
+- 过滤参数可组合：`--run-id` / `--node` / `--event`（`node_start` / `node_finish` /
+  `run_finish`）；`--last N` 只保留末尾 N 条（`N < 0` 报错退出码 2）；
+- `--summary` 输出按节点聚合表格（执行次数 / 总耗时 / 失败数，取自
+  `node_finish` 事件），与明细输出互斥；
+- **容错**：损坏行（非 JSON / 非 dict / 缺 `event` 字段）记 warn 后跳过，
+  不中断；文件不存在/无法读取退出码 1，正常（含空文件、过滤后无匹配）退出码 0。
+
+---
+
+## 6. 故障排查清单
 
 | 症状 | 排查方向 | 处理 |
 | --- | --- | --- |
@@ -303,7 +374,7 @@ python -m op_pipeline queue compact `
 
 ---
 
-## 6. 相关文档
+## 7. 相关文档
 
 - [快速上手](quickstart.md)：安装、首个流水线、自定义算子、常见配置错误；
 - [API 参考](../reference/api.md)：`RunStore` / `run_pipeline` / `QueueWorkerExecutor` 等公开 API；
