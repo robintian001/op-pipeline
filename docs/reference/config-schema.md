@@ -2,7 +2,7 @@
 
 配置格式支持 **JSON / TOML / YAML**（内容同构），此外可按需注册自定义格式。`.json` 与无扩展名走 `json`，
 `.toml` 走标准库 `tomllib`，`.yaml/.yml` 需可选依赖 `pyyaml`。解析入口
-[PipelineSpec.from_file()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L402-L406)。
+[PipelineSpec.from_file()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L402-L406)。
 
 格式分发走 loader 注册表（M3-8）：内建 json/toml/yaml 即注册项；第三方格式通过
 `PipelineSpec.register_loader(suffix, fn)` 扩展——`suffix` 为扩展名（可省略前导点、大小写不敏感），
@@ -141,7 +141,7 @@
 | `Any` | 不校验 |
 
 之后检查 `choices`、`minimum`、`maximum`。完整实现见
-[params.coerce()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/params.py#L64-L137)。
+[params.coerce()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/params.py#L64-L137)。
 
 ---
 
@@ -150,7 +150,7 @@
 **未知键告警**：`from_dict` 对顶层与节点里不认识的键发 `logging.warning`（不报错，
 保证前向兼容），消息附带近义键建议——例如把 `params` 拼成 `param` 会看到
 `流水线配置 含未知键 'param'（将被忽略）；是否想写 'params'？`。合法键集合见
-[spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) 中 `NodeSpec._KNOWN_KEYS` 与 `PipelineSpec._KNOWN_KEYS`；
+[spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py) 中 `NodeSpec._KNOWN_KEYS` 与 `PipelineSpec._KNOWN_KEYS`；
 CLI 下 WARNING 会经 stderr 直接展示（`validate` 同样可见）。
 
 编译期（`build_plan`）会一次性汇总以下问题，抛 `SpecValidationError`：

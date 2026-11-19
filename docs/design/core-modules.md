@@ -9,7 +9,7 @@
 
 ### 1.1 声明侧
 
-`Operator` 类属性即契约（[operator.py#L59-L66](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/operator.py#L59-L66)）：
+`Operator` 类属性即契约（[operator.py#L59-L66](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/operator.py#L59-L66)）：
 
 | 类属性 | 默认 | 说明 |
 | --- | --- | --- |
@@ -21,7 +21,7 @@
 | `param_table` | 由 `params` 归一得到 | 运行期真正使用的参数声明表 |
 | `deterministic` | `True` | 决定是否允许参与缓存 |
 
-`normalize_operator_class()`（[operator.py#L20-L44](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/operator.py#L20-L44)）
+`normalize_operator_class()`（[operator.py#L20-L44](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/operator.py#L20-L44)）
 在**注册时**执行一次归一化，并做两项硬校验：
 
 1. 端口名必须是合法 Python 标识符且非关键字（端口名会成为 `run()` 的关键字参数）；
@@ -31,7 +31,7 @@
 
 ### 1.2 执行侧
 
-`execute()` 是框架唯一调用入口（[operator.py#L118-L127](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/operator.py#L118-L127)）：
+`execute()` 是框架唯一调用入口（[operator.py#L118-L127](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/operator.py#L118-L127)）：
 
 ```
 execute(ctx, inputs):
@@ -42,9 +42,9 @@ execute(ctx, inputs):
 ```
 
 - `_prepare_inputs`：未声明的输入直接拒绝；非 optional 且未接线的端口报缺失；
-  optional 端口补 `None`（[operator.py#L130-L146](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/operator.py#L130-L146)）。
+  optional 端口补 `None`（[operator.py#L130-L146](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/operator.py#L130-L146)）。
 - `_normalize_output`：`None` 视为空 dict；非 Mapping 且只有一个输出端口时视为该端口裸值；
-  未声明的输出拒绝；非 optional 输出缺失拒绝（[operator.py#L148-L170](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/operator.py#L148-L170)）。
+  未声明的输出拒绝；非 optional 输出缺失拒绝（[operator.py#L148-L170](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/operator.py#L148-L170)）。
 
 **设计取舍**：契约校验放在 `execute()` 而不是 `run()` 内部，保证"任何调用路径（引擎或单测）都受同一约束"，
 而算子作者只需专注纯函数式实现。
@@ -62,7 +62,7 @@ execute(ctx, inputs):
 ### 2.1 Port（软类型）
 
 `Port(name, type=Any, optional=False, doc="")` 是冻结 dataclass。`as_ports()` 支持四种写法
-（[ports.py#L39-L74](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/ports.py#L39-L74)）：
+（[ports.py#L39-L74](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/ports.py#L39-L74)）：
 
 ```python
 "table"                                  # 单个简写
@@ -72,7 +72,7 @@ execute(ctx, inputs):
 ```
 
 类型检查是**软校验**：`value_matches()` 只做 `isinstance`，`None` 与 `Any` 永远通过。
-`port_warnings()` 与 [check_handle_types()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L518-L546)
+`port_warnings()` 与 [check_handle_types()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L518-L546)
 已实现，但**当前未被引擎或 CLI 调用**（见 [技术债 §5](../design/extension-points.md#5-已知技术债与实现缺口)）。
 
 ### 2.2 Param（参数声明）
@@ -97,7 +97,7 @@ Param(type=Any, default=_UNSET, doc="", choices=(), minimum=None, maximum=None)
 | `Any` / `None` | 任意 | 原样 |
 
 随后统一检查 `choices`（成员）与 `minimum` / `maximum`（仅数值）。
-来源：[params.py#L64-L137](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/params.py#L64-L137)。
+来源：[params.py#L64-L137](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/params.py#L64-L137)。
 
 **为什么这么设计**：配置来自 TOML/JSON/CLI，天然是字符串或宽类型；有限且明确的归一
 （尤其 `"3" -> 3`）比引入 pydantic 更符合"零依赖、可嵌入"的目标。
@@ -132,7 +132,7 @@ Registry.describe() -> list[dict] # 供 `ops --json` 使用
 ### 3.3 插件加载
 
 `load_plugins(modules=(), paths=(), base_dir=None, package="op_pipeline.ops")`
-（[registry.py#L119-L166](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L119-L166)）：
+（[registry.py#L119-L166](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/registry.py#L119-L166)）：
 
 1. 先 `import_module(package)` 加载内置算子包（找不到时静默跳过，不阻断自定义插件）；
 2. `modules` 走标准 import；
@@ -147,8 +147,8 @@ if mod_name in sys.modules:      # 以 stem 去重，而不是按绝对路径
 **风险**：不同目录下同名 `.py` 插件（如两个 `my_ops.py`）只会加载第一个。
 插件应使用唯一文件名，或改用 `modules=` 走正规包路径。
 
-内置算子通过 [ops/\_\_init\_\_.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/ops/__init__.py) 的 import 副作用注册；
-[`__init__.py`](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/__init__.py#L90-L92) 在包导入时调用一次 `load_builtin_ops()`。
+内置算子通过 [ops/\_\_init\_\_.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/ops/__init__.py) 的 import 副作用注册；
+[`__init__.py`](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/__init__.py#L90-L92) 在包导入时调用一次 `load_builtin_ops()`。
 
 ---
 
@@ -178,7 +178,7 @@ if mod_name in sys.modules:      # 以 stem 去重，而不是按绝对路径
 | `"${p.dir}/x.md"` | 字符串内混排，逐段替换为 `str()` |
 | 整串是单一引用 | 保留原始类型（不转字符串） |
 
-源码：[spec.py#L187-L284](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L187-L284)。
+源码：[spec.py#L187-L284](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L187-L284)。
 
 **已知限制**：引用正则 `\$\{([^{}]+)\}` 不支持嵌套花括号，因此无法在 `${}` 内写 dict 字面量。
 
@@ -190,7 +190,7 @@ if mod_name in sys.modules:      # 以 stem 去重，而不是按绝对路径
 ### 4.4 拓扑排序
 
 Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性输出
-（[spec.py#L490-L515](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L490-L515)）。
+（[spec.py#L490-L515](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L490-L515)）。
 确定性对快照测试与 `graph` 输出很重要。
 
 ---
@@ -206,12 +206,12 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 
 **允许的函数**：`len str int float bool abs min max sum sorted any all round isinstance`；
 另可通过 `register_function(name, fn)` 注册领域函数（纯函数、合法标识符、禁止覆盖内置名，
-全局生效需在加载配置前调用，见 [expression.py#L179-L206](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/expression.py#L179-L206)）。
+全局生效需在加载配置前调用，见 [expression.py#L179-L206](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/expression.py#L179-L206)）。
 
 **被明确阻断**：任意对象属性访问（`x.__class__`——点语法只做映射下钻，无属性逃逸面）、
 `Lambda`、推导式、`eval/open/__import__` 等任意调用、
 赋值与语句（只解析 `mode="eval"`）。测试用例见
-[tests/test_op_pipeline.py#L116-L126](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/tests/test_op_pipeline.py#L116-L126)。
+[tests/test_op_pipeline.py#L116-L126](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/tests/test_op_pipeline.py#L116-L126)。
 
 ### 5.2 求值语义细节
 
@@ -224,7 +224,7 @@ Kahn 算法，`ready` 列表每轮排序，保证"同层按名字"的确定性�
 
 | 使用方 | 环境变量来源 |
 | --- | --- |
-| 节点 `when` | 输入端口值、参数值、`inputs`、`params`（解析后）、`raw_params`（原始值）（见 [engine.py#L404-L422](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L404-L422)） |
+| 节点 `when` | 输入端口值、参数值、`inputs`、`params`（解析后）、`raw_params`（原始值）（见 [engine.py#L404-L422](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L404-L422)） |
 | `table.*` 行级表达式 | `row_env()`：字段名（标识符形式）+ `row` + `i` |
 | `control.assert` | `value` + 节点参数 + dict 值展平 |
 
@@ -260,7 +260,7 @@ NodeContext（由 for_node 创建）
   ctx.run_id / ctx.pipeline_params
 ```
 
-`save_artifact` 只支持 `dict/list/str/bytes`（[context.py#L51-L62](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/context.py#L51-L62)）。
+`save_artifact` 只支持 `dict/list/str/bytes`（[context.py#L51-L62](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/context.py#L51-L62)）。
 `NodeContext.logger` 通过 `logger.getChild(node_id)` 派生，日志天然带节点名。
 
 **为什么算子必须走 ctx**：单测时可用假 ctx 替代，避免真实文件系统与全局日志；

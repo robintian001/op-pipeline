@@ -16,9 +16,9 @@
 | 新配置格式 | `PipelineSpec.register_loader(suffix, fn)` 注册表（M3-8）：内建 json/toml/yaml 亦为注册项；`fn(path) -> dict`，后缀自动归一化（`"fake"`/`".fake"` 等价），未知后缀报错并列出已注册格式 | 只新增注册调用，不改框架 | 稳定（M3-8） |
 | 算子别名 | `Registry.register(aliases=...)` | 算子声明 | 稳定 |
 | 自定义缓存 | 传入 `CacheStore` 兼容对象 | `run_pipeline` / `Engine` | 弱契约（鸭子类型） |
-| 替换执行器 | 实现 `Executor` 协议（submit/wait/shutdown）；内置 `ThreadExecutor`（默认）、`ProcessExecutor`（硬超时，M2-2）、`QueueWorkerExecutor`（共享队列 + worker 进程，M4-4） | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py)、[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py) | 稳定（M2-1） |
-| 替换句柄存储 | 实现 `HandleStore` 协议（get/put/snapshot/items）；内置 `InMemoryHandleStore`（默认）与 `SpillHandleStore`（超阈值落盘、按需加载，M2-4） | [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py) | 稳定（M2-3） |
-| 运行存储 | 实现 `RunStore`（`record_run`/`record_node`/`query`/`prev_node`）；内置 SQLite 实现（M2-5），默认关闭零副作用；M2-6 起引擎以 `run_store=...` + `resume_run_id=...` 实现断点续跑 | [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/store.py) | 稳定（M2-5） |
+| 替换执行器 | 实现 `Executor` 协议（submit/wait/shutdown）；内置 `ThreadExecutor`（默认）、`ProcessExecutor`（硬超时，M2-2）、`QueueWorkerExecutor`（共享队列 + worker 进程，M4-4） | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/executor.py)、[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/remote.py) | 稳定（M2-1） |
+| 替换句柄存储 | 实现 `HandleStore` 协议（get/put/snapshot/items）；内置 `InMemoryHandleStore`（默认）与 `SpillHandleStore`（超阈值落盘、按需加载，M2-4） | [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/handlestore.py) | 稳定（M2-3） |
+| 运行存储 | 实现 `RunStore`（`record_run`/`record_node`/`query`/`prev_node`）；内置 SQLite 实现（M2-5），默认关闭零副作用；M2-6 起引擎以 `run_store=...` + `resume_run_id=...` 实现断点续跑 | [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/store.py) | 稳定（M2-5） |
 | 执行事件钩子 | 实现 `Hook` 协议（`on_node_start`/`on_node_finish`/`on_run_finish`，可只实现其一）；`Engine(hooks=[...])` / `run_pipeline(hooks=[...])` / `run(hooks=[...])` 挂载；进度条/日志聚合/OTel/UI 从这里取数（M2-7） | `engine.py` `_run_node`（start/finish）与 `run()` 末尾（run_finish） | 稳定（M2-7） |
 | async 宿主桥接 | `run_pipeline_async`（`loop.run_in_executor` 包装同步引擎，参数/返回值与 `run_pipeline` 一致）；async 宿主内 `await` 不阻塞事件循环（M2-8） | `engine.py` `run_pipeline_async`，包顶层导出 | 稳定（M2-8） |
 | 缓存指纹策略 | `CacheStore.compute_key` 签名扩展：`source` 参数（算子源码摘要）默认纳入指纹——算子源码变更即缓存失效；显式 `include_source=False` 可关闭（M2-5/T7 出债，M5-4 起默认开启） | `cache.py` | 弱契约（鸭子类型） |
@@ -110,7 +110,7 @@ from op_pipeline import load_plugins
 load_plugins(entry_points=True)
 ```
 
-加载顺序（[registry.py#L197-L360](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L197-L360)）：
+加载顺序（[registry.py#L197-L360](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/registry.py#L197-L360)）：
 内置 `op_pipeline.ops` → 入口点 → `modules` → `paths`。文件加载的模块名是
 `_op_plugin_<路径 blake2b 摘要>`（同一文件重复加载幂等跳过；指定 `registry` 时为
 `_op_plugin_<stem>_<序号>`，跨注册表各执行一次）。入口点按包分发去重（同一已安装包
@@ -140,7 +140,7 @@ load_plugins(paths=["plugins/my_ops.py"], registry=reg)  # 插件进 reg，内�
 report, values = run("my_pipeline.toml", registry=reg)   # default_registry 全程不受影响
 ```
 
-要点（[registry.py#L106-L143](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/registry.py#L106-L143)）：
+要点（[registry.py#L106-L143](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/registry.py#L106-L143)）：
 
 - 裸 `@op("x.y")` 写法的插件文件也能定向：`load_plugins(..., registry=...)` 加载期间
   `@op` 落到目标表（contextvar 实现，线程/任务隔离）；
@@ -260,7 +260,7 @@ class CacheStore:
 
 ### 4.2 执行器
 
-引擎已抽象出 `Executor` 协议（[executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py)，M2-1），
+引擎已抽象出 `Executor` 协议（[executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/executor.py)，M2-1），
 默认 `ThreadExecutor` 平移原线程池行为：
 
 ```python
@@ -288,7 +288,7 @@ class Executor(Protocol):
 输入全部可 pickle 且子进程能按模块名 import 其定义（插件文件里的算子
 需要注意子进程的可见性）。
 
-**远程执行示范（M4-4）**：`QueueWorkerExecutor`（[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py)，
+**远程执行示范（M4-4）**：`QueueWorkerExecutor`（[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/remote.py)，
 M4-4）把任务分发给独立 worker 进程——客户端 `submit` 把载荷
 `pickle → base64` 逐行追加进 JSONL 队列文件，worker 进程
 （`python -m op_pipeline worker --queue <path> [--out <dir>]`，新 CLI 入口）
@@ -299,7 +299,7 @@ M4-4）把任务分发给独立 worker 进程——客户端 `submit` 把载荷
 `spawn` 子进程 + 硬超时，由引擎内部调度；`QueueWorkerExecutor` 面向
 "独立 worker 进程/跨机器（共享挂载盘）"，任务与结果通过文件系统交换，
 不要求 worker 与客户端同机。端到端示范见
-[examples/remote_exec_demo.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/examples/remote_exec_demo.py)。
+[examples/remote_exec_demo.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/examples/remote_exec_demo.py)。
 
 > 边界说明（M5-1 起已接入）：`run_pipeline(executor=...)` / `Engine` 的
 > `executor` 参数接受 `str | Executor | None`——传任意 `Executor` 实例时引擎
@@ -326,7 +326,7 @@ M4-4）把任务分发给独立 worker 进程——客户端 `submit` 把载荷
 
 | # | 缺口 | 证据 | 影响 | 建议落点 |
 | --- | --- | --- | --- | --- |
-| T13 | `strict=False` 可返回残缺 Plan | [spec.py#L587](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L587)（默认参数）与 [spec.py#L729-L730](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L729-L730)（残缺 Plan 返回） | 无调用方使用，属预留 | **已收口（M5-4）：保留行为并文档明确，默认 `strict=True` 不变，无调用方** |
+| T13 | `strict=False` 可返回残缺 Plan | [spec.py#L587](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L587)（默认参数）与 [spec.py#L729-L730](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L729-L730)（残缺 Plan 返回） | 无调用方使用，属预留 | **已收口（M5-4）：保留行为并文档明确，默认 `strict=True` 不变，无调用方** |
 
 > 剩余按需处理。**T13 已收口（M5-4）**：保留 `strict=False` 行为（无调用方、非默认）
 > 并文档明确——默认 `strict=True` 不变，属"文档明确而非删代码"的收口。
@@ -354,15 +354,15 @@ M4-4）把任务分发给独立 worker 进程——客户端 `submit` 把载荷
 
 | 演进方向 | 具体设计 | 落点 |
 | --- | --- | --- |
-| 硬超时 | **已实现（M2-2）**：`ProcessExecutor` 每任务一子进程，`timeout` 到点 `terminate()`；结果/异常经管道序列化回传；不可 pickle 回退线程 | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py)；`Engine._execute_in_process` |
+| 硬超时 | **已实现（M2-2）**：`ProcessExecutor` 每任务一子进程，`timeout` 到点 `terminate()`；结果/异常经管道序列化回传；不可 pickle 回退线程 | [executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/executor.py)；`Engine._execute_in_process` |
 | asyncio 调度 | **部分已实现（M2-8）**：`run_pipeline_async` 以 `run_in_executor` 桥接 async 宿主（参数/返回值与同步版一致，事件循环不被阻塞，见 [runtime-semantics §6.3](../architecture/runtime-semantics.md#63-async-宿主嵌入m2-8)）；全 asyncio 调度器（引擎内 `asyncio.wait(FIRST_COMPLETED)` 调度同步与异步算子）仍不在范围 | `engine.py` `run_pipeline_async` |
-| 持久化元数据 | **已实现（M2-5/M2-6）**：`RunStore` 把运行与节点状态写入 SQLite（`runs`/`nodes` 两表：status/attempts/error/cache_key/时间），`Engine._collect` 与 `_mark_skipped` 入库；断点续跑 `--resume` 已实现（M2-6）：构造时预载参考 run 的 nodes 记录进 `_resume_map`，缓存命中且 cache_key 一致 → 标记 `[resumed]` | [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/store.py)；`Engine._collect`/`run` 汇总处、`Engine.__init__` |
+| 持久化元数据 | **已实现（M2-5/M2-6）**：`RunStore` 把运行与节点状态写入 SQLite（`runs`/`nodes` 两表：status/attempts/error/cache_key/时间），`Engine._collect` 与 `_mark_skipped` 入库；断点续跑 `--resume` 已实现（M2-6）：构造时预载参考 run 的 nodes 记录进 `_resume_map`，缓存命中且 cache_key 一致 → 标记 `[resumed]` | [store.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/store.py)；`Engine._collect`/`run` 汇总处、`Engine.__init__` |
 | 可选 schema | 端口支持 `dataclass`/`pydantic` 类型；在 `_prepare_inputs` 前做深校验 | `ports.value_matches` + `Operator._prepare_inputs` |
 | 分布式 | 抽出 `Executor` 协议；句柄改引用（对象存储 key / Arrow 表） | `engine.py` + `context.py` |
-| 大对象 | **已实现（M2-4）**：`SpillHandleStore` 句柄表存路径占位而非值；`get` / 快照按键访问时 pickle 按需加载；惰性快照使成员检查与迭代零 IO | [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py)、`Engine` attach 钩子 |
+| 大对象 | **已实现（M2-4）**：`SpillHandleStore` 句柄表存路径占位而非值；`get` / 快照按键访问时 pickle 按需加载；惰性快照使成员检查与迭代零 IO | [handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/handlestore.py)、`Engine` attach 钩子 |
 
 这些演进有一个共同前置条件：**句柄访问必须收敛到少数几个函数**。
-M2-3 起收敛点已落在 `HandleStore` 接口（[handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/handlestore.py)）：
+M2-3 起收敛点已落在 `HandleStore` 接口（[handlestore.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/handlestore.py)）：
 写 = `Engine._publish` → `store.put`，读 = `RefResolver._lookup` → `store.snapshot()` 后查表
 （引擎经 `Engine(handle_store=...)` 注入自定义实现即可）。
 不要在算子内部直接读写句柄表。

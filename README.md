@@ -242,7 +242,7 @@ from op_pipeline import load_plugins
 load_plugins(entry_points=True)  # 扫描已安装插件包入口点
 ```
 
-发布插件包的完整指南见 [扩展设计 §3.4](../op-pipeline/docs/design/extension-points.md#34-插件包发布指南pip-分发m3-4)。
+发布插件包的完整指南见 [扩展设计 §3.4](../docs/design/extension-points.md#34-插件包发布指南pip-分发m3-4)。
 
 ---
 
@@ -315,9 +315,9 @@ exec_.wait([f])
 print(f.result())  # 42
 ```
 
-双进程端到端示范见 [examples/remote_exec_demo.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/examples/remote_exec_demo.py)
+双进程端到端示范见 [examples/remote_exec_demo.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/examples/remote_exec_demo.py)
 （脚本扮演引擎进程提交 3 个任务、另起 worker 子进程消费，含异常回写演示）。
-数据生态示例 [examples/pipeline_data_ecosystem.toml](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/examples/pipeline_data_ecosystem.toml)
+数据生态示例 [examples/pipeline_data_ecosystem.toml](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/examples/pipeline_data_ecosystem.toml)
 （CSV → Parquet → Excel 往返读写）：
 
 ```bash

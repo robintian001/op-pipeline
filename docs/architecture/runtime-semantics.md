@@ -12,8 +12,8 @@
   Plan + RunContext + CacheStore ──► Engine.run() ──► RunReport + handles
 ```
 
-编译入口见 [build_plan()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L328-L487)，
-执行入口见 [Engine.run()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L252-L336)。
+编译入口见 [build_plan()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L328-L487)，
+执行入口见 [Engine.run()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L252-L336)。
 
 ---
 
@@ -33,13 +33,13 @@ for k, v in overrides:
 params = RefResolver(params, {}, os.environ).resolve(params)   # 展开 ${env.X}
 ```
 
-源码：[spec.py#L339-L351](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L339-L351)。
+源码：[spec.py#L339-L351](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L339-L351)。
 注意参数之间**不保证**能互相引用：`RefResolver` 用的是同一个 `params` 字典，因此
 `a = "${p.b}"` 只在 `b` 已存在于字典时才能解析成功，不存在则报 `RefResolutionError`。
 
 ### 1.2 节点 id 唯一性
 
-统计出现次数，重复即问题项（[spec.py#L353-L359](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L353-L359)）。
+统计出现次数，重复即问题项（[spec.py#L353-L359](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L353-L359)）。
 
 ### 1.3 算子存在性、参数合法性、句柄归属
 
@@ -48,9 +48,9 @@ params = RefResolver(params, {}, os.environ).resolve(params)   # 展开 ${env.X}
 1. `registry.get(node.op)` 失败（含未注册、别名不存在）→ 问题项；
 2. 若 `node.params` **不含**任何 `${}` 引用，直接 `cls(**node.params)` 实例化，
    把参数校验前移到编译期；若含引用，则只做"参数名是否声明"的静态检查，
-   实例化推迟到运行期（[spec.py#L370-L387](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L370-L387)）；
+   实例化推迟到运行期（[spec.py#L370-L387](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L370-L387)）；
 3. 为每个输出端口计算句柄：`node.outputs.get(port, f"{id}.{port}")`，
-   重复占用直接报错（[spec.py#L389-L403](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L389-L403)）。
+   重复占用直接报错（[spec.py#L389-L403](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L389-L403)）。
 
 > 设计要点：句柄归属表是在**遍历所有节点之后**才用于引用检查的，
 > 因此配置里节点的书写顺序无关紧要，前向引用（引用写在后面的节点）天然合法。
@@ -60,10 +60,10 @@ params = RefResolver(params, {}, os.environ).resolve(params)   # 展开 ${env.X}
 - `RefResolver.static_target()` 递归提取 `inputs` 与 `params` 中所有 `${...}` 路径；
   以 `p.` / `params.` / `env.` 开头的跳过（参数与环境变量不产生依赖）。
 - 其余引用用 `match_handle()` 做**最长前缀匹配**（支持 `${node.port.field}` 下钻），
-  匹配到的句柄所属节点即成为依赖（[spec.py#L421-L437](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L421-L437)）。
+  匹配到的句柄所属节点即成为依赖（[spec.py#L421-L437](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L421-L437)）。
 - 自引用即自环，报错并剔除该依赖。
 - 算子声明的非 optional 输入端口若未接线，报错
-  （[spec.py#L439-L448](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L439-L448)）。
+  （[spec.py#L439-L448](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L439-L448)）。
 
 > 依赖是**由引用推导**出来的，配置里没有独立的 `depends_on` 字段。
 > 这保证了"图"与"数据流"永远一致，不可能出现声明依赖但没接线的情况。
@@ -73,7 +73,7 @@ params = RefResolver(params, {}, os.environ).resolve(params)   # 展开 ${env.X}
 - `spec.outputs` 里的引用同样做句柄存在性校验；
 - 仅当此前没有任何问题时才做 Kahn 拓扑排序（同层按名字排序，保证结果稳定），
   否则环检测的噪音会掩盖真正的配置错误
-  （[spec.py#L469-L515](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L469-L515)）。
+  （[spec.py#L469-L515](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L469-L515)）。
 
 `Plan` 一旦产出，执行阶段不再回看配置文本。
 
@@ -93,7 +93,7 @@ pending ──┬─► running ──► success ──► 下游可调度
 ```
 
 引擎内部用两个并发字典跟踪：`_results[node_id] = NodeResult`、`_completed[node_id] = status`
-（[engine.py#L217-L218](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L217-L218)）。
+（[engine.py#L217-L218](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L217-L218)）。
 
 ### 2.2 主循环
 
@@ -111,12 +111,12 @@ while pending or running:
         mark_all_pending_skipped("依赖无法满足")
 ```
 
-源码：[engine.py#L275-L288](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L275-L288)。
+源码：[engine.py#L275-L288](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L275-L288)。
 
 ### 2.3 dispatch 的决策顺序
 
 对 `pending` 中的每个节点（按拓扑序）依次判断
-（[engine.py#L344-L402](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L344-L402)）：
+（[engine.py#L344-L402](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L344-L402)）：
 
 1. **取消已触发**（`cancel_event` 被置位或 `Engine.cancel()` 被调用）→ 全部标记 skipped，
    注明"运行已被取消：\<原因\>"，并向报告 `warnings` 追加一条取消告警；
@@ -142,8 +142,8 @@ env = {
 }
 ```
 
-源码：[engine.py#L404-L422](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L404-L422)。
-求值走 [evaluate_condition()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/expression.py#L172-L174)，
+源码：[engine.py#L404-L422](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L404-L422)。
+求值走 [evaluate_condition()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/expression.py#L172-L174)，
 即 AST 白名单（见 [核心模块设计 §5](../design/core-modules.md#5-expressionpy安全表达式)）。
 
 > `when = "params.n > 0"` 与 `when = "n > 0"` 完全等价；点语法对映射做键下钻
@@ -174,8 +174,8 @@ except: status = failed, error = "Type: message", traceback = format_exc()（截
 finally: duration = now - started_at
 ```
 
-源码：[engine.py#L467-L540](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L467-L540)。
-`_publish` 在锁内写共享句柄表（[engine.py#L542-L547](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L542-L547)）。
+源码：[engine.py#L467-L540](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L467-L540)。
+`_publish` 在锁内写共享句柄表（[engine.py#L542-L547](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L542-L547)）。
 
 > M2-4 `SpillHandleStore` 的落盘语义：`put` 时按 `pickle.dumps` 结果量大小，
 > 超过阈值（默认 1MB）的值写盘（目录默认 `artifacts_dir/spill`，引擎在构造时经
@@ -201,7 +201,7 @@ finally: duration = now - started_at
 | `fail_fast=true` 且出现硬失败 | failed | skipped | **停止调度** | `failed` |
 
 硬失败判定：`status == failed && not allow_failure`
-（[engine.py#L341-L343](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L341-L343)）。
+（[engine.py#L341-L343](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L341-L343)）。
 
 ### 3.2 重试与退避
 
@@ -215,7 +215,7 @@ for attempt in 1..attempts:
         sleep(max(0, retry_delay) * 2 ** (attempt - 1))
 ```
 
-源码：[engine.py#L549-L580](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L549-L580)。
+源码：[engine.py#L549-L580](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L549-L580)。
 
 `ConfigError` 覆盖其全部子类：`SpecValidationError`、`ParamValidationError`、
 `RefResolutionError`、`CycleError`、`OperatorNotFoundError`、`DuplicateOperatorError`。
@@ -236,8 +236,8 @@ for attempt in 1..attempts:
 
 两种模式的超时失败都会进入重试逻辑，因此超时 + 重试可能导致同一算子并发多份实例执行。
 
-源码：[engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) `_execute_once` / `_execute_in_process`、
-[executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/executor.py) `ProcessExecutor.wait`。
+源码：[engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py) `_execute_once` / `_execute_in_process`、
+[executor.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/executor.py) `ProcessExecutor.wait`。
 
 ### 3.4 异常信息的保留
 
@@ -338,8 +338,8 @@ key = blake2b(20 bytes, json.dumps({
 }, sort_keys=True))
 ```
 
-源码：[cache.py#L70-L91](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cache.py#L70-L91)，
-指纹算法见 [fingerprint()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/cache.py#L19-L42)：
+源码：[cache.py#L70-L91](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/cache.py#L70-L91)，
+指纹算法见 [fingerprint()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/cache.py#L19-L42)：
 标量用 `类型:repr`，容器递归并按 key 排序，类 DataFrame 对象用 `shape + to_json()[:2000]`，其余退化为 `repr`。
 
 由此得到三个期望性质：
@@ -354,7 +354,7 @@ key = blake2b(20 bytes, json.dumps({
 ### 4.2 生效条件
 
 只有同时满足以下三点才读写缓存
-（[engine.py#L483-L513](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py#L483-L513)）：
+（[engine.py#L483-L513](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py#L483-L513)）：
 
 1. 节点 `cache = true`；
 2. `CacheStore.enabled`（目录非空）；
@@ -431,7 +431,7 @@ status = "failed"   if hard_failures
 不是完整数据；完整数据通过 `run_pipeline()` 返回的 `handles` 获取。
 
 **端口软类型告警（M1-1 起）**：`run()` 汇总阶段调用
-[check_handle_types()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py#L553-L580)
+[check_handle_types()](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py#L553-L580)
 对每个已产出句柄做声明类型与实际类型的核对，不符时写入 `warnings`
 （如 `节点 [src] 句柄 'src.value' 声明 int，实际 str`）。值**照常向下游传递**，
 运行状态不受影响——类型声明是文档与排障信息，不是执行门禁；缺失的句柄
@@ -617,8 +617,8 @@ RunReport（summary() / to_json()）+ handles
 
 ## 8. 修改引擎时的检查清单
 
-改动 [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/engine.py) 或
-[spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/spec.py) 时，下面这些不变量必须仍然成立：
+改动 [engine.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/engine.py) 或
+[spec.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/spec.py) 时，下面这些不变量必须仍然成立：
 
 1. 节点只在其全部 `depends_on` 完成后才被提交；
 2. 任何 failed/skipped 状态都必须写入 `_completed`，否则调度会永久卡住；
@@ -633,7 +633,7 @@ RunReport（summary() / to_json()）+ handles
 
 > 小节索引：§9 队列执行器示范（M4-4）→ §9.1 引擎接入（M5-1）→ §9.2 租约与故障回收（v0.8）。
 
-`QueueWorkerExecutor`（[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py)）
+`QueueWorkerExecutor`（[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/remote.py)）
 实现 `Executor` 协议（submit/wait/shutdown），但把任务分发给**独立 worker 进程**执行，
 客户端与 worker 之间只通过共享文件系统交换：
 
