@@ -21,6 +21,7 @@ import hashlib
 import logging
 import os
 import pickle
+import shutil
 import threading
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
@@ -133,32 +134,85 @@ class SpillHandleStore:
 
     文件名 = ``<句柄名>.<blake2b 摘要>.pkl``：摘要防大小写不敏感文件系统
     上的名字碰撞（Windows 把 ``A.x`` / ``a.x`` 视为同一文件）。
+
+    ``cleanup``（M7-4 Task 10）控制运行结束后的落盘目录清理：
+
+    - ``"never"``（默认，兼容 v0.7.0）：目录保留，行为不变；
+    - ``"on_run_success"``：本次运行成功时由引擎删除 attach 注入的
+      落盘目录（失败/取消保留，便于排障）。显式传 ``spill_dir`` 时目录
+      生命周期归调用方，引擎不会删除。
     """
+
+    _CLEANUP_POLICIES = ("never", "on_run_success")
 
     def __init__(
         self,
         *,
         threshold: int = 1_000_000,
         spill_dir: str | os.PathLike | None = None,
+        cleanup: str = "never",
     ) -> None:
+        if cleanup not in self._CLEANUP_POLICIES:
+            raise ValueError(
+                "cleanup 只能是 'never' 或 'on_run_success'，"
+                f"实际是 {cleanup!r}"
+            )
         self._lock = threading.RLock()
         self._threshold = int(threshold)
+        self._cleanup = cleanup
         self._data: dict[str, Any] = {}
+        self._explicit_dir = spill_dir is not None
         self._spill_dir = (
             Path(spill_dir).expanduser() if spill_dir is not None else None
         )
+        # attach 注入的目录（≠ 显式 spill_dir）：清理只针对它，避免误删调用方目录
+        self._attached_dir: Path | None = None
 
     @property
     def spill_dir(self) -> Path | None:
         """当前落盘目录（attach 前可能为 None）。"""
         return self._spill_dir
 
+    @property
+    def cleanup(self) -> str:
+        """清理策略（``never`` / ``on_run_success``）。"""
+        return self._cleanup
+
     def attach(self, context: Any) -> None:
-        """`Engine` 构造时注入运行上下文：未显式指定目录则挂 artifacts_dir。"""
-        if self._spill_dir is None:
-            base = getattr(context, "artifacts_dir", None)
-            if base is not None:
-                self._spill_dir = Path(base) / "spill"
+        """`Engine` 构造时注入运行上下文：未显式指定目录则挂 artifacts_dir。
+
+        M7-4 Task 10：同一 store 复用多次运行时重新挂到本次 run 的目录，
+        上次 run 的目录不会被误删（清理只删本次 attach 的目录）。
+        """
+        if self._explicit_dir:
+            return
+        base = getattr(context, "artifacts_dir", None)
+        if base is not None:
+            self._spill_dir = Path(base) / "spill"
+            self._attached_dir = self._spill_dir
+
+    def cleanup_run_dir(self) -> None:
+        """删除本次运行 attach 的落盘目录（M7-4 Task 10）。
+
+        只删 attach 注入的目录（显式 ``spill_dir`` 归调用方管理）；删除前
+        先把落盘句柄加载回内存，保证运行结束后 store 仍可读（``run_pipeline``
+        会在 run 结束后物化全量快照）。失败/取消时调用方不调用本方法。
+        """
+        target = self._attached_dir
+        if target is None:
+            return
+        self._attached_dir = None
+        with self._lock:
+            for name, ref in list(self._data.items()):
+                if not isinstance(ref, _SpilledRef):
+                    continue
+                try:
+                    self._data[name] = pickle.loads(ref.path.read_bytes())
+                except OSError:
+                    # 文件已不在：保持原引用，读取时按既有语义报错
+                    continue
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=False)
 
     def put(self, name: str, value: Any) -> None:
         try:

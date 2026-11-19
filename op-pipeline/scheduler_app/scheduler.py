@@ -4,6 +4,8 @@
   可选 ``--registry/--plugin/--workdir/--cache-dir/--db``；
 - M6：``--pipeline`` 可重复（多流水线每轮按顺序全部触发）；``--alert-webhook``
   在运行失败时 POST JSON 告警；``--keep-runs`` 每轮结束后清理历史运行记录；
+- M7-3：``--alert-silence <秒>`` 告警静默窗口：同一 pipeline 在窗口内失败只发送
+  一次告警（内存记录上次发送时刻，进程内有效，多 pipeline 互不影响）；
 - 启动后立即执行一次，之后每 ``--every`` 秒执行一次；
 - 每次运行结果写入 RunStore（复用 M2-5 SQLite 运行记录库）；
 - Ctrl+C / KeyboardInterrupt 干净退出：打印退出信息，退出码 0；
@@ -40,6 +42,7 @@ def run_scheduler(
     cache_dir: str | Path | None = ".pipeline_cache",
     db: str | Path | None = None,
     alert_webhook: str | None = None,
+    alert_silence: float | None = None,
     keep_runs: int | None = None,
     stop_event: threading.Event | None = None,
     logger: logging.Logger | None = None,
@@ -57,6 +60,8 @@ def run_scheduler(
     - ``db``：RunStore SQLite 路径；给定则每次运行结果落库，None = 不落库；
     - ``alert_webhook``：告警 Webhook URL；运行状态非 success 或抛异常时 POST
       ``{"pipeline","run_id","status","error"}``，发送失败只记 warning；
+    - ``alert_silence``：告警静默窗口（秒）；同一 pipeline 距上次实际发送不足该
+      时长时跳过告警，``None`` 或 ``<= 0`` 表示不静默（与 M6 行为一致）；
     - ``keep_runs``：每轮结束后保留最近 N 条运行记录（``RunStore.prune``）；
       ``None`` 或 ``<= 0`` 表示不清理；
     - ``stop_event``：置位后当前轮结束即退出循环（默认内部自建）；
@@ -76,6 +81,8 @@ def run_scheduler(
     from op_pipeline import RunStore
 
     store = RunStore(db) if db is not None else None
+    # M7-3：告警静默窗口的内存记录（pipeline_key -> 上次实际发送的 monotonic）
+    last_alert_at: dict[str, float] = {}
     count = 0
     try:
         while not stop.is_set():
@@ -92,7 +99,10 @@ def run_scheduler(
                 )
                 count += 1
                 if not ok and alert_webhook:
-                    _send_alert(alert_webhook, cfg, info, logger)
+                    _maybe_alert(
+                        alert_webhook, cfg, info, alert_silence,
+                        last_alert_at, logger,
+                    )
                 if stop.is_set():
                     break
             # M6：每轮结束（全部流水线跑完）后按保留策略清理历史
@@ -126,6 +136,35 @@ def _normalize_pipelines(
     if not items:
         raise ValueError("pipeline 不能为空序列")
     return items
+
+
+def _maybe_alert(
+    webhook: str,
+    pipeline: str | Path,
+    info: dict[str, str],
+    alert_silence: float | None,
+    last_alert_at: dict[str, float],
+    logger: logging.Logger,
+) -> None:
+    """M7-3：按静默窗口决定是否发送告警。
+
+    ``alert_silence`` 为 ``None``/``<= 0`` 时行为与 M6 完全一致（每次失败都发）；
+    否则同一 pipeline 距上次实际发送不足 ``alert_silence`` 秒时跳过并记 info 日志。
+    多 pipeline 以配置路径为 key，互不影响。
+    """
+    key = str(pipeline)
+    silence = alert_silence if alert_silence and alert_silence > 0 else None
+    if silence is not None:
+        last = last_alert_at.get(key)
+        now = time.monotonic()
+        if last is not None and (now - last) < silence:
+            logger.info(
+                "告警静默：pipeline=%s 距上次告警 %.2fs < %.2fs，跳过本轮",
+                key, now - last, silence,
+            )
+            return
+    _send_alert(webhook, pipeline, info, logger)
+    last_alert_at[key] = time.monotonic()
 
 
 def _send_alert(
@@ -250,6 +289,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="告警 Webhook：运行失败时 POST JSON 到该地址（默认不告警）",
     )
     parser.add_argument(
+        "--alert-silence", type=float, default=None, metavar="SECONDS",
+        help="告警静默窗口（秒）：同 pipeline 窗口内失败只告警一次（默认不静默）",
+    )
+    parser.add_argument(
         "--keep-runs", type=int, default=None, metavar="N",
         help="每轮结束后仅保留最近 N 条运行记录（N<=0 表示不清理）",
     )
@@ -274,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         cache_dir=args.cache_dir,
         db=args.db,
         alert_webhook=args.alert_webhook,
+        alert_silence=args.alert_silence,
         keep_runs=args.keep_runs,
         stop_event=stop,
     )

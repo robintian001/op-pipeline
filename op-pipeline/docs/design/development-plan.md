@@ -11,7 +11,7 @@
 
 | 约定项 | 内容 |
 | --- | --- |
-| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4`；M4 → `0.5`；M5 → `0.6`；M6 → `0.7` |
+| 版本节奏 | M1 → `0.2.0`；M1.5 各任务独立发 `0.2.x` 小版本（一任务一 PR 一发布，小步快跑）；M2 → `0.3`；M3 → `0.4`；M4 → `0.5`；M5 → `0.6`；M6 → `0.7`；M7 → `0.8` |
 | 合入门槛 | `python -m unittest discover -s tests -v` 全绿 + 新任务自带测试 + 两个示例流水线端到端通过 |
 | 回归基线 | 每个任务合入前先跑基线；M2 的抽象类任务要求"平移后行为零变化"（现有 21 用例不改断言） |
 | 文档同步 | 改动涉及节点字段/执行语义/CLI 的，同一变更内更新 [运行时语义](../architecture/runtime-semantics.md) 与 [配置规范](../reference/config-schema.md)；新增算子更新 [算子清单](../reference/operator-catalog.md) |
@@ -425,6 +425,30 @@
 > `pipeline_text.toml --plugin plugins/demo_ops.py`、`examples/remote_exec_demo.py`
 > 三个端到端均退出码 0；wheel 元数据 0.7.0、含 `py.typed`，临时目录安装后
 > `op_pipeline ops --json` 得 50 个算子。
+
+---
+
+## 7.6 M7：远程执行可靠性、配置体验与资源治理（v0.8）
+
+目标：把"能跑通"的远程执行补成"故障可回收"，把配置与脚手架补成"可自助上手"，
+并为缓存/落盘补上容量治理；内核语义与默认行为保持不变，全部为可选加法。
+
+| 编号 | 方向 | 关键交付 |
+| --- | --- | --- |
+| M7-1 | 远程执行可靠性 | `QueueWorkerExecutor(..., lease_seconds, max_attempts)` 把租约写进队列行；worker 以 `claims/<job_id>.json` 原子认领、daemon 心跳续租、空闲扫描过期租约按 attempt 重投或写 error（含"超过重投上限"）；CLI `worker` 新增 `--lease-seconds`/`--max-attempts`/`--owner`；新增 `queue compact` 归档已处理条目并原子清空活跃队列 |
+| M7-2 | 配置体验与脚手架 | `validate --json`（只校验不执行）；`init --template minimal\|data\|scheduler`；`scaffold op`；配置字符串支持解析期 `${env:NAME}` / `${env:NAME:-default}`；报告 `params` 对 `TOKEN\|SECRET\|PASSWORD\|KEY` 键名与敏感 env 值打码 |
+| M7-3 | 运维外围 | Web UI `/compare` 节点级并集差异、`/api/runs` 分页筛选、`/api/runs/<id>`、Prometheus `/metrics`；`run_scheduler(..., alert_silence=...)` + CLI `--alert-silence` 窗口内只告警一次 |
+| M7-4 | 数据与缓存治理 | `SpillHandleStore(cleanup="on_run_success")` 成功后清理本次 run 的落盘目录；`CacheStore(max_entries/max_bytes)` 容量淘汰 + 命中刷新 + `key_lock` 单飞；CLI `run` 新增 `--cache-max-entries`/`--cache-max-bytes`/`--spill-warn-bytes`；`storage_warnings()` 超阈值写入中文告警 |
+
+**M7 完成定义（DoD）**：全量回归全绿；主示例、插件示例与远程双进程示范端到端通过；
+`pyproject.toml` 升 `0.8.0`；`CHANGELOG` 归档 0.8.0；配置规范/运行时语义/运维指南/API 清单
+与实现对齐，算子数保持 50。
+
+> **M7 已完成并关闭（v0.8.0，2026-11-19）**：M7-1 ~ M7-4 全部落地，无 BREAKING——
+> 所有新增参数可选、默认行为与 v0.7.0 一致，RunStore schema 无变化，算子总数仍为 50。
+> 文档同步：配置规范（`${env:...}`、缓存容量、spill 清理）、运行时语义（§4.5 缓存 LRU
+> 与单飞、§9.2 队列租约与故障回收）、运维指南（`queue compact`、worker 租约参数、
+> `--alert-silence`、`/compare`/`/api/runs`/`/metrics`）与稳定 API 清单。
 
 ---
 

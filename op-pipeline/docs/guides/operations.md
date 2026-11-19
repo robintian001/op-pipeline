@@ -81,6 +81,19 @@ python -m scheduler_app.scheduler --pipeline pipeline.json --every 60 --db runs.
 - `N <= 0` 视为**不清理**（调度器侧跳过，不调用 `prune`）；
 - 不传该参数时不做任何清理，历史记录只增不减。
 
+### 1.4 告警静默：`--alert-silence`（v0.8）
+
+```powershell
+python -m scheduler_app.scheduler --pipeline pipeline.json --every 60 --db runs.db `
+  --alert-webhook https://example.internal/hooks/pipeline-alert `
+  --alert-silence 1800
+```
+
+- 同一 pipeline 距**上次实际发送**告警不足 `--alert-silence` 秒时跳过本次告警（记 info 日志）；
+- 不传或 `<= 0` 时行为与 v0.7 一致（每次失败都发）；
+- 静默记录只存在调度进程内存中，重启后重置；程序化调用为
+  `run_scheduler(..., alert_webhook=..., alert_silence=1800)`。
+
 ---
 
 ## 2. Web UI：`scheduler_app.web`
@@ -108,6 +121,47 @@ v0.7 起的能力（M6 Task 7）：
 
 旧库没有 `nodes.duration` 列时页面照常渲染，不会报错；该列由 v0.7 的 RunStore
 在建表/补列时写入，新产生的运行才有耗时可展示。
+
+### 2.1 运行对比页：`/compare`（v0.8）
+
+```text
+GET /compare?a=<run_id>&b=<run_id>
+```
+
+- 缺任一参数返回 **400** 纯文本；run 不存在返回 **404** 并列出缺失的 run_id；
+- 页面展示两次运行的状态、总耗时，以及节点级并集差异：仅一侧存在的节点标注"仅 A/仅 B"，
+  共有节点展示各自耗时与差值（`+` / `-`）；
+- `nodes` 表没有 `resumed` 列，因此对比页只按 `cached` 展示「缓存/—」。
+
+### 2.2 只读 JSON API 与指标（v0.8）
+
+| 路径 | 返回 |
+| --- | --- |
+| `GET /api/runs?page=1&size=20&status=failed` | `{"items": [...], "total": N, "page": 1, "size": 20}`；分页/筛选语义与列表页一致 |
+| `GET /api/runs/<run_id>` | `{"run": {...}, "nodes": [...]}`；run 不存在返回 404 JSON `{"error": "..."}` |
+| `GET /metrics` | Prometheus 文本，`Content-Type: text/plain; version=0.0.4; charset=utf-8` |
+
+```bash
+curl -s 'http://127.0.0.1:8000/api/runs?status=failed&size=5'
+curl -s 'http://127.0.0.1:8000/api/runs/20260719-101500-ab12'
+curl -s 'http://127.0.0.1:8000/metrics'
+```
+
+`/metrics` 输出片段：
+
+```text
+# HELP op_pipeline_runs_total 按状态统计的运行次数
+# TYPE op_pipeline_runs_total counter
+op_pipeline_runs_total{status="success"} 12
+op_pipeline_runs_total{status="failed"} 2
+op_pipeline_runs_total{status="partial"} 1
+op_pipeline_runs_total{status="skipped"} 0
+# HELP op_pipeline_runs_duration_seconds 全部运行耗时总和（秒）
+# TYPE op_pipeline_runs_duration_seconds counter
+op_pipeline_runs_duration_seconds 183.420000
+```
+
+四个状态始终输出（无记录为 0）；耗时取 `SUM(finished_at - started_at)`。
 
 ---
 
@@ -190,6 +244,9 @@ python -m op_pipeline worker --queue jobs.jsonl --out results --count 8 --poll 0
 | `--count N` | 最多消费 N 个任务后正常退出；不传则持续监听直到 `Ctrl+C`（exit 130） |
 | `--poll` | 队列轮询间隔秒数（默认 0.1） |
 | `--workers N` | **v0.7 起支持**：并发执行任务的 worker 线程数（默认 1；`N <= 0` 报错）。`--count` 的语义是"最多认领的任务数" |
+| `--lease-seconds S` | **v0.8 起支持**：任务租约秒数（默认 0 = 关闭租约）；队列行内值优先 |
+| `--max-attempts N` | **v0.8 起支持**：租约过期后的最大 attempt（默认 3）；队列行内值优先 |
+| `--owner ID` | **v0.8 起支持**：租约持有者标识（默认 `<hostname>-<pid>`） |
 
 结果按 `job_id` 独立写成 `<job_id>.json`（先写 `.tmp` 再原子改名），并发消费时
 不同任务的结果文件互不覆盖。
@@ -213,6 +270,20 @@ worker 通过 `default_registry` 按算子名实例化：**内置算子天然可
 随部署代码可导入，或做成安装后的插件包（入口点自动发现）。仅放在某个
 `--plugin` 文件里的算子，worker 侧看不到，会以"未注册的算子"失败。
 
+### 4.3 队列压缩：`queue compact`（v0.8）
+
+```powershell
+python -m op_pipeline queue compact `
+  --queue .op_pipeline/remote/jobs.jsonl `
+  --out .op_pipeline/remote/results
+```
+
+- **前置条件**：队列中**全部** job_id 都已有 `<out>/<job_id>.json` 结果文件；
+- 满足时把原始队列行追加进归档文件（默认 `<队列 stem>.archive.jsonl`，可用
+  `--archive <file>` 指定），再用同目录临时文件 + `os.replace` 原子清空活跃队列；
+- 存在未完成任务或无法解析的行时**拒绝改动任何文件**，打印未完成 job_id 并返回非 0；
+- 建议在 worker 停机（或确认队列不再被追加）后执行；压缩不删除 `results/` 与 `claims/`。
+
 ---
 
 ## 5. 故障排查清单
@@ -226,6 +297,8 @@ worker 通过 `default_registry` 按算子名实例化：**内置算子天然可
 | 文件被占用 / 无法覆盖输出 | 上一次超时线程仍在写文件；Excel/Parquet 句柄未释放；下游读取中 | 软超时不会强杀线程，对可能卡死的算子用 `executor="process"`（硬超时）；输出路径按 `run_id` 隔离；确保读取方先 `close()` |
 | `nodes.duration` 全是 0 | 旧库尚未补列，或运行的是 v0.6 及更早版本 | 用 v0.7 打开旧库会自动补列；新产生的运行才有耗时 |
 | Web UI 页面 404 | `run_id` 不存在或库路径不是同一个 | 核对 `create_server(db_path)` 指向的库；列表页确认 run_id |
+| 同一任务被执行两次 | 租约过期后重投，原 worker 可能仍存活 | 远程算子应保持幂等；用 `--owner` 区分实例，必要时核对 `results/<job_id>.json` 的写入时间 |
+| `queue compact` 拒绝执行 | 队列仍有未完成或不可解析的任务 | 按提示的 job_id 查 `results/`；确认 worker 停机且任务全部完成后重试 |
 | 调度器单轮失败但进程还在 | 设计如此：单轮异常被隔离 | 查 `ERROR` 日志与 RunStore `runs.status/error`；需要外部通知时配 `--alert-webhook` |
 
 ---

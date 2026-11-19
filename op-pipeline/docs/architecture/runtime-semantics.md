@@ -323,6 +323,9 @@ for attempt in 1..retries+1:
 
 ## 4. 缓存语义
 
+> 小节索引：§4.1 key 的组成 → §4.2 生效条件 → §4.3 命中与写入 → §4.4 边界 →
+> §4.5 缓存 LRU 与单飞（v0.8）。
+
 ### 4.1 key 的组成
 
 ```
@@ -367,12 +370,33 @@ key = blake2b(20 bytes, json.dumps({
 
 | 边界 | 现状 |
 | --- | --- |
-| 缓存目录解析 | `--cache-dir` 默认 `.pipeline_cache`，相对**进程 CWD**，而非 `--workdir` |
-| 淘汰策略 | 无，只有 `CacheStore.clear()` 手动清理 |
+| 缓存目录解析 | `--cache-dir` 默认 `.pipeline_cache`，相对**工作目录**（M1-2 起，与进程 CWD 无关） |
+| 淘汰策略 | v0.8 起支持 `max_entries` / `max_bytes` 按 mtime 自动淘汰；未配置容量时只有 `CacheStore.clear()` 手动清理 |
 | 算子在执行中写文件但被缓存命中 | 文件写入不会重放（副作用丢失），因此带副作用的算子应关闭缓存 |
 | pickle 反序列化 | 只应指向可信目录；不要使用他人提供的缓存目录 |
 | 源码失效 | 默认（M5-4 起）按算子源码指纹失效——源码变更自动缓存失效；显式 `include_source=False` 后仅靠 `version` 手动递增 |
 | 别名 | key 使用配置里的名字，`read_csv` 与 `io.read_csv` 会产生不同 key |
+
+### 4.5 缓存 LRU 与单飞（v0.8）
+
+**容量淘汰**：`CacheStore(directory, max_entries=None, max_bytes=None)` 的容量上限可选，
+`None` 表示不限。启用后每次 `store()` 写入完成即调用 `_evict()`：只扫描 `*.pkl`
+（正在写的 `<key>.tmp` 不参与），按 mtime 升序删除最旧条目，直到条目数与总字节
+同时满足上限；Windows 上因句柄占用删除失败时跳过，下次写入再试。`max_entries <= 0`
+或 `max_bytes <= 0` 在构造时即抛 `ValueError`。
+
+**命中刷新（LRU）**：仅当启用了任一容量上限时，`load()` 命中后调用 `os.utime` 刷新
+mtime；未配置容量时保持 v0.7.0 行为（不触碰文件时间）。
+
+**同 key 单飞**：`CacheStore.key_lock(key)` 返回该 `cache_key` 对应的进程内
+`threading.Lock`（锁表由元锁保护）。引擎在缓存未命中后持锁二次查缓存，仍未命中才
+执行算子并写入——并发线程遇到同一 key 时只有一个真正计算，其余等待后直接读缓存。
+锁只在当前进程内生效，跨进程（如多个 worker）不共享。
+
+**边界**：容量上限是"写入后收敛"，不是硬配额——单次写入大对象时目录可能瞬时超过上限；
+淘汰只在写入路径触发，纯命中的运行不会主动收缩目录。运行结束由 `storage_warnings()`
+统计缓存目录与 spill 目录实际占用，超过 `cache.max_bytes` / `spill_warn_bytes` 时只向
+`report.warnings` 追加中文提示，**不改变** `status` 与 `outputs`。
 
 ---
 
@@ -433,7 +457,8 @@ workdir/                                  # 默认 = 配置文件所在目录
 | --- | --- |
 | `success` / `partial` | 0 |
 | `failed` | 1 |
-| `validate` 校验失败 | 2 |
+| `validate` 校验失败 | 1（通过为 0） |
+| CLI 用法错误（如 `--resume` 未同时指定 `--runs`） | 2 |
 
 ---
 
@@ -606,6 +631,8 @@ RunReport（summary() / to_json()）+ handles
 
 ## 9. 远程执行示范（M4-4）：队列执行器与 worker CLI
 
+> 小节索引：§9 队列执行器示范（M4-4）→ §9.1 引擎接入（M5-1）→ §9.2 租约与故障回收（v0.8）。
+
 `QueueWorkerExecutor`（[remote.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op-pipeline/op_pipeline/remote.py)）
 实现 `Executor` 协议（submit/wait/shutdown），但把任务分发给**独立 worker 进程**执行，
 客户端与 worker 之间只通过共享文件系统交换：
@@ -685,3 +712,41 @@ M5-1 起 `run_pipeline(executor=...)` / `Engine` 的 executor 参数接受
 6. **worker 侧算子可见性**：worker 经 `default_registry` 按算子名实例化——
    内置算子天然可见；自定义算子需经插件机制或随代码部署（见
    [扩展设计 §4.2](../design/extension-points.md#42-执行器)）。
+
+### 9.2 远程队列租约与故障回收（v0.8）
+
+v0.7 及以前的队列投递是"至少一次"：worker 认领后崩溃，任务就此丢失。M7-1 引入
+**租约（lease）**，把"认领"变成可过期、可回收的状态：
+
+```
+客户端 submit                              worker 认领
+─────────────                              ──────────
+队列行携带 lease_seconds / max_attempts     原子创建 claims/<job_id>.json
+                                            {owner, deadline=now+lease, attempt}
+```
+
+- **开关**：`QueueWorkerExecutor(queue, out, lease_seconds=S, max_attempts=N)` 在 `submit`
+  时把两个值写进队列行；worker 侧 `consume_jobs(..., lease_seconds=..., max_attempts=...,
+  owner=...)` 与 CLI `--lease-seconds`/`--max-attempts`/`--owner` 提供同参数。**队列行内值
+  优先**，行内缺失才用 worker 参数；`lease_seconds <= 0`（默认）时完全不创建 `claims/`，
+  行为与 v0.7.0 一致。
+- **互斥认领**：worker 以 `O_CREAT|O_EXCL` 原子创建 `<out>/claims/<job_id>.json`，内容含
+  `owner`（默认 `<hostname>-<pid>`）、`deadline`、`attempt`；文件已存在说明已被其他 worker
+  认领，当前 worker 跳过该行。原子创建是跨进程互斥的唯一依据，不依赖锁文件或数据库。
+- **心跳续租**：执行期间启动 daemon 线程，每 `max(lease_seconds/3, 0.05)` 秒把 `deadline`
+  推到 `now + lease_seconds`；任务结束（成功/失败）删除 claim。
+- **过期回收**：worker 空闲时每个 `poll` 周期最多扫描一次 `claims/*.json`，发现
+  `deadline < now` 的 claim 时：
+  - `attempt < max_attempts` → 删除 claim，把原队列行（`attempt + 1`）追加到队尾重投；
+  - `attempt >= max_attempts` → 删除 claim，直接写 `status="error"` 的结果文件，
+    错误信息含"超过重投上限"，任务不再重投。
+
+  回收前先尝试创建 `.reclaim-<job_id>.lock`，避免多个 worker 同时回收同一任务；队列行
+  已被归档/删除时，孤儿 claim 直接清理。
+- **语义边界**：租约保证的是"worker 崩溃后任务不会永久卡住"，不是"恰好一次"——
+  原 worker 若只是失联但仍存活，重投会导致同一任务执行两次；远程算子应保持幂等，
+  或自行在输出侧去重。deadline 基于 `time.time()`，跨机器使用需时钟大致同步。
+- **队列压缩**：`python -m op_pipeline queue compact --queue <file> --out <dir>
+  [--archive <file>]` 仅当**全部** job_id 都已有结果文件时，把原始队列行追加到归档
+  （默认 `<队列 stem>.archive.jsonl`），再用同目录临时文件 + `os.replace` 原子清空
+  活跃队列；存在未完成任务（或无法解析的行）时拒绝改动任何文件并返回非 0 退出码。

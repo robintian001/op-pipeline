@@ -27,7 +27,8 @@
 引用语法：
     ``${<node>.<port>}`` 或 ``${<handle>}``  -> 上游数据
     ``${p.<name>}``                          -> 流水线参数
-    ``${env.<NAME>}``                        -> 环境变量
+    ``${env.<NAME>}``                        -> 环境变量（运行期解析）
+    ``${env:NAME}`` / ``${env:NAME:-默认}``  -> 环境变量（解析期注入，可带默认值）
 字符串中可混排（``"${p.dir}/${p.name}.json"``）。
 """
 from __future__ import annotations
@@ -53,6 +54,106 @@ from .ports import Port, type_label, value_matches
 logger = logging.getLogger("op_pipeline.spec")
 
 _REF_PATTERN = re.compile(r"\$\{([^{}]+)\}")
+
+# M7-2 Task 6：解析期环境变量注入。``${env:NAME}`` / ``${env:NAME:-default}``
+# 在构造 NodeSpec 之前完成替换；既有 ``${env.NAME}``（点号语法）仍由 RefResolver
+# 在 build_plan/运行期解析，两者互不干扰（``env:`` 形式优先处理并全部消失）。
+_ENV_PLACEHOLDER = re.compile(r"\$\{env:([^{}]*)\}")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_SENSITIVE_ENV_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
+
+
+def _substitute_env_text(
+    text: str, where: str, env: Mapping[str, str], sensitive: list[str]
+) -> str:
+    """替换单个字符串里的 ``${env:...}`` 占位符，其余文本原样保留。"""
+
+    def replace(match: re.Match[str]) -> str:
+        body = match.group(1)
+        if ":-" in body:
+            name, default = body.split(":-", 1)
+        else:
+            name, default = body, None
+        if not _ENV_NAME.fullmatch(name):
+            raise SpecValidationError(
+                [
+                    f"{where} 的 ${{env:...}} 占位符语法错误：变量名 {name!r} 不合法"
+                    "（应匹配 [A-Za-z_][A-Za-z0-9_]*）"
+                ]
+            )
+        if name in env:
+            value = env[name]
+        elif default is not None:
+            value = default
+        else:
+            raise SpecValidationError(
+                [
+                    f"{where} 引用的环境变量 '{name}' 未设置（占位符 ${{env:{name}}}）；"
+                    f"可写成 ${{env:{name}:-默认值}}"
+                ]
+            )
+        if _SENSITIVE_ENV_NAME.search(name):
+            sensitive.append(str(value))
+        return str(value)
+
+    result = _ENV_PLACEHOLDER.sub(replace, text)
+    if "${env:" in result:
+        raise SpecValidationError(
+            [f"{where} 的 ${{env:...}} 占位符语法错误：未闭合（缺少 '}}'）"]
+        )
+    return result
+
+
+def _substitute_env_value(
+    value: Any, where: str, env: Mapping[str, str], sensitive: list[str]
+) -> Any:
+    """递归替换参数值中的环境变量占位符（仅处理字符串）。"""
+    if isinstance(value, str):
+        return _substitute_env_text(value, where, env, sensitive)
+    if isinstance(value, list):
+        return [_substitute_env_value(item, where, env, sensitive) for item in value]
+    if isinstance(value, Mapping):
+        return {
+            key: _substitute_env_value(item, where, env, sensitive)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _resolve_env_params(
+    raw: Mapping[str, Any], env: Mapping[str, str]
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """解析期替换顶层 ``params`` 与各节点 ``params`` 中的环境变量占位符。"""
+    sensitive: list[str] = []
+    data = dict(raw)
+
+    params = data.get("params")
+    if isinstance(params, Mapping):
+        data["params"] = {
+            key: _substitute_env_value(value, f"流水线参数 '{key}'", env, sensitive)
+            for key, value in params.items()
+        }
+
+    nodes = data.get("nodes")
+    if isinstance(nodes, list):
+        new_nodes: list[Any] = []
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                new_nodes.append(node)
+                continue
+            node_copy = dict(node)
+            node_id = node.get("id") or node.get("name") or "?"
+            node_params = node_copy.get("params")
+            if isinstance(node_params, Mapping):
+                where = f"节点 [{node_id}]"
+                node_copy["params"] = {
+                    key: _substitute_env_value(value, where, env, sensitive)
+                    for key, value in node_params.items()
+                }
+            new_nodes.append(node_copy)
+        data["nodes"] = new_nodes
+
+    return data, tuple(sensitive)
 
 
 def _warn_unknown_keys(where: str, raw: Mapping[str, Any], known: frozenset[str]) -> None:
@@ -387,6 +488,8 @@ class PipelineSpec:
     nodes: list[NodeSpec] = field(default_factory=list)
     outputs: dict[str, str] = field(default_factory=dict)
     defaults: dict[str, Any] = field(default_factory=dict)
+    # M7-2 Task 6：解析期替换过的敏感环境变量值（仅用于报告打码；不进入 to_dict）
+    sensitive_values: tuple[str, ...] = ()
 
     # from_dict 接受的合法键（dataclass 字段之外无类型注解，不会被当作字段）
     _KNOWN_KEYS = frozenset(
@@ -396,12 +499,20 @@ class PipelineSpec:
 
     @classmethod
     def from_dict(
-        cls, raw: Mapping[str, Any], base_dir: str | Path | None = None
+        cls,
+        raw: Mapping[str, Any],
+        base_dir: str | Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
     ) -> "PipelineSpec":
         if not isinstance(raw, Mapping):
             raise ConfigError("流水线配置根节点必须是对象")
         raw = _resolve_includes(raw, base_dir=base_dir)  # M3-7：合并顶层 includes
         raw = _migrate(raw)  # M3-5：版本检查 + 逐级迁移到当前格式
+        # M7-2 Task 6：参数里的 ${env:NAME} / ${env:NAME:-default} 在解析期替换
+        raw, sensitive_values = _resolve_env_params(
+            raw, os.environ if env is None else env
+        )
         _warn_unknown_keys("流水线配置", raw, cls._KNOWN_KEYS)
         nodes_raw = raw.get("nodes") or []
         if not isinstance(nodes_raw, list):
@@ -421,6 +532,7 @@ class PipelineSpec:
             nodes=[NodeSpec.from_dict(n, defaults=defaults) for n in nodes_raw],
             outputs={str(k): str(v) for k, v in (raw.get("outputs") or {}).items()},
             defaults=defaults,
+            sensitive_values=sensitive_values,
         )
 
     # ------------------------------------------------------------------ #
@@ -446,10 +558,12 @@ class PipelineSpec:
         _LOADERS[norm] = fn
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "PipelineSpec":
+    def from_file(
+        cls, path: str | Path, *, env: Mapping[str, str] | None = None
+    ) -> "PipelineSpec":
         path = Path(path).expanduser()
         data = _load_raw(path)
-        return cls.from_dict(data, base_dir=path.parent)
+        return cls.from_dict(data, base_dir=path.parent, env=env)
 
     def to_dict(self) -> dict[str, Any]:
         return {

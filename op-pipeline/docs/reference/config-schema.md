@@ -18,7 +18,7 @@
 | `name` | str | `"pipeline"` | 流水线名，进入报告 |
 | `version` | str | `"1"` | 流水线版本，进入报告 |
 | `description` | str | `""` | 备注 |
-| `params` | object | `{}` | 流水线参数；可被 `--param` 覆盖；值中可用 `${env.X}` |
+| `params` | object | `{}` | 流水线参数；可被 `--param` 覆盖；值中可用 `${env.X}`（运行期解析）或 `${env:NAME}`（解析期替换，见 §3.1） |
 | `nodes` | array | 必填 | 节点列表，**顺序无关**（执行由引用推导的依赖决定） |
 | `outputs` | object | `{}` | 流水线对外产物：名字 → `${...}` 引用 |
 | `includes` | array\<str\> | `[]` | **配置组合**（M3-7）：相对本文件所在目录的配置文件路径数组，按顺序加载并合并（`params`/`defaults`/`outputs` 逐键覆盖、`nodes` 拼接），主配置优先；节点 id 跨文件重复报错；子配置自身也可 `includes`（按自身目录解析）；循环引用报错；仅 `from_file` 或显式 `base_dir` 可用 |
@@ -46,7 +46,7 @@
 | `concurrency_group` | str | `""` | **v0.7 新增，可选**：并发分组名；同组节点的同时执行数受运行级 `concurrency_limits[组名]` 限制（只限制实际执行，不含缓存命中）。空串或未配置的组不加限制，缺省行为与旧版一致 |
 | `description` | str | `""` | 备注（不参与执行） |
 
-### 2.1 运行级参数（v0.7 新增，可选）
+### 2.1 运行级参数（v0.7 起，可选）
 
 以下参数**不是配置文件字段**，通过库调用传入（`run(config, ..., concurrency_limits=...)` /
 `run_pipeline(..., concurrency_limits=...)` / `Engine(..., concurrency_limits=...)`）；
@@ -55,6 +55,9 @@
 | 参数 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `concurrency_limits` | dict\<str, int\> | `None`（不限） | 并发分组上限：键为节点 `concurrency_group`，值为该组同时执行的节点数上限（必须为正整数，否则 `ConfigError`）。只在当前运行/进程内生效，不跨 worker 聚合 |
+| `cache_max_entries` | int | `None`（不限） | **v0.8 新增，可选**：缓存条目上限，每次写入后按 mtime 淘汰最旧 `*.pkl`（等价于 `CacheStore(max_entries=...)`）；须为正整数，否则 `ValueError` |
+| `cache_max_bytes` | int | `None`（不限） | **v0.8 新增，可选**：缓存总字节上限，与条目上限同时生效（等价于 `CacheStore(max_bytes=...)`）；须为正整数，否则 `ValueError` |
+| `spill_warn_bytes` | int | `None`（不告警） | **v0.8 新增，可选**：运行结束时 spill 落盘目录占用告警阈值（字节），超过只向 `report.warnings` 追加中文提示，不改变 status/outputs |
 
 > **行为变更（M3-3，T15 治理）**：`table.select_columns` / `table.sort_rows` /
 > `table.derive_column` / `table.join` 的列判定从"首行代表全表列"改为**全表列集合并集**。
@@ -81,6 +84,19 @@
 - 正则 `\$\{([^{}]+)\}`，**不支持嵌套花括号**；
 - 参数与环境变量引用**不产生依赖**，只有句柄引用才产生依赖；
 - 引用解析失败在编译期表现为 `SpecValidationError`（静态目标不存在），运行期为 `RefResolutionError`。
+
+### 3.1 解析期环境变量：`${env:NAME}` / `${env:NAME:-默认值}`（v0.8）
+
+- **语法**：`${env:NAME}` 取环境变量 `NAME`；`${env:NAME:-默认值}` 在 `NAME` 未设置时使用
+  `:-` 之后的默认值（可为空串）。变量名须匹配 `[A-Za-z_][A-Za-z0-9_]*`。
+- **解析时机**：在 `PipelineSpec.from_dict` **解析期**完成替换，覆盖顶层 `params` 与各节点
+  `params`（递归 `list`/`dict` 内的字符串），早于编译与执行；占位符替换结果为字符串。
+- **错误**：变量缺失且未提供默认值时抛 `SpecValidationError`，消息含变量名与位置
+  （`流水线参数 'x'` 或 `节点 [id]`）；变量名非法或占位符未闭合报语法错误。
+- **与 `${env.NAME}` 的区别**：点号形式由 `RefResolver` 在编译/运行期按引用解析，遵循
+  "单引用保留原始类型"等规则；冒号形式只在解析期做文本替换，二者互不干扰。
+- **敏感值打码**：变量名匹配 `TOKEN|SECRET|PASSWORD|KEY`（不区分大小写）时，替换值记为敏感值；
+  运行报告 `RunReport.params` 中键名命中该规则、或值包含敏感值的参数显示 `***`（执行期真实值不变）。
 
 ---
 
@@ -165,20 +181,29 @@ CLI 下 WARNING 会经 stderr 直接展示（`validate` 同样可见）。
 
 ```
 python -m op_pipeline run      <config> [选项]
-python -m op_pipeline validate <config>
+python -m op_pipeline validate <config> [--json]
+python -m op_pipeline init     <dir> [--template minimal|data|scheduler]
+python -m op_pipeline scaffold op <name> [--dir <path>]
 python -m op_pipeline graph    <config> [--format mermaid|dot|ascii]
 python -m op_pipeline ops      [--json]
 python -m op_pipeline describe <op_name>
+python -m op_pipeline worker   --queue <file> [选项]
+python -m op_pipeline queue compact --queue <file> --out <dir> [--archive <file>]
 ```
 
 `run` 选项：`--workdir`、`--workers`、`--cache-dir`（默认 `.pipeline_cache`）、`--no-cache`、
-`--fail-fast`、`--dry-run`、`--json PATH`、`--plugin PATH`（可多次，相对配置文件所在目录解析）、`--param KEY=VALUE`（可多次）、`-v`。
+`--cache-max-entries`、`--cache-max-bytes`、`--spill-warn-bytes`、`--fail-fast`、`--dry-run`、
+`--json PATH`、`--runs DB`、`--resume RUN_ID`、`--executor {thread,process,queue}`、
+`--plugin PATH`（可多次，相对配置文件所在目录解析）、`--param KEY=VALUE`（可多次）、`-v`。
+
+`validate` 只加载/编译/契约校验，不执行、不写输出；`--json` 输出
+`{"ok","errors","warnings","nodes":[{"id","op"}]}`。
 
 | 退出码 | 含义 |
 | --- | --- |
-| 0 | `success` / `partial` |
-| 1 | `failed` |
-| 2 | `validate` 校验失败 |
+| 0 | `success` / `partial`；`validate` 校验通过 |
+| 1 | `failed`；`validate` 校验失败 |
+| 2 | CLI 用法错误（如 `--resume` 未同时指定 `--runs`） |
 
 `--param` 的值先尝试 `json.loads`（因此 `n=3` 是 int、`flag=true` 是 bool、`x=[1,2]` 是 list），
 失败后按字符串处理。
@@ -193,6 +218,18 @@ python -m op_pipeline describe <op_name>
 | `.op_pipeline/artifacts/<run_id>/<node_id>/` | `RunContext.create()` | 惰性创建（算子首次使用产物才建目录；可用 `artifacts_dir` 参数覆盖位置） |
 | `.pipeline_cache/*.pkl` | `--cache-dir` / `run(cache_dir=...)` | **相对工作目录解析**（M1-2 起，与进程 CWD 无关）；绝对路径原样使用；`--no-cache` / `cache_dir=None` 即禁用 |
 | `--json PATH` | `RunReport.to_json()` | 自动创建父目录 |
+
+### 8.1 缓存容量与 spill 清理（v0.8）
+
+| 能力 | 配置方式 | 语义 |
+| --- | --- | --- |
+| 缓存条目上限 | `CacheStore(max_entries=N)` / `run(..., cache_max_entries=N)` / `--cache-max-entries N` | 每次写入后按 `*.pkl` 的 mtime 升序淘汰最旧条目，直至条目数不超过 N；`N <= 0` 抛 `ValueError` |
+| 缓存字节上限 | `CacheStore(max_bytes=B)` / `run(..., cache_max_bytes=B)` / `--cache-max-bytes B` | 同一轮淘汰同时满足字节上限；只处理 `*.pkl`，不误删正在写入的 `.tmp` |
+| 命中刷新（LRU） | 启用任一容量上限时自动生效 | 命中读取后 `os.utime` 刷新 mtime；未配置容量时不触碰文件时间，行为与 v0.7.0 一致 |
+| spill 落盘清理 | `SpillHandleStore(cleanup="on_run_success")` | 运行状态为 `success` 时删除本次 run attach 的 `<artifacts_dir>/spill`（删除前先把落盘值载回内存）；`partial`/`failed`/取消保留；显式传入 `spill_dir` 时目录生命周期归调用方，引擎不删 |
+| 存储占用告警 | `run(..., spill_warn_bytes=N)` / `--spill-warn-bytes N` | 运行结束统计缓存目录与 spill 目录占用，超过阈值只向 `report.warnings` 追加中文提示 |
+
+`cleanup` 只接受 `"never"`（默认，兼容 v0.7.0）与 `"on_run_success"`，非法值抛 `ValueError`。
 
 ---
 

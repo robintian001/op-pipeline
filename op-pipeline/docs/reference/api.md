@@ -21,7 +21,7 @@
 | `run_pipeline` | 执行一个已解析的 `PipelineSpec`，返回 `(RunReport, dict[str, Any])`（报告 + 全部句柄值）；支持缓存、重试、并发分组限流、钩子、运行记录与各类执行器。 | 稳定 API，破坏性变更升 minor |
 | `run_pipeline_async` | `run_pipeline` 的 async 宿主桥接：把同步引擎放到事件循环默认线程执行器，`await` 期间不阻塞循环，参数/返回值一致。 | 稳定 API，破坏性变更升 minor |
 | `Engine` | 单次运行的执行器，接收编译后的 `Plan`；需要自定义句柄存储、执行器或直接驱动调度时使用（一个实例只跑一次）。 | 稳定 API，破坏性变更升 minor |
-| `CacheStore` | 内容指纹缓存实现；`cache_dir=None` 即禁用，也可替换为同鸭子类型对象。 | 稳定 API（弱契约，可替换） |
+| `CacheStore` | 内容指纹缓存实现；`cache_dir=None` 即禁用；v0.8 起可选 `max_entries`/`max_bytes` 容量上限（按 mtime 淘汰、命中刷新 mtime）与 `key_lock(key)` 同 key 单飞锁，也可替换为同鸭子类型对象。 | 稳定 API（弱契约，可替换） |
 | `fingerprint` | 计算任意值的内容指纹，是缓存 key（算子名 + 版本 + 参数 + 输入 + 源码摘要）的基础。 | 内部/实验 |
 
 错误类型（同属运行入口的异常契约，全部派生自 `PipelineError`）：
@@ -77,10 +77,12 @@
 | `Executor` | 执行器协议：`submit(fn, *args)` / `wait(futures, first_completed=...)` / `shutdown()`。 | 稳定 API（协议） |
 | `ThreadExecutor` | 默认线程池执行器：同步算子并行执行，支持软超时。 | 稳定 API，破坏性变更升 minor |
 | `ProcessExecutor` | 子进程执行器：节点在 `spawn` 子进程中执行，超时为硬终止；载荷不可 pickle 时回退线程。 | 稳定 API，破坏性变更升 minor |
-| `QueueWorkerExecutor` | 队列执行器：任务写入共享 JSONL，由独立 worker 进程消费，结果目录原子回写。 | 稳定 API，破坏性变更升 minor |
+| `QueueWorkerExecutor` | 队列执行器：任务写入共享 JSONL，由独立 worker 进程消费，结果目录原子回写；v0.8 起构造参数新增 `lease_seconds`/`max_attempts`（租约与重投上限）。 | 稳定 API，破坏性变更升 minor |
+| `consume_jobs` | worker 侧消费入口（`op_pipeline.remote` 模块级）；v0.8 起新增 `owner`/`lease_seconds`/`max_attempts` 参数，用于租约认领与过期回收。 | 稳定 API（模块级） |
+| `compact_queue` | 队列归档与清空（`op_pipeline.remote` 模块级，CLI `queue compact`）：仅当全部任务已有结果时归档并原子清空，返回 `(未完成 job_id 列表, 归档路径)`。 | 稳定 API（模块级） |
 | `HandleStore` | 句柄存储协议：`get/put/snapshot/items`；节点间只通过句柄交换数据。 | 稳定 API（协议） |
 | `InMemoryHandleStore` | 默认句柄存储：值常驻内存。 | 稳定 API，破坏性变更升 minor |
-| `SpillHandleStore` | 大对象按阈值落盘的句柄存储（默认 1MB），读时按需加载。 | 稳定 API，破坏性变更升 minor |
+| `SpillHandleStore` | 大对象按阈值落盘的句柄存储（默认 1MB），读时按需加载；v0.8 起 `cleanup="on_run_success"` 在运行成功后清理本次 run 的落盘目录（失败/取消保留，显式 `spill_dir` 不删）。 | 稳定 API，破坏性变更升 minor |
 | `SharedHandleStore` | 跨进程共享目录的句柄存储，远程 worker 与引擎用它交换节点输出。 | 稳定 API，破坏性变更升 minor |
 
 ---
@@ -105,7 +107,32 @@
 
 ---
 
-## 7. 相关文档
+## 7. 外围服务与 CLI
+
+### 7.1 外围服务 API（`scheduler_app`）
+
+| 符号 | 用途 | 稳定性 |
+| --- | --- | --- |
+| `scheduler_app.scheduler.run_scheduler` | 调度循环；v0.8 起新增 `alert_silence`（秒，同 pipeline 窗口内失败只告警一次），其余参数与 v0.7 一致。 | 稳定 API，破坏性变更升 minor |
+| `scheduler_app.web.create_server` | 只读 Web UI；v0.8 起新增 `/compare`、`/api/runs`、`/api/runs/<id>` 与 `/metrics` 路由。 | 稳定 API，破坏性变更升 minor |
+
+### 7.2 CLI 子命令
+
+| 子命令 | 用途 |
+| --- | --- |
+| `run <cfg>` | 执行流水线；v0.8 新增 `--cache-max-entries` / `--cache-max-bytes` / `--spill-warn-bytes`（均可选） |
+| `validate <cfg> [--json]` | 只加载/编译/契约校验；`--json` 输出 `{"ok","errors","warnings","nodes"}` |
+| `init <dir> [--template minimal\|data\|scheduler]` | 生成脚手架项目；目标目录非空时拒绝 |
+| `scaffold op <name> [--dir PATH]` | 生成算子与测试骨架；非法名或文件已存在时拒绝 |
+| `worker --queue <file>` | 消费共享队列；v0.8 新增 `--lease-seconds` / `--max-attempts` / `--owner` |
+| `queue compact --queue <file> --out <dir> [--archive <file>]` | 全部任务完成后归档历史行并清空活跃队列 |
+
+> 以上均为加法，向后兼容：所有新参数可选，缺省行为与 v0.7.0 一致；RunStore schema
+> 与算子数量（50）不变，不构成破坏性变更。
+
+---
+
+## 8. 相关文档
 
 - [快速上手](../guides/quickstart.md)：安装、首个流水线、自定义算子与常见错误；
 - [运维指南](../guides/operations.md)：调度、Web UI、RunStore、远程 worker 与排障；

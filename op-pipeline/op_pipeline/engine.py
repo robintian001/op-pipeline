@@ -26,6 +26,7 @@ import functools
 import inspect
 import logging
 import os
+import re
 import threading
 import time
 import traceback
@@ -39,7 +40,12 @@ from .context import RunContext
 from .errors import ConfigError, RefResolutionError
 from .executor import Executor, ProcessExecutor, ThreadExecutor, _child_run_op
 from .expression import evaluate_condition
-from .handlestore import HandleStore, InMemoryHandleStore, SharedHandleStore
+from .handlestore import (
+    HandleStore,
+    InMemoryHandleStore,
+    SharedHandleStore,
+    SpillHandleStore,
+)
 from .remote import QueueWorkerExecutor, _remote_run
 from .spec import Plan, PlanNode, RefResolver, check_handle_types
 
@@ -71,6 +77,30 @@ def _describe(value: Any) -> str:
         text = value if len(value) <= 60 else value[:57] + "..."
         return f"str({text!r})"
     return f"{type(value).__name__}"
+
+
+# M7-2 Task 6：报告参数打码——键名或值命中敏感特征时显示 ***。
+_SENSITIVE_PARAM_KEY = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
+
+
+def _masked_params(
+    params: Mapping[str, Any], sensitive_values: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """构造报告用的参数副本（不影响执行期真实参数与 ``plan.params``）。
+
+    满足任一条件即打码：参数键名匹配 ``TOKEN|SECRET|PASSWORD|KEY``（不区分
+    大小写），或值转成字符串后包含解析期记录的非空敏感值。
+    """
+    secrets = tuple(str(value) for value in sensitive_values if str(value))
+    masked: dict[str, Any] = {}
+    for key, value in params.items():
+        text = str(value)
+        sensitive_key = bool(_SENSITIVE_PARAM_KEY.search(str(key)))
+        if sensitive_key or any(secret in text for secret in secrets):
+            masked[key] = "***"
+        else:
+            masked[key] = value
+    return masked
 
 
 @dataclass
@@ -426,7 +456,9 @@ class Engine:
             run_id=self.context.run_id,
             status=SUCCESS,
             started_at=started,
-            params=dict(self.plan.params),
+            params=_masked_params(
+                dict(self.plan.params), self.plan.spec.sensitive_values
+            ),
             artifacts_dir=str(self.context.artifacts_dir),
         )
 
@@ -505,6 +537,9 @@ class Engine:
 
         # 汇总阶段：端口软类型告警（值照常传递，只提示不符；缺失的句柄天然跳过）
         self._warnings.extend(check_handle_types(self.plan, self.store.snapshot()))
+        # M7-4 Task 10：运行成功且策略为 on_run_success 时删除本次 run 的 spill 目录；
+        # 失败/取消保留，便于排障。放在类型检查之后（检查会读盘取值）。
+        self._cleanup_spill_on_success(report.status)
         report.warnings.extend(self._warnings)
         report.finished_at = time.time()
         # M2-5：运行级记录落库（run_id 主键，可覆盖同 run_id 的重跑记录）
@@ -531,6 +566,23 @@ class Engine:
     # ------------------------------------------------------------------ #
     # 调度
     # ------------------------------------------------------------------ #
+    def _cleanup_spill_on_success(self, status: str) -> None:
+        """M7-4 Task 10：``on_run_success`` 策略下删除本次 run 的落盘目录。
+
+        仅处理 ``SpillHandleStore``（含其子类，子类默认策略为 never）；
+        显式 ``spill_dir`` 归调用方管理，``cleanup_run_dir`` 不会删除。
+        删除失败（如 Windows 句柄占用）只记告警，不改变运行结果。
+        """
+        store = self.store
+        if not isinstance(store, SpillHandleStore):
+            return
+        if status != SUCCESS or store.cleanup != "on_run_success":
+            return
+        try:
+            store.cleanup_run_dir()
+        except OSError as exc:
+            self._warnings.append(f"清理 spill 落盘目录失败：{exc}")
+
     def _allowed_failure(self, node_id: str) -> bool:
         return self.plan.node(node_id).spec.allow_failure
 
@@ -768,49 +820,46 @@ class Engine:
                 )
                 cached = self.cache.load(cache_key)
                 if cached is not None:
-                    outputs = cached
-                    result.cached = True
-                    result.cache_key = cache_key
-                    result.status = SUCCESS
-                    result.duration = time.time() - result.started_at
-                    result.outputs = {k: _describe(v) for k, v in outputs.items()}
-                    # M2-6：断点续跑语义与线程路径一致
-                    prev = self._resume_map.get(node.spec.id)
-                    if prev is not None and prev[0] == SUCCESS and prev[1] == cache_key:
-                        result.resumed = True
-                    # 缓存命中走引擎写收敛点：值经 store.put 进共享目录（下游可读）
-                    self._publish(node, outputs)
-                    self.context.logger.info(
-                        "节点 %s 命中缓存%s",
-                        node.spec.id,
-                        f"，续跑自 {self.resume_run_id}" if result.resumed else "",
-                    )
-                    return result
+                    return self._finish_cache_hit(node, result, cached, cache_key)
 
             result.cache_key = cache_key or ""
-            # M6-3 Task 8：远程节点同样受并发分组限流（acquire 在工作线程内）
-            sem = self._group_semaphore(node.spec.concurrency_group)
-            if sem is not None:
-                sem.acquire()
+            # M7-4 Task 11：单飞锁 + 二次查缓存（远程路径与线程路径同语义）
+            flight_lock = (
+                self.cache.key_lock(cache_key) if cache_key is not None else None
+            )
+            if flight_lock is not None:
+                flight_lock.acquire()
             try:
-                data = self._attempt_loop(
-                    node,
-                    ctx,
-                    result,
-                    lambda: self._remote_once(node, params, inputs, node.spec.timeout),
-                )
-            finally:
+                if cache_key is not None:
+                    cached = self.cache.load(cache_key)
+                    if cached is not None:
+                        return self._finish_cache_hit(node, result, cached, cache_key)
+                # M6-3 Task 8：远程节点同样受并发分组限流（acquire 在工作线程内）
+                sem = self._group_semaphore(node.spec.concurrency_group)
                 if sem is not None:
-                    sem.release()
-            result.status = SUCCESS
-            # worker 已把输出原子发布进共享目录；引擎侧从同一目录读回实际值
-            raw = {
-                port: self.store.get(handle)
-                for port, handle in (data.get("outputs") or {}).items()
-            }
-            result.outputs = {k: _describe(v) for k, v in raw.items()}
-            if cache_key is not None:
-                self.cache.store(cache_key, raw)
+                    sem.acquire()
+                try:
+                    data = self._attempt_loop(
+                        node,
+                        ctx,
+                        result,
+                        lambda: self._remote_once(node, params, inputs, node.spec.timeout),
+                    )
+                finally:
+                    if sem is not None:
+                        sem.release()
+                result.status = SUCCESS
+                # worker 已把输出原子发布进共享目录；引擎侧从同一目录读回实际值
+                raw = {
+                    port: self.store.get(handle)
+                    for port, handle in (data.get("outputs") or {}).items()
+                }
+                result.outputs = {k: _describe(v) for k, v in raw.items()}
+                if cache_key is not None:
+                    self.cache.store(cache_key, raw)
+            finally:
+                if flight_lock is not None:
+                    flight_lock.release()
         except _RemoteCancelled:
             # M6-3 Task 10：取消不再等待远程结果——标记 skipped，不算失败
             result.status = SKIPPED
@@ -892,43 +941,41 @@ class Engine:
                 )
                 cached = self.cache.load(cache_key)
                 if cached is not None:
-                    outputs = cached
-                    result.cached = True
-                    result.cache_key = cache_key
-                    result.status = SUCCESS
-                    result.duration = time.time() - result.started_at
-                    result.outputs = {k: _describe(v) for k, v in outputs.items()}
-                    # M2-6：断点续跑——参考 run 里该节点成功且 cache_key 一致才算续跑命中；
-                    # 只复用缓存/句柄（产出已在缓存里），不重跑算子
-                    prev = self._resume_map.get(node.spec.id)
-                    if prev is not None and prev[0] == SUCCESS and prev[1] == cache_key:
-                        result.resumed = True
-                    self._publish(node, outputs)
-                    self.context.logger.info(
-                        "节点 %s 命中缓存%s",
-                        node.spec.id,
-                        f"，续跑自 {self.resume_run_id}" if result.resumed else "",
-                    )
-                    return result
+                    return self._finish_cache_hit(node, result, cached, cache_key)
 
             result.cache_key = cache_key or ""
-            # M6-3 Task 8：并发分组限流——acquire 在工作线程内、缓存命中判定
-            # 之后、实际执行之前（不阻塞调度线程）；异常路径同样释放配额。
-            sem = self._group_semaphore(node.spec.concurrency_group)
-            if sem is not None:
-                sem.acquire()
+            # M7-4 Task 11：单飞锁在工作线程内获取（未命中且准备计算处）；
+            # 进入后二次查缓存——同 key 的其它线程可能已写入，命中则直接复用。
+            flight_lock = (
+                self.cache.key_lock(cache_key) if cache_key is not None else None
+            )
+            if flight_lock is not None:
+                flight_lock.acquire()
             try:
-                outputs = self._execute_with_retry(instance, ctx, inputs, node, result)
-            finally:
+                if cache_key is not None:
+                    cached = self.cache.load(cache_key)
+                    if cached is not None:
+                        return self._finish_cache_hit(node, result, cached, cache_key)
+                # M6-3 Task 8：并发分组限流——acquire 在工作线程内、缓存命中判定
+                # 之后、实际执行之前（不阻塞调度线程）；异常路径同样释放配额。
+                sem = self._group_semaphore(node.spec.concurrency_group)
                 if sem is not None:
-                    sem.release()
-            result.status = SUCCESS
-            result.outputs = {k: _describe(v) for k, v in outputs.items()}
+                    sem.acquire()
+                try:
+                    outputs = self._execute_with_retry(instance, ctx, inputs, node, result)
+                finally:
+                    if sem is not None:
+                        sem.release()
+                result.status = SUCCESS
+                result.outputs = {k: _describe(v) for k, v in outputs.items()}
 
-            if cache_key is not None:
-                self.cache.store(cache_key, outputs)
+                if cache_key is not None:
+                    self.cache.store(cache_key, outputs)
 
-            self._publish(node, outputs)
+                self._publish(node, outputs)
+            finally:
+                if flight_lock is not None:
+                    flight_lock.release()
         except _NodeFailure as failure:
             result.status = FAILED
             result.error = f"{type(failure.cause).__name__}: {failure.cause}"
@@ -957,6 +1004,35 @@ class Engine:
                 result.duration,
                 result.cached,
             )
+        return result
+
+    def _finish_cache_hit(
+        self,
+        node: PlanNode,
+        result: NodeResult,
+        outputs: dict[str, Any],
+        cache_key: str,
+    ) -> NodeResult:
+        """命中缓存的收口（M7-4 Task 11 抽出，首次查询与单飞二次查询共用）。
+
+        线程路径与远程路径语义一致：标记 cached/cache_key、判定断点续跑、
+        经 ``_publish`` 写回句柄并按需记录日志。
+        """
+        result.cached = True
+        result.cache_key = cache_key
+        result.status = SUCCESS
+        result.duration = time.time() - result.started_at
+        result.outputs = {k: _describe(v) for k, v in outputs.items()}
+        # M2-6：参考 run 里该节点成功且 cache_key 一致才算续跑命中
+        prev = self._resume_map.get(node.spec.id)
+        if prev is not None and prev[0] == SUCCESS and prev[1] == cache_key:
+            result.resumed = True
+        self._publish(node, outputs)
+        self.context.logger.info(
+            "节点 %s 命中缓存%s",
+            node.spec.id,
+            f"，续跑自 {self.resume_run_id}" if result.resumed else "",
+        )
         return result
 
     def _publish(self, node: PlanNode, outputs: Mapping[str, Any]) -> None:
@@ -1126,6 +1202,55 @@ class _RemoteCancelled(Exception):
 # --------------------------------------------------------------------------- #
 # 便捷入口
 # --------------------------------------------------------------------------- #
+def _dir_usage(path: Path) -> int:
+    """目录内文件总字节（递归；目录不存在返回 0）。"""
+    if not path.is_dir():
+        return 0
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:  # pragma: no cover - 并发删除等瞬时失败
+            continue
+    return total
+
+
+def storage_warnings(
+    cache: CacheStore,
+    *,
+    artifacts_dir: str | Path,
+    spill_warn_bytes: int | None = None,
+    spill_dir: str | Path | None = None,
+) -> list[str]:
+    """M7-4 Task 12：运行结束的存储容量告警（只读统计，不改变运行结果）。
+
+    - 配置了 ``cache.max_bytes`` 且缓存目录实际占用超过它 → 中文提示；
+    - 配置了 ``spill_warn_bytes`` 且 spill 目录占用超过它 → 中文提示；
+    - 未配置阈值时不告警（默认 None，与 v0.7.0 一致）。
+    """
+    warnings: list[str] = []
+    if cache.enabled and cache.max_bytes is not None and cache.directory is not None:
+        used = _dir_usage(cache.directory)
+        if used > cache.max_bytes:
+            warnings.append(
+                f"缓存目录 {cache.directory} 实际占用 {used} 字节，"
+                f"超过上限 {cache.max_bytes} 字节，建议清理或调整缓存容量参数"
+            )
+    if spill_warn_bytes is not None and spill_warn_bytes > 0:
+        target = (
+            Path(spill_dir) if spill_dir is not None
+            else Path(artifacts_dir) / "spill"
+        )
+        used = _dir_usage(target)
+        if used > spill_warn_bytes:
+            warnings.append(
+                f"落盘目录 {target} 实际占用 {used} 字节，"
+                f"超过告警阈值 {spill_warn_bytes} 字节"
+            )
+    return warnings
+
+
 def run_pipeline(
     spec: Any,
     *,
@@ -1144,6 +1269,9 @@ def run_pipeline(
     run_id: str | None = None,
     logger: logging.Logger | None = None,
     concurrency_limits: Mapping[str, int] | None = None,
+    cache_max_entries: int | None = None,
+    cache_max_bytes: int | None = None,
+    spill_warn_bytes: int | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """编译 + 执行一步到位，返回值与句柄表。
 
@@ -1165,6 +1293,10 @@ def run_pipeline(
     ``concurrency_limits``（M6-3 Task 8）节点并发分组上限：``{组名: 正整数}``，
     与节点 ``concurrency_group`` 配合限制同组节点同时执行数；未声明组或未配置
     限制的节点不受影响；非法值（<=0 / 非整数）抛 ``ConfigError``。
+    ``cache_max_entries`` / ``cache_max_bytes``（M7-4 Task 11）：缓存容量上限，
+    写入后按 mtime 淘汰最旧条目；默认 None = 不限（与 v0.7.0 一致）。
+    ``spill_warn_bytes``（M7-4 Task 12）：spill 落盘目录占用告警阈值，运行结束
+    超过阈值时向 ``report.warnings`` 追加中文提示；默认 None = 不告警。
 
     典型的库内调用::
 
@@ -1183,13 +1315,27 @@ def run_pipeline(
         logger=logger,
         cache=None,
     )
-    cache_store = CacheStore(cache_dir, base_dir=workdir)
+    cache_store = CacheStore(
+        cache_dir,
+        base_dir=workdir,
+        max_entries=cache_max_entries,
+        max_bytes=cache_max_bytes,
+    )
     engine = Engine(plan, context, cache_store=cache_store, max_workers=max_workers,
                     fail_fast=fail_fast, cancel_event=cancel_event, executor=executor,
                     handle_store=handle_store, run_store=run_store,
                     resume_run_id=resume_run_id, hooks=hooks,
                     concurrency_limits=concurrency_limits)
     report = engine.run()
+    # M7-4 Task 12：运行结束统计缓存/spill 目录占用，超阈值追加中文告警
+    report.warnings.extend(
+        storage_warnings(
+            cache_store,
+            artifacts_dir=report.artifacts_dir,
+            spill_warn_bytes=spill_warn_bytes,
+            spill_dir=getattr(engine.store, "spill_dir", None),
+        )
+    )
     return report, dict(engine.store.snapshot())
 
 

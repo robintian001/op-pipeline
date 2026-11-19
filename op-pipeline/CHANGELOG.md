@@ -5,6 +5,32 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-19
+
+### Added
+
+- 远程执行可靠性（M7-1）：`QueueWorkerExecutor` 新增 `lease_seconds`/`max_attempts`，worker
+  以 `claims/<job_id>.json` 原子认领、心跳线程定期续租，空闲时扫描过期租约并按 attempt
+  重投或写 error；CLI `worker` 新增 `--lease-seconds`/`--max-attempts`/`--owner`，并新增
+  `queue compact` 归档已处理条目、清空活跃队列。
+- 配置体验与脚手架（M7-2）：新增 `validate --json`、`init --template minimal|data|scheduler`
+  与 `scaffold op` 三个 CLI 入口；配置字符串参数支持解析期 `${env:NAME}` /
+  `${env:NAME:-default}` 替换，缺失且无默认值时抛出 `SpecValidationError`。
+- 运维外围（M7-3）：Web UI 新增运行对比页 `/compare`、只读 JSON API `/api/runs` 与
+  `/api/runs/<id>`、Prometheus 文本指标 `/metrics`；`run_scheduler` 新增 `alert_silence`
+  （CLI `--alert-silence`），同一 pipeline 在窗口内失败只告警一次。
+- 数据与缓存治理（M7-4）：`SpillHandleStore(cleanup="on_run_success")` 在运行成功后清理本次
+  run 的落盘目录；`CacheStore(max_entries/max_bytes)` 按 mtime 淘汰最旧条目并在命中时刷新，
+  同时提供同 key 进程内单飞锁；CLI `run` 新增 `--cache-max-entries`/`--cache-max-bytes`/
+  `--spill-warn-bytes`，运行结束超阈值写入中文告警。
+
+### Changed
+
+- 运行报告 `params` 对敏感参数打码：键名匹配 `TOKEN|SECRET|PASSWORD|KEY`（不区分大小写）
+  或值来自敏感环境变量时显示 `***`，执行期真实值不受影响。
+- 兼容性：新增参数全部可选、默认行为与 v0.7.0 一致；RunStore schema 无变化，
+  算子总数仍为 50（无新增算子）。
+
 ## [0.7.0] - 2026-11-19
 
 ### Added

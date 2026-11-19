@@ -33,7 +33,10 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import pickle
+import socket
+import tempfile
 import threading
 import time
 import traceback
@@ -63,6 +66,163 @@ def _atomic_write(path: Path, data: dict[str, Any]) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+
+
+# --------------------------------------------------------------------------- #
+# M7-1：租约（claims/<job_id>.json）辅助
+#
+# 租约是跨进程的墙钟约定（``time.time()``，不能用 monotonic）：不同 worker
+# 可能在不同机器/进程上，只有 epoch 秒可比。claim 的创建必须 O_EXCL 原子，
+# 保证同一 job 只有一个 worker 认领成功；续租/回收重写用同目录临时文件 +
+# ``os.replace``，读取方不会看到写了一半的 JSON。
+# --------------------------------------------------------------------------- #
+def _claims_dir(out: Path) -> Path:
+    return out / "claims"
+
+
+def _default_owner() -> str:
+    try:
+        host = socket.gethostname()
+    except OSError:  # 极端环境下取不到主机名：仍给出可用标识
+        host = "unknown"
+    return f"{host}-{os.getpid()}"
+
+
+def _read_claim(path: Path) -> dict[str, Any] | None:
+    """读 claim；文件被删除/写一半/权限异常时当作"未持有"（返回 None）。"""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _try_create_claim(path: Path, data: dict[str, Any]) -> bool:
+    """``O_CREAT|O_EXCL`` 原子创建 claim；已存在返回 False（绝不覆盖）。"""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+    finally:
+        os.close(fd)
+    return True
+
+
+def _replace_claim(path: Path, data: dict[str, Any]) -> None:
+    """同目录临时文件 + ``os.replace`` 原子替换（心跳续租用）。"""
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, ensure_ascii=False))
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _release_claim(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:  # 并发删除/权限问题：租约过期后仍会被回收，不阻断执行
+        pass
+
+
+def _acquire_claim(
+    out: Path,
+    job_id: str,
+    *,
+    owner: str,
+    lease_seconds: float,
+    attempt: int,
+) -> tuple[Path, dict[str, Any]] | None:
+    """尝试认领任务：成功返回 ``(claim 路径, claim 内容)``，被他人持有返回 None。
+
+    - 首次 ``O_EXCL`` 创建即成功；
+    - 已存在且未过期 → 另一个 worker 持有，跳过；
+    - 已过期 → unlink 旧 claim 后重试一次（attempt = 旧 attempt+1），
+      再失败（其他 worker 抢先）则跳过本轮。
+    行内 ``attempt`` 与旧 claim 的 attempt 取较大者，保证 attempt 单调递增。
+    """
+    claims = _claims_dir(out)
+    claims.mkdir(parents=True, exist_ok=True)
+    path = claims / f"{job_id}.json"
+    attempt = max(1, int(attempt or 1))
+    data = {"owner": owner, "deadline": time.time() + lease_seconds, "attempt": attempt}
+    if _try_create_claim(path, data):
+        return path, data
+
+    existing = _read_claim(path)
+    if existing is None:  # 刚被删除或正在写：本轮不碰，等下一轮
+        return None
+    try:
+        deadline = float(existing.get("deadline", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if deadline >= time.time():
+        return None  # 未过期：另一 worker 持有
+
+    try:
+        old_attempt = int(existing.get("attempt", attempt))
+    except (TypeError, ValueError):
+        old_attempt = attempt
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    attempt = max(attempt, old_attempt + 1)
+    data = {"owner": owner, "deadline": time.time() + lease_seconds, "attempt": attempt}
+    if _try_create_claim(path, data):
+        return path, data
+    return None
+
+
+class _LeaseHeartbeat:
+    """执行期间的后台续租线程（daemon）：每 ``lease_seconds/3`` 刷新 deadline。
+
+    claim 若已被回收（文件消失），线程直接退出——绝不"复活"一个已过期的
+    claim，否则原 worker 的结果会与重新执行的结果互相覆盖。
+    """
+
+    def __init__(self, path: Path, claim: dict[str, Any], lease_seconds: float):
+        self._path = path
+        self._claim = dict(claim)
+        self._lease_seconds = lease_seconds
+        self._interval = max(lease_seconds / 3.0, 0.05)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="op-lease-heartbeat", daemon=True
+        )
+
+    def __enter__(self) -> "_LeaseHeartbeat":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        return False
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            if not self._path.is_file():
+                return
+            self._claim["deadline"] = time.time() + self._lease_seconds
+            try:
+                _replace_claim(self._path, self._claim)
+            except OSError:
+                # Windows 上其他 worker 正在读 claim 时 os.replace 可能短暂失败
+                # （共享冲突）：下一拍重试，不能因此停止续租。
+                continue
 
 
 class _QueueTask:
@@ -145,10 +305,21 @@ class QueueWorkerExecutor:
         python -m op_pipeline worker --queue jobs.jsonl --out results --count 1
     """
 
-    def __init__(self, queue: str | Path, out: str | Path, *, poll: float = 0.1) -> None:
+    def __init__(
+        self,
+        queue: str | Path,
+        out: str | Path,
+        *,
+        poll: float = 0.1,
+        lease_seconds: float = 0.0,
+        max_attempts: int = 3,
+    ) -> None:
         self._queue = Path(queue)
         self._out = Path(out)
         self._poll = poll
+        # M7-1：租约配置随队列行下发（0 = 关闭租约，保持 v0.7.0 行为）
+        self.lease_seconds = lease_seconds
+        self.max_attempts = max_attempts
         self._out.mkdir(parents=True, exist_ok=True)
         self._closed = False
 
@@ -171,7 +342,16 @@ class QueueWorkerExecutor:
         except Exception as exc:  # pickle 失败典型：lambda/闭包/不可序列化对象
             raise RuntimeError(f"任务不可 pickle，无法提交到队列：{exc}") from exc
         job_id = uuid.uuid4().hex
-        line = json.dumps({"job_id": job_id, "payload": payload}, ensure_ascii=False)
+        line = json.dumps(
+            {
+                "job_id": job_id,
+                "payload": payload,
+                # M7-1：老 worker 读多余键无影响；缺这两个键时按 worker 参数处理
+                "lease_seconds": self.lease_seconds,
+                "max_attempts": self.max_attempts,
+            },
+            ensure_ascii=False,
+        )
         with self._queue.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
         return _QueueTask(
@@ -293,6 +473,167 @@ def _run_one(line: str, out: Path) -> dict[str, Any]:
     return {"job_id": job_id, "status": status}
 
 
+def _process_line(
+    line: str,
+    out: Path,
+    *,
+    owner: str,
+    lease_seconds: float,
+) -> dict[str, Any] | None:
+    """执行一行；租约开启时先互斥认领。返回 None 表示"跳过（不计数）"。
+
+    行内 ``lease_seconds>0`` 覆盖函数参数（老队列行缺该键时按 worker 参数）；
+    ``lease_seconds<=0`` 时完全不碰 claims 目录，行为与 v0.7.0 一致。
+    """
+    try:
+        item = json.loads(line)
+    except json.JSONDecodeError:
+        return _run_one(line, out)  # 坏行保持旧行为：在 _run_one 处报错
+    job_id = item.get("job_id")
+    if not job_id:
+        return _run_one(line, out)
+    try:
+        job_lease = float(item.get("lease_seconds", lease_seconds) or 0.0)
+    except (TypeError, ValueError):
+        job_lease = lease_seconds
+    if job_lease <= 0:
+        return _run_one(line, out)
+    # 已完成（结果文件已存在）→ 跳过，即使残留 claim 也不再执行
+    if (out / f"{job_id}.json").is_file():
+        return None
+    claimed = _acquire_claim(
+        out,
+        job_id,
+        owner=owner,
+        lease_seconds=job_lease,
+        attempt=item.get("attempt") or 1,
+    )
+    if claimed is None:
+        return None  # 另一 worker 持有 / 抢输 / claim 正在写
+    claim_path, claim = claimed
+    try:
+        with _LeaseHeartbeat(claim_path, claim, job_lease):
+            return _run_one(line, out)
+    finally:
+        _release_claim(claim_path)
+
+
+def _try_reclaim_lock(claims: Path, job_id: str) -> Path | None:
+    """``O_EXCL`` 抢占回收锁，避免多个 worker 对同一过期任务重复追加队列行。"""
+    lock = claims / f".reclaim-{job_id}.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+    except OSError:
+        return None
+    os.close(fd)
+    return lock
+
+
+def _append_queue_line(queue: Path, item: dict[str, Any]) -> None:
+    line = json.dumps(item, ensure_ascii=False)
+    with queue.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def _scan_expired_claims(
+    queue: Path, out: Path, *, default_max_attempts: int
+) -> list[str]:
+    """扫描 ``<out>/claims`` 并回收过期租约（空闲时每个 poll 周期最多一次）。
+
+    - 对应 job 已有结果 → 只删除 claim（清理）；
+    - attempt < max_attempts → 删除 claim，把原队列行（attempt+1）追加到队列末尾；
+    - attempt >= max_attempts → 删除 claim，写 error 结果，不再重投。
+    每个 job 的回收处理都先抢 ``.reclaim-<job_id>.lock``，抢不到直接跳过。
+    """
+    claims = _claims_dir(out)
+    if not claims.is_dir():
+        return []
+    now = time.time()
+    expired: list[Path] = []
+    for path in claims.glob("*.json"):
+        claim = _read_claim(path)
+        if claim is None:
+            continue
+        try:
+            deadline = float(claim.get("deadline", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if deadline < now:
+            expired.append(path)
+    if not expired:
+        return []
+
+    lines = queue.read_text(encoding="utf-8").splitlines() if queue.exists() else []
+    by_job: dict[str, dict[str, Any]] = {}
+    for raw in lines:
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        job_id = item.get("job_id")
+        if job_id:
+            by_job[job_id] = item  # 同 job 多次重投时以最后一行为准
+
+    reclaimed: list[str] = []
+    for path in expired:
+        job_id = path.stem
+        lock = _try_reclaim_lock(claims, job_id)
+        if lock is None:
+            continue
+        try:
+            claim = _read_claim(path)
+            if claim is None:
+                continue
+            try:
+                deadline = float(claim.get("deadline", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if deadline >= time.time():
+                continue  # 抢锁期间被心跳续租
+            if (out / f"{job_id}.json").is_file():
+                _release_claim(path)
+                continue
+            item = by_job.get(job_id)
+            if item is None:  # 队列行已被归档/删除：孤儿 claim 直接清理
+                _release_claim(path)
+                continue
+            try:
+                attempt = int(claim.get("attempt", item.get("attempt") or 1))
+            except (TypeError, ValueError):
+                attempt = 1
+            try:
+                max_attempts = int(item.get("max_attempts", default_max_attempts))
+            except (TypeError, ValueError):
+                max_attempts = default_max_attempts
+            _release_claim(path)
+            if attempt >= max_attempts:
+                _atomic_write(
+                    out / f"{job_id}.json",
+                    {
+                        "job_id": job_id,
+                        "status": "error",
+                        "result": None,
+                        "error": (
+                            f"超过重投上限：attempt={attempt} >= "
+                            f"max_attempts={max_attempts}"
+                        ),
+                    },
+                )
+                continue
+            new_item = dict(item)
+            new_item["attempt"] = attempt + 1
+            _append_queue_line(queue, new_item)
+            reclaimed.append(job_id)
+        finally:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+    return reclaimed
+
+
 def _consume_sequential(
     queue: Path,
     out: Path,
@@ -300,8 +641,11 @@ def _consume_sequential(
     count: int | None,
     poll: float,
     stop_event: threading.Event | None,
+    owner: str,
+    lease_seconds: float,
+    max_attempts: int,
 ) -> list[dict[str, Any]]:
-    """单 worker 消费（M5-1 原循环）：逐行执行，行为与历史完全一致。"""
+    """单 worker 消费（M5-1 原循环）：逐行执行；租约关闭时行为与历史一致。"""
     offset = 0
     consumed = 0
     processed: list[dict[str, Any]] = []
@@ -313,14 +657,23 @@ def _consume_sequential(
         if not new_lines:
             if count is not None and consumed >= count:
                 break
+            # 空闲：扫描过期租约（重投的行会作为"新增行"被后续 offset 读到）
+            _scan_expired_claims(queue, out, default_max_attempts=max_attempts)
             time.sleep(poll)
             continue
         for line in new_lines:
             if count is not None and consumed >= count:
                 break
-            processed.append(_run_one(line, out))
+            result = _process_line(
+                line,
+                out,
+                owner=owner,
+                lease_seconds=lease_seconds,
+            )
             offset += 1
-            consumed += 1
+            if result is not None:  # 认领失败/已完成的作品不计数（count 只数实际执行）
+                processed.append(result)
+                consumed += 1
         if count is not None and consumed >= count:
             break
     return processed
@@ -334,24 +687,31 @@ def _consume_parallel(
     poll: float,
     stop_event: threading.Event | None,
     workers: int,
+    owner: str,
+    lease_seconds: float,
+    max_attempts: int,
 ) -> list[dict[str, Any]]:
     """多 worker 并发消费（M6-3 Task 10）：认领与 offset 递增加锁。
 
     - 每个 worker 循环"认领一行 -> 执行 -> 写结果文件"；认领到的下标即
       返回列表中的位置，因此返回顺序恒为认领顺序（单队列 FIFO = 提交顺序）；
-    - ``count`` 为"最多认领的任务数"：达到上限后所有 worker 退出；
-    - ``stop_event`` 置位后不再认领新任务，已认领的任务仍执行完并写结果。
+    - ``count`` 为"最多实际执行的任务数"（M7-1：认领失败/跳过不计数）；
+    - ``stop_event`` 置位后不再认领新任务，已认领的任务仍执行完并写结果；
+    - 空闲线程每个 ``poll`` 至多触发一次过期租约扫描（共享时间戳去重）。
     """
     lock = threading.Lock()
+    scan_lock = threading.Lock()
     offset = 0
     claimed = 0
+    inflight = 0
+    last_scan = 0.0
     processed: list[dict[str, Any] | None] = []
 
     def _claim() -> tuple[tuple[int, str] | None, bool]:
         """返回 ``((下标, 行), False)``；无新任务时 ``(None, 是否已达 count 上限)``。"""
-        nonlocal offset, claimed
+        nonlocal offset, inflight
         with lock:
-            if count is not None and claimed >= count:
+            if count is not None and claimed + inflight >= count:
                 return None, True
             lines = (
                 queue.read_text(encoding="utf-8").splitlines() if queue.exists() else []
@@ -360,12 +720,26 @@ def _consume_parallel(
                 return None, False
             line = lines[offset]
             offset += 1
-            claimed += 1
+            inflight += 1
             index = len(processed)
             processed.append(None)
             return (index, line), False
 
+    def _maybe_scan() -> None:
+        nonlocal last_scan
+        if not scan_lock.acquire(blocking=False):
+            return
+        try:
+            now = time.monotonic()
+            if now - last_scan < poll:
+                return
+            last_scan = now
+            _scan_expired_claims(queue, out, default_max_attempts=max_attempts)
+        finally:
+            scan_lock.release()
+
     def _worker() -> None:
+        nonlocal claimed, inflight
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
@@ -373,15 +747,29 @@ def _consume_parallel(
             if item is None:
                 if exhausted:
                     return
+                _maybe_scan()
                 time.sleep(poll)
                 continue
             index, line = item
-            processed[index] = _run_one(line, out)
+            try:
+                result = _process_line(
+                    line,
+                    out,
+                    owner=owner,
+                    lease_seconds=lease_seconds,
+                )
+            finally:
+                with lock:
+                    inflight -= 1
+            if result is not None:
+                with lock:
+                    claimed += 1
+                processed[index] = result
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="op-worker") as pool:
         for _ in range(workers):
             pool.submit(_worker)
-        # 退出 with 时等待全部 worker 结束（与串行版的阻塞语义一致）
+        # 退出 with 时等待全部 worker 结束（与串行版的阻塞语义相同）
     return [item for item in processed if item is not None]
 
 
@@ -393,6 +781,9 @@ def consume_jobs(
     poll: float = 0.1,
     stop_event: threading.Event | None = None,
     workers: int = 1,
+    owner: str | None = None,
+    lease_seconds: float = 0.0,
+    max_attempts: int = 3,
 ) -> list[dict[str, Any]]:
     """worker 侧：增量消费 JSONL 队列并把每个任务的结果写回 ``out`` 目录。
 
@@ -401,6 +792,10 @@ def consume_jobs(
     - ``workers``（M6-3 Task 10）：并发执行任务的 worker 数，默认 1（保持原
       串行循环行为）；``<= 0`` 抛 ``ValueError``。并发时认领与 offset 递增
       在同一把锁内完成，结果仍按 ``<job_id>.json`` 原子写，返回顺序按认领顺序；
+    - ``owner``/``lease_seconds``/``max_attempts``（M7-1）：任务租约配置；
+      ``lease_seconds<=0`` 时完全不碰 ``claims/``，行为与 v0.7.0 一致；
+      队列行内的 ``lease_seconds``/``max_attempts`` 优先于这里（行内缺失才用
+      这些默认值）；
     - 返回已消费任务的 ``[{"job_id", "status"}]`` 列表，供 CLI 打印与测试断言。
     """
     if workers <= 0:
@@ -408,10 +803,73 @@ def consume_jobs(
     queue = Path(queue)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    owner = owner or _default_owner()
     if workers == 1:
         return _consume_sequential(
-            queue, out, count=count, poll=poll, stop_event=stop_event
+            queue,
+            out,
+            count=count,
+            poll=poll,
+            stop_event=stop_event,
+            owner=owner,
+            lease_seconds=lease_seconds,
+            max_attempts=max_attempts,
         )
     return _consume_parallel(
-        queue, out, count=count, poll=poll, stop_event=stop_event, workers=workers
+        queue,
+        out,
+        count=count,
+        poll=poll,
+        stop_event=stop_event,
+        workers=workers,
+        owner=owner,
+        lease_seconds=lease_seconds,
+        max_attempts=max_attempts,
     )
+
+
+def compact_queue(
+    queue: str | Path,
+    out: str | Path,
+    archive: str | Path | None = None,
+) -> tuple[list[str], Path]:
+    """把已处理条目归档、重写活跃队列（M7-1 Task 3）。
+
+    返回 ``(未完成 job_id 列表, 归档文件路径)``。存在未完成任务时不改动任何
+    文件（调用方据此返回非 0 退出码）；全部完成时把原始行追加进归档文件，
+    再用同目录临时文件 + ``os.replace`` 把活跃队列原子重写为空。
+    """
+    queue = Path(queue)
+    out = Path(out)
+    if not queue.exists():
+        raise FileNotFoundError(f"队列文件不存在：{queue}")
+    target = (
+        Path(archive).expanduser()
+        if archive is not None
+        else queue.with_name(queue.stem + ".archive.jsonl")
+    )
+    lines = [raw for raw in queue.read_text(encoding="utf-8").splitlines() if raw.strip()]
+    pending: list[str] = []
+    for raw in lines:
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError:
+            pending.append("(无法解析的行)")
+            continue
+        job_id = item.get("job_id")
+        if not job_id or not (out / f"{job_id}.json").is_file():
+            pending.append(str(job_id or "(缺少 job_id)"))
+    if pending:
+        return pending, target
+    if lines:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as fh:
+            for raw in lines:
+                fh.write(raw + "\n")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(queue.parent), prefix=queue.name + ".", suffix=".tmp"
+    )
+    os.close(fd)
+    os.replace(tmp_name, queue)  # 空临时文件原子替换活跃队列
+    return [], target
+

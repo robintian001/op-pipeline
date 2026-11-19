@@ -131,6 +131,9 @@ def run(
     resume_run_id: str | None = None,
     hooks: list[Any] | None = None,
     concurrency_limits: Mapping[str, int] | None = None,
+    cache_max_entries: int | None = None,
+    cache_max_bytes: int | None = None,
+    spill_warn_bytes: int | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。
 
@@ -154,6 +157,10 @@ def run(
     - ``concurrency_limits``（M6-3 Task 8）：节点并发分组上限
       ``{组名: 正整数}``，与节点 ``concurrency_group`` 配合使用，透传给
       ``run_pipeline``；默认 None = 不做组限流。
+    - ``cache_max_entries`` / ``cache_max_bytes``（M7-4 Task 11）：缓存容量上限，
+      写入后按 mtime 淘汰最旧条目；默认 None = 不限。
+    - ``spill_warn_bytes``（M7-4 Task 12）：spill 落盘目录占用告警阈值，
+      运行结束超过时写入 ``report.warnings``；默认 None = 不告警。
     """
     config_path = Path(config).expanduser().resolve()
     load_plugins(
@@ -178,6 +185,9 @@ def run(
         resume_run_id=resume_run_id,
         hooks=hooks,
         concurrency_limits=concurrency_limits,
+        cache_max_entries=cache_max_entries,
+        cache_max_bytes=cache_max_bytes,
+        spill_warn_bytes=spill_warn_bytes,
     )
 
 
