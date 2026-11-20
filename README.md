@@ -22,7 +22,7 @@
 | 完全可配置 | JSON / TOML / YAML 描述 DAG、参数、连线、运行策略 | 不把 Python 代码写进配置（表达式走 AST 白名单，非 `eval`） |
 | 可单测 | 算子不依赖引擎内部状态，`Operator.execute(ctx, inputs)` 可被单独调用 | — |
 | 可增量扩展 | `@op` 装饰器 + 插件加载（模块路径/文件路径），不改编排层 | 不做算子市场/版本仓库 |
-| 轻量可嵌入 | 无调度器、无数据库、无服务端；`run_pipeline()` 一行调用 | 不做分布式调度、不做多租户（见第 9 节） |
+| 轻量可嵌入 | 无调度器、无数据库、无服务端；`run_pipeline()` 一行调用 | 不做分布式调度、不做多租户（见第 10 节） |
 
 与 Airflow / Prefect / Dagster 的定位差异：那三者是**平台**（调度、元数据、UI、重试策略中心化）；
 本项目是**库**——适合"脚本级 ETL/数据处理/报告生成"要长期维护、又想保留可嵌入性的场景。
@@ -83,9 +83,11 @@ op_pipeline/
 examples/
 ├── pipeline_orders.json / .toml    订单汇总（18 节点，含 fan-out 并行）
 ├── pipeline_text.toml              文本摘要（插件算子 + 重试 + 句柄下钻）
+├── pipeline_subpipeline.json       子流水线编排（父调子 + ${param:} 注入，M8）
+├── pipeline_subpipeline_child.json 子流水线的子配置
 ├── plugins/demo_ops.py             自定义算子示例
 └── data/*.csv, *.txt               示例数据
-tests/test_op_pipeline.py           21 个用例（unittest，零依赖）
+tests/                              36 个测试模块（unittest，零依赖）
 ```
 
 ---
@@ -161,7 +163,9 @@ print(values["top.table"][0]["region"])
 | `${raw}` | 用 `outputs` 改过名的句柄 |
 | `${stats.stats.最长行}` | 句柄下钻（dict 键 / list 下标，最长前缀优先） |
 | `${p.min_amount}` | 流水线参数 |
-| `${env.HOME}` | 环境变量 |
+| `${env.HOME}` | 环境变量（运行期解析） |
+| `${env:TOKEN}` / `${env:TOKEN:-dev}` | 环境变量（解析期注入，v0.8；可带默认值，未设置且无默认值报错） |
+| `${param:DATE}` / `${param:DATE:-today}` | 运行级参数（解析期注入，v0.9；CLI `run --param DATE=...`，敏感键在报告中打码） |
 | `"${p.dir}/report.md"` | 字符串内混排（整串是单一引用时保留原始类型） |
 
 `when` 表达式的变量来自：本节点输入端口值、本节点参数值、`inputs` / `params` 两个字典。
@@ -276,7 +280,7 @@ load_plugins(entry_points=True)  # 扫描已安装插件包入口点
 
 ---
 
-## 8. 观测性（M3-6）
+## 9. 观测性（M3-6）
 
 `run_pipeline(..., hooks=[...])` 之外，`op_pipeline.observe.JsonlHook` 把一次运行的事件流
 导出为 JSON lines（NDJSON），每行一个事件：`node_start` / `node_finish` / `run_finish`，
@@ -297,7 +301,7 @@ hook.close()
 
 ---
 
-## 9. 远程执行示范（M4-4）
+## 10. 远程执行示范（M4-4）
 
 `QueueWorkerExecutor`（`from op_pipeline import QueueWorkerExecutor`）实现
 `Executor` 协议，但把任务分发给**独立 worker 进程**执行，客户端与 worker 之间
@@ -331,7 +335,7 @@ python -m op_pipeline run examples/pipeline_data_ecosystem.toml --no-cache
 
 ---
 
-## 10. 调度与 Web UI 外围服务（M5-2）
+## 11. 调度与 Web UI 外围服务（M5-2）
 
 独立子包 `scheduler_app/`（纯标准库，**不进内核**——`op_pipeline` 不引用它，保持
 "零依赖、零守护进程"承诺）：
@@ -346,25 +350,42 @@ python -c "from scheduler_app import create_server; create_server('runs.db', 800
 
 ---
 
-## 11. 已知限制与后续演进
+## 12. 典型应用场景
 
-| 限制 | 现状 | 演进方向 |
-| --- | --- | --- |
-| 超时是软超时 | 线程无法被强杀，超时后底层仍可能继续跑 | 引入进程池/子进程执行器做硬超时 |
-| 并发模型 | 同步算子 + 线程池；`async def run` 会被自动放进事件循环 | 换成 asyncio 调度器以支撑高并发 IO |
-| 无持久化元数据 | 只有 JSON 运行报告 + 文件缓存 | 接 SQLite 记录 run/node 状态，支持断点续跑 |
-| 类型只做软校验 | 端口类型不符仅告警 | 引入可选 schema（pydantic/dataclass）做深校验 |
-| 无分布式 | 单机进程内 | 抽出 `Executor` 接口，接队列/集群 |
-| 大对象 | 句柄常驻内存，缓存走 pickle 文件 | 接对象存储/Arrow 表，句柄传引用 |
+- **多环境参数化部署** —— 同一份配置在 dev/staging/prod 间复用：`${env:DB_HOST:-localhost}` 在解析期注入环境差异，`python -m op_pipeline run pipeline.json --param date=2026-11-20 --param env=prod` 在运行时注入本次差异（`--param` 可重复）。
+- **流水线复用拆分** —— 把通用明细层/汇总层拆成子配置，父配置用 `pipeline.run` 节点执行子配置并通过 `params` 注入参数（示例 `examples/pipeline_subpipeline.json`）；子流水线防环含链路、深度上限 5、结果永不落缓存。
+- **多任务依赖编排** —— 调度器 `--after` 让「日汇总」只在「各分区明细」本轮全部 success 后触发：`python -m scheduler_app.scheduler --pipeline part_a.json --pipeline part_b.json --pipeline daily.json --after daily=part_a,part_b`（pipeline 名 = 配置文件 stem；依赖未全成功则本轮跳过并记 info，成环报 `ConfigError`）。
+- **大表先探后跑** —— 接手陌生大表先小成本验证结构与字段：`python -m op_pipeline run big.json --sample 5`（仅截断 list 句柄、采样时缓存读写禁用；报告含 run 级 `sample_rows` 与节点级 `sampled`）。
+- **行数血缘审计** —— 报告 nodes[] 平铺的 `rows_in`/`rows_out` 与 Web 详情页 In/Out 列用来发现「某一层行数骤减」；`/compare` 页直接对比两次运行的行数差（+N/-N 与「仅 A/仅 B」）。
+- **运行耗时观测** —— Web 详情页的甘特时间线按相对 run 起点铺开每个节点的执行区间（success 绿 / failed 红 / cached 灰 / skipped 淡灰），一眼定位串行瓶颈段。
+- **数据质量门禁** —— `quality.null_check` / `quality.unique` / `quality.schema_check` 在清洗后校验空值率、重复与类型（error 抛错、warn 出明细，table 原样透传），配合 `allow_failure` 与 `when` 组合出「告警不断流」或「失败即拦」的门禁。
+- **事件审计与告警排查** —— `JsonlHook` 把事件流落 JSONL，事后 `python -m op_pipeline events runs/events.jsonl --summary` 聚合失败与耗时（支持 `--run-id` / `--node` / `--event` / `--last N` 过滤；损坏行跳过并告警）。
+- **配置变更前自检** —— 上线前 `python -m op_pipeline explain pipeline.json --param env=prod --json` 导出最终生效配置（含 `--param` 注入结果），与测试环境 diff；不执行节点、零文件产出，非法配置退出码 1。
+- **敏感凭据安全** —— `${env:DB_PASSWORD}` 解析期注入避免明文写进配置文件；`--param token=...` 中含 TOKEN/SECRET/PASSWORD/KEY 的运行级参数在报告里自动打码。
 
 ---
 
-## 12. 自测
+## 13. 已知限制与后续演进
+
+| 限制 | 现状 | 演进方向 |
+| --- | --- | --- |
+| 默认执行器超时是软超时 | 线程无法被强杀，超时后底层仍可能继续跑；可选 `ProcessExecutor`（M2-2）提供硬超时与进程隔离 | 进程级超时的粒度与开销优化 |
+| 并发模型 | 同步算子 + 线程池（默认 `min(8, CPU)`）；async 宿主经 `run_pipeline_async` 桥接（M2-8） | 换成 asyncio 调度器以支撑高并发 IO |
+| 元数据持久化 | 内核可选 RunStore SQLite（`--runs` 落库 + `--resume` 断点续跑，M2-5/M2-6）；scheduler_app 运行历史亦落 RunStore（v0.9 起含行数血缘列） | 行数血缘之外的值级血缘与更细粒度审计 |
+| 类型只做软校验 | 端口类型不符仅告警 | 引入可选 schema（pydantic/dataclass）做深校验 |
+| 无分布式编排 | 单机进程内调度；`Executor` 可替换，`QueueWorkerExecutor` 已支持跨进程队列与租约回收（M4-4/M7-1） | 多机调度与集群编排 |
+| 大对象 | 句柄默认内存驻留，超阈值可落盘（`SpillHandleStore`，v0.8 起可选 `cleanup="on_run_success"`）；缓存走 pickle 文件 | 接对象存储/Arrow 表，句柄传引用 |
+
+---
+
+## 14. 自测
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
 覆盖：算子契约与参数校验、表达式白名单拦截、未知算子/未知句柄/缺输入/环检测、
-端到端文件读写、4 路并行耗时、重试与尝试次数、失败传播与旁路分支继续、
-`when` 跳过、缓存复用、句柄下钻、JSON/TOML 解析、插件加载。
+端到端文件读写、重试与失败传播、缓存复用、插件加载；以及 RunStore 断点续跑、
+远程队列租约与故障回收、scheduler_app 调度/告警/`after` 依赖触发、Web UI
+（详情/对比/时间线/In-Out 行数列）、`${param:}` 参数注入、`--sample` 采样预览、
+行数血缘、子流水线与 M8 新算子（time/json/quality/pipeline.run）。

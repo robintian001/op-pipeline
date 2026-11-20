@@ -37,8 +37,9 @@
                                     │ @op 注册
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 算子层  (ops/) + 外部插件                                                    │
-│   io / table / stats / text / report / control / http / db / df（九组）      │
-│   共 40 个内置算子                                                          │
+│   io / table / stats / text / datetime / json / quality / report / control  │
+│   / pipeline / http / db / df / parquet / excel（按 ops/ 模块分组，十四组）   │
+│   共 59 个内置算子                                                          │
 │   业务算子以插件形式平级加入，不与框架耦合                                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -66,7 +67,7 @@
 | [context.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/context.py) | `RunContext` `NodeContext` | 运行 ID、日志、工作目录、产物路径、参数注入 | 不持有句柄表（句柄在 `Engine`） |
 | [graph.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/graph.py) | `to_mermaid` `to_dot` `to_ascii` | 依赖图 / 执行计划渲染 | 不做布局算法 |
 | [cli.py](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/cli.py) | `main` `build_parser` | 命令行入口与退出码 | 不提供业务算子 |
-| [ops/](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/ops/__init__.py) | 40 个 `@op` 类 | 内置算子库，导入即注册 | 不依赖引擎内部实现 |
+| [ops/](file:///C:/Users/ZTIAN12/PycharmProjects/op-pipeline/op_pipeline/ops/__init__.py) | 59 个 `@op` 类 | 内置算子库，导入即注册 | 不依赖引擎内部实现 |
 
 ## 4. 核心抽象与不变量
 

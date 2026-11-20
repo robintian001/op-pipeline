@@ -10,10 +10,10 @@
 | --- | --- | --- | --- |
 | [architecture/overview.md](architecture/overview.md) | 架构设计 | 框架维护者、接入方 | 定位、分层、模块职责矩阵、核心抽象、关键设计决策（含取舍与代价） |
 | [architecture/runtime-semantics.md](architecture/runtime-semantics.md) | 运行时设计 | 框架维护者、排障者 | 两阶段执行模型、编译期校验、调度算法、失败传播、重试、软超时、缓存、报告聚合 |
-| [architecture/roadmap.md](architecture/roadmap.md) | 演进规划 | 维护者、决策者 | 能力边界与场景适配评估（强适配/补插件可用/不适合）、演进原则、三阶段路线、不建议方向 |
+| [architecture/roadmap.md](architecture/roadmap.md) | 演进规划 | 维护者、决策者 | 能力边界与场景适配评估（强适配/补插件可用/不适合）、演进原则、阶段 1 → 1.5 → 2 → … → 6 路线、不建议方向 |
 | [design/core-modules.md](design/core-modules.md) | 详细设计 | 贡献者 | 逐模块的职责、关键类型与函数、校验规则、实现细节与坑位 |
 | [design/extension-points.md](design/extension-points.md) | 扩展设计 | 算子作者、二次开发者 | 自定义算子、插件加载、替换执行器/缓存、演进路线落点、已知技术债 |
-| [design/development-plan.md](design/development-plan.md) | 开发计划 | 贡献者、维护者 | 里程碑（M1 正确性 / M1.5 库通用性 / M2 三抽象 / M3 生态）任务分解：改动落点、验收标准、技术债映射、DoD 与工程约定 |
+| [design/development-plan.md](design/development-plan.md) | 开发计划 | 贡献者、维护者 | 里程碑（M1 正确性 / M1.5 库通用性 / M2 三抽象 / M3 生态 / M4~M8 工程化与编排组合）任务分解：改动落点、验收标准、技术债映射、DoD 与工程约定 |
 | [reference/config-schema.md](reference/config-schema.md) | 参考手册 | 流水线配置编写者 | 顶层/节点字段、引用语法、表达式子集、参数归一规则、CLI 与退出码 |
 | [reference/operator-catalog.md](reference/operator-catalog.md) | 参考手册 | 流水线配置编写者 | 59 个内置算子的输入/输出/参数契约与行为要点 |
 | [reference/api.md](reference/api.md) | 参考手册 | 二次开发者、维护者 | 包顶层 `__all__` 公开 API、分组语义与稳定性承诺 |
@@ -30,12 +30,13 @@
 ## 代码位置约定
 
 本目录与包源码同处一个仓库根：包源码位于 `op_pipeline/`，示例与插件位于 `examples/`，
-自测位于 `tests/test_op_pipeline.py`。文档中的源码链接统一使用 `file:///` 绝对路径，可直接跳转。
+自测位于 `tests/`（unittest，零依赖）。文档中的源码链接统一使用 `file:///` 绝对路径，可直接跳转。
 
 示例一览：
 
 - `examples/pipeline_orders.json` / `.toml`：CLI 模式（并行 fan-out、when、断言、4 种输出）；
 - `examples/pipeline_text.toml` + `plugins/demo_ops.py`：插件加载与重试（`--plugin` 相对配置文件目录解析）；
+- `examples/pipeline_subpipeline.json` + `pipeline_subpipeline_child.json`：`pipeline.run` 子流水线编排（父调子 + `${param:}` 运行级参数注入，v0.9）；
 - `examples/embedded_lib_demo.py`：**库嵌入模式**（独立注册表 + 取消事件 + 纯内存运行三合一，
   直接 `python examples/embedded_lib_demo.py` 运行，无需安装）。
 
