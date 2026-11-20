@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import json
 import logging
 import os
 import re
@@ -38,7 +39,13 @@ from typing import Any, Callable, Mapping, Protocol
 from .cache import CacheStore
 from .context import RunContext
 from .errors import ConfigError, RefResolutionError
-from .executor import Executor, ProcessExecutor, ThreadExecutor, _child_run_op
+from .executor import (
+    Executor,
+    PooledProcessExecutor,
+    ProcessExecutor,
+    ThreadExecutor,
+    _child_run_op,
+)
 from .expression import evaluate_condition
 from .handlestore import (
     HandleStore,
@@ -103,6 +110,23 @@ def _masked_params(
     return masked
 
 
+def _make_preview(value: Any, n: int) -> Any:
+    """M9 Task 7：单端口值级预览快照（只影响报告，不影响执行）。
+
+    - list：前 n 行原值（元素原样，不截断）；
+    - dict：前 n 个键的子 dict；
+    - str：截前 200 字符；
+    - 其他类型：repr 截前 200 字符。
+    """
+    if isinstance(value, list):
+        return value[:n]
+    if isinstance(value, dict):
+        return {key: value[key] for key in list(value)[:n]}
+    if isinstance(value, str):
+        return value[:200]
+    return repr(value)[:200]
+
+
 @dataclass
 class NodeResult:
     node_id: str
@@ -127,6 +151,10 @@ class NodeResult:
     rows_out: dict[str, int] = field(default_factory=dict)
     # M8-2 Task 4：采样预览模式运行时为 True（报告标注；非采样不出现该键）
     sampled: bool = False
+    # M9 Task 7：值级预览——输入/输出端口的前 N 行（list）或前 N 键（dict）
+    # 原值快照；str 与其他类型截前 200 字符。仅 value_preview 非 None 时采集。
+    preview_in: dict[str, Any] = field(default_factory=dict)
+    preview_out: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -147,6 +175,10 @@ class NodeResult:
             data["rows_out"] = dict(self.rows_out)
         if self.sampled:
             data["sampled"] = True
+        if self.preview_in:
+            data["preview_in"] = self.preview_in
+        if self.preview_out:
+            data["preview_out"] = self.preview_out
         return data
 
 
@@ -292,13 +324,18 @@ class Engine:
         concurrency_limits: Mapping[str, int] | None = None,
         sample_rows: int | None = None,
         lineage: bool = True,
+        value_preview: int | None = None,
     ) -> None:
         # M5-1：运行级执行器三元态——字符串选择器 / Executor 实例 / None（默认线程池）。
-        if isinstance(executor, str) and executor not in ("thread", "process", "queue"):
-            raise ConfigError(f"executor 只能是 thread/process/queue，实际是 {executor!r}")
+        if isinstance(executor, str) and executor not in (
+            "thread", "process", "process_pool", "queue"
+        ):
+            raise ConfigError(
+                f"executor 只能是 thread/process/process_pool/queue，实际是 {executor!r}"
+            )
         if executor is not None and not isinstance(executor, (str, Executor)):
             raise ConfigError(
-                "executor 只能是字符串选择器（thread/process/queue）或实现 "
+                "executor 只能是字符串选择器（thread/process/process_pool/queue）或实现 "
                 "Executor 协议（submit/wait/shutdown）的实例，"
                 f"实际是 {type(executor).__name__}"
             )
@@ -310,6 +347,16 @@ class Engine:
             or sample_rows < 1
         ):
             raise ValueError(f"sample_rows 必须是 ≥1 的整数，实际是 {sample_rows!r}")
+        # M9 Task 7：值级预览行数——sample_rows 之外的独立预览开关；只影响报告
+        # （preview_in/preview_out），不影响执行（句柄不截断、缓存照常），也不受
+        # lineage 开关控制。None = 不采集（默认行为与 v0.9.0 一致）。
+        if value_preview is not None and (
+            isinstance(value_preview, bool)
+            or not isinstance(value_preview, int)
+            or value_preview < 1
+        ):
+            raise ValueError(f"value_preview 必须是 ≥1 的整数，实际是 {value_preview!r}")
+        self.value_preview = value_preview
         self.plan = plan
         self.context = context
         # M8-2 Task 5：行数血缘开关（默认开启）；False 时报告节点不含 rows_in/rows_out
@@ -341,7 +388,11 @@ class Engine:
         need_queue = executor == "queue" or (
             executor in (None, "thread") and node_level_queue
         )
-        if isinstance(executor, str) and executor in ("thread", "process") and node_level_queue:
+        if (
+            isinstance(executor, str)
+            and executor in ("thread", "process", "process_pool")
+            and node_level_queue
+        ):
             self._warnings.append(
                 f"存在节点级 executor='queue' 声明，但运行级 executor={executor!r} 优先，"
                 "本次运行不会创建队列执行器"
@@ -360,7 +411,11 @@ class Engine:
         self._remote = isinstance(self._executor_instance, QueueWorkerExecutor)
         # 运行级实例接管节点执行时，节点级 executor 声明被忽略——记告警留痕
         if isinstance(executor, Executor):
-            ignored = {"process"} if self._remote else {"process", "queue"}
+            ignored = (
+                {"process", "process_pool"}
+                if self._remote
+                else {"process", "process_pool", "queue"}
+            )
             for node in plan.nodes:
                 if node.spec.executor in ignored:
                     self._warnings.append(
@@ -399,12 +454,23 @@ class Engine:
         # 声明被忽略并记告警（见上）。
         if isinstance(executor, Executor) or need_queue:
             need_process = False
+            use_pooled = False
         else:
-            need_process = executor == "process" or any(
-                node.spec.executor == "process" for node in plan.nodes
+            kinds = {"process", "process_pool"}
+            need_process = executor in kinds or any(
+                node.spec.executor in kinds for node in plan.nodes
+            )
+            # M9 Task 6：仅当运行级或任一节点声明 process_pool 时启用常驻
+            # worker 池；纯 "process" 保持每任务一进程的 M2-2 行为（零变化）。
+            use_pooled = executor == "process_pool" or any(
+                node.spec.executor == "process_pool" for node in plan.nodes
             )
         self._process_pool = (
-            ProcessExecutor(on_fallback=self._warnings.append) if need_process else None
+            (PooledProcessExecutor if use_pooled else ProcessExecutor)(
+                on_fallback=self._warnings.append
+            )
+            if need_process
+            else None
         )
         # M2-4：落盘型句柄存储（如 SpillHandleStore）实现 attach(context) 时，
         # 由引擎把落盘目录挂到本次运行的 artifacts_dir 下；普通实现无此钩子。
@@ -584,7 +650,10 @@ class Engine:
         self._cleanup_spill_on_success(report.status)
         report.warnings.extend(self._warnings)
         report.finished_at = time.time()
-        # M2-5：运行级记录落库（run_id 主键，可覆盖同 run_id 的重跑记录）
+        # M2-5：运行级记录落库（run_id 主键，可覆盖同 run_id 的重跑记录）。
+        # M9 Task 11：附带全量报告 JSON——与 --report-out 同一序列化规则
+        # （json.dumps(report.to_dict(), ensure_ascii=False, indent=2, default=str)）。
+        # 此时报告已定稿（nodes/status/warnings/finished_at 均已汇总完毕）。
         if self.run_store is not None:
             self.run_store.record_run(
                 report.run_id,
@@ -594,6 +663,9 @@ class Engine:
                 report.started_at,
                 report.finished_at,
                 report.params,
+                report_json=json.dumps(
+                    report.to_dict(), ensure_ascii=False, indent=2, default=str
+                ),
             )
         self.context.logger.info(
             "运行结束 %s：%s，耗时 %.2fs",
@@ -846,6 +918,9 @@ class Engine:
             inputs = self._sample_inputs(inputs)
             if self.lineage:
                 result.rows_in = self._row_counts(inputs)
+            # M9 Task 7：值级预览——远程路径输入快照（与 lineage 独立）
+            if self.value_preview is not None:
+                result.preview_in = self._previews(inputs)
             params = resolver.resolve(node.spec.params)
             ctx.params = params
 
@@ -908,6 +983,9 @@ class Engine:
                 # M8-2 Task 5：行数血缘——远程路径输出读回处记录 list 端口行数
                 if self.lineage:
                     result.rows_out = self._row_counts(raw)
+                # M9 Task 7：值级预览——远程路径输出快照
+                if self.value_preview is not None:
+                    result.preview_out = self._previews(raw)
                 if cache_key is not None:
                     self.cache.store(cache_key, raw)
             finally:
@@ -978,6 +1056,14 @@ class Engine:
             if isinstance(value, list)
         }
 
+    def _previews(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        """M9 Task 7：值级预览采集（value_preview 非 None 时调用，规则见
+        :func:`_make_preview`；预览不影响句柄本身）。"""
+        return {
+            port: _make_preview(value, self.value_preview or 1)
+            for port, value in values.items()
+        }
+
     def _run_node(self, node: PlanNode) -> NodeResult:
         ctx = self.context.for_node(node.spec.id, node.spec.op)
         result = NodeResult(node_id=node.spec.id, op=node.spec.op, started_at=time.time())
@@ -998,6 +1084,9 @@ class Engine:
             # M8-2 Task 5：行数血缘——记录截断后（实际传入规模）的输入行数
             if self.lineage:
                 result.rows_in = self._row_counts(inputs)
+            # M9 Task 7：值级预览——快照"采样截断后实际传入"的输入（与 lineage 独立）
+            if self.value_preview is not None:
+                result.preview_in = self._previews(inputs)
             params = resolver.resolve(node.spec.params)
             ctx.params = params
             instance = node.operator if node.operator is not None else node.operator_cls(**params)
@@ -1051,6 +1140,9 @@ class Engine:
                 # M8-2 Task 5：行数血缘——输出发布处记录 list 端口行数
                 if self.lineage:
                     result.rows_out = self._row_counts(outputs)
+                # M9 Task 7：值级预览——发布前原值快照（句柄本身不截断、缓存照常）
+                if self.value_preview is not None:
+                    result.preview_out = self._previews(outputs)
 
                 if cache_key is not None:
                     self.cache.store(cache_key, outputs)
@@ -1109,6 +1201,9 @@ class Engine:
         # M8-2 Task 5：行数血缘——缓存命中后反序列化的输出若为 list 也记录行数
         if self.lineage:
             result.rows_out = self._row_counts(outputs)
+        # M9 Task 7：值级预览——缓存命中同样快照（preview_in 已在输入解析处采集）
+        if self.value_preview is not None:
+            result.preview_out = self._previews(outputs)
         # M2-6：参考 run 里该节点成功且 cache_key 一致才算续跑命中
         prev = self._resume_map.get(node.spec.id)
         if prev is not None and prev[0] == SUCCESS and prev[1] == cache_key:
@@ -1203,7 +1298,12 @@ class Engine:
         inputs: Mapping[str, Any],
         timeout: float | None,
     ) -> dict[str, Any]:
-        """进程模式（M2-2）：算子在子进程执行，timeout 由 ProcessExecutor 强制（硬超时）。"""
+        """进程模式（M2-2/M9 Task 6）：算子在子进程执行，timeout 硬超时强制。
+
+        池实例按运行级/节点级声明二选一构造：纯 "process" 用每任务一进程的
+        ``ProcessExecutor``；涉及 "process_pool" 用常驻 worker 池
+        ``PooledProcessExecutor``。两种 kind 共用同一池实例，此处无需区分。
+        """
         run = ctx.run
         ctx_data = (
             ctx.node_id,
@@ -1213,7 +1313,7 @@ class Engine:
             str(run.workdir),
             str(run.artifacts_dir),
         )
-        assert self._process_pool is not None  # 仅在 kind=="process" 且池存在时进入
+        assert self._process_pool is not None  # 仅在 kind 为 process/process_pool 且池存在时进入
         task = self._process_pool.submit(
             _child_run_op, instance, ctx_data, dict(inputs), timeout=timeout
         )
@@ -1228,7 +1328,7 @@ class Engine:
         timeout: float | None,
         kind: str = "thread",
     ) -> dict[str, Any]:
-        if kind == "process" and self._process_pool is not None:
+        if kind in ("process", "process_pool") and self._process_pool is not None:
             return self._execute_in_process(instance, ctx, inputs, timeout)
         if not timeout:
             return instance.execute(ctx, inputs)
@@ -1360,6 +1460,7 @@ def run_pipeline(
     spill_warn_bytes: int | None = None,
     sample_rows: int | None = None,
     lineage: bool = True,
+    value_preview: int | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """编译 + 执行一步到位，返回值与句柄表。
 
@@ -1378,6 +1479,11 @@ def run_pipeline(
     worker 可预先启动常驻消费）；或任意 ``Executor`` 实例（如
     ``QueueWorkerExecutor(...)`` / ``ThreadExecutor(...)``），引擎把节点执行分发到
     该实例，实例生命周期归调用方、引擎不 shutdown。
+    ``executor="process_pool"``（M9 Task 6）走常驻 worker 进程池
+    :class:`~op_pipeline.executor.PooledProcessExecutor`：N 个 spawn 子进程复用
+    执行多个节点任务（默认 ``min(8, cpu_count)`` 个 worker），免去每任务冷启动
+    开销；硬超时仍强制——terminate 在跑 worker 并自动补位，worker 崩溃同样补位、
+    在跑任务按失败结算。节点级 ``executor="process_pool"`` 声明同样触发建池。
     ``concurrency_limits``（M6-3 Task 8）节点并发分组上限：``{组名: 正整数}``，
     与节点 ``concurrency_group`` 配合限制同组节点同时执行数；未声明组或未配置
     限制的节点不受影响；非法值（<=0 / 非整数）抛 ``ConfigError``。
@@ -1390,6 +1496,11 @@ def run_pipeline(
     缓存读写全部禁用；必须是 ≥1 的整数（bool 不算），非法抛 ``ValueError``。
     ``lineage``（M8-2 Task 5）：行数血缘开关（默认开启）；False 时报告节点
     不含 rows_in/rows_out，其余行为不变。
+    ``value_preview``（M9 Task 7）：值级预览行数——非 None 时报告节点附带
+    ``preview_in``/``preview_out``（dict[端口, 预览]）：list 取前 N 行原值、
+    dict 取前 N 键子 dict、str 截前 200 字符、其他类型 repr 截 200 字符。
+    只影响报告不影响执行（句柄不截断、缓存照常），与 ``sample_rows``、
+    ``lineage`` 相互独立；非法值抛 ``ValueError``。
 
     典型的库内调用::
 
@@ -1421,7 +1532,7 @@ def run_pipeline(
                     handle_store=handle_store, run_store=run_store,
                     resume_run_id=resume_run_id, hooks=hooks,
                     concurrency_limits=concurrency_limits,
-                    sample_rows=sample_rows, lineage=lineage)
+                    sample_rows=sample_rows, lineage=lineage, value_preview=value_preview)
     report = engine.run()
     # M7-4 Task 12：运行结束统计缓存/spill 目录占用，超阈值追加中文告警
     report.warnings.extend(
@@ -1455,6 +1566,7 @@ async def run_pipeline_async(
     concurrency_limits: Mapping[str, int] | None = None,
     sample_rows: int | None = None,
     lineage: bool = True,
+    value_preview: int | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """async 宿主嵌入（M2-8）：把同步引擎抛到事件循环的默认执行器里跑。
 
@@ -1498,5 +1610,6 @@ async def run_pipeline_async(
             concurrency_limits=concurrency_limits,
             sample_rows=sample_rows,
             lineage=lineage,
+            value_preview=value_preview,
         ),
     )

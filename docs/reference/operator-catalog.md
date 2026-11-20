@@ -1,6 +1,6 @@
 # 内置算子契约清单
 
-共 59 个算子（53 个零依赖内置 + 6 个可选依赖的 Parquet/Excel/Arrow 算子），按 `ops/` 下的文件分组。字段约定：
+共 68 个算子（62 个零依赖内置 + 6 个可选依赖的 Parquet/Excel/Arrow 算子），按 `ops/` 下的文件分组。字段约定：
 
 - **入 / 出**：`名字:类型`，`?` 表示 optional（未接线时收到 `None`）；
 - **参数**：`*` 表示必填；未标默认值即必填；
@@ -29,7 +29,7 @@
 
 ---
 
-## 2. 表（table_ops.py，12 个）
+## 2. 表（table_ops.py，16 个）
 
 | 算子 | 入 | 出 | 参数 |
 | --- | --- | --- | --- |
@@ -45,6 +45,10 @@
 | `table.union` | `left` `right` | `table:list` | `distinct=false` |
 | `table.take_column` | `table` | `values:list` `count:int` | `column*`、`skip_null=true` |
 | `table.explode` | `table` | `table:list` `rows:int` | `column*`、`index_column=None`、`keep_empty=false` |
+| `table.fill_null` | `table` | `table:list` `filled:int` | `value*`（填充值）、`columns=None`（None 表示全部列） |
+| `table.replace` | `table` | `table:list` `replaced:int` | `mapping*:dict`（旧值→新值）、`columns=None`（None 表示全部列）、`regex=false` |
+| `table.pivot` | `table` | `table:list` `rows:int` | `index*`（str 或 list）、`columns*`（键列）、`values*`（值列）、`agg=None`（`first`/`last`/`sum`/`count`/`mean`，None 表示不允许重复组合） |
+| `table.unpivot` | `table` | `table:list` `rows:int` | `columns*`（str 或 list）、`index=None`（None 表示除展开列外的全部列）、`name_to="variable"`、`value_to="value"` |
 
 行为要点与坑：
 
@@ -90,7 +94,7 @@
 
 ---
 
-## 4. 文本（text_ops.py，5 个）
+## 4. 文本（text_ops.py，6 个）
 
 | 算子 | 入 | 出 | 参数 |
 | --- | --- | --- | --- |
@@ -99,6 +103,7 @@
 | `text.join_lines` | `lines` | `text:str` `length:int` | `sep="\n"` |
 | `text.regex_extract` | `text` | `matches:list` `count:int` | `pattern*`、`group=0`、`ignore_case=false` |
 | `text.replace_regex` | `text` | `text:str` `replacements:int` | `pattern*`、`replacement*`、`count=0`（0 表示全部） |
+| `text.hash` | `text` | `digest:str` `length:int` | `algorithm="sha256"`（`md5`/`sha1`/`sha256`/`sha512`/`blake2b`）、`encoding="utf-8"` |
 
 行为要点：
 
@@ -279,11 +284,13 @@ pyarrow（`pip install op-pipeline[parquet]`）与 openpyxl（`pip install op-pi
 
 ---
 
-## 12. JSON 结构（json_ops.py，1 个）
+## 12. JSON 结构（json_ops.py，3 个）
 
 | 算子 | 入 | 出 | 参数 |
 | --- | --- | --- | --- |
 | `json.flatten` | `data:dict` | `data:dict` `count:int` | `sep="."`、`max_depth=0`（0 表示不限） |
+| `json.parse` | `text:str` | `data:any` | — |
+| `json.stringify` | `data:any` | `text:str` `bytes:int` | `indent=2`、`ensure_ascii=false`、`sort_keys=false` |
 
 行为要点：
 
@@ -354,7 +361,24 @@ pyarrow（`pip install op-pipeline[parquet]`）与 openpyxl（`pip install op-pi
 
 ---
 
-## 15. 示例插件算子（examples/plugins/demo_ops.py）
+## 15. 压缩（compress_ops.py，2 个）
+
+| 算子 | 入 | 出 | 参数 |
+| --- | --- | --- | --- |
+| `compress.gzip` | `text` | `path:str` `bytes:int` | `path*`、`encoding="utf-8"`、`mtime=0` |
+| `compress.ungzip` | — | `text:str` `length:int` | `path*`、`encoding="utf-8"` |
+
+行为要点：
+
+- 基于标准库 `gzip` 实现，**零第三方依赖**；路径经 `ctx.resolve_path()`（相对工作目录），
+  写出前自动创建父目录；
+- `compress.gzip` 以 `gzip.compress(..., mtime=...)` 二进制写出，默认 `mtime=0`
+  保证同文本产出字节一致；**落盘副作用标记 `deterministic=False`**，结果永不落入节点缓存；
+- `compress.ungzip` 沿 io 读算子惯例默认 `deterministic=True`；文件不存在抛 `FileNotFoundError`。
+
+---
+
+## 16. 示例插件算子（examples/plugins/demo_ops.py）
 
 不属于内置算子，需 `--plugin plugins/demo_ops.py`（`--plugin` 路径相对配置文件所在目录解析）后可用：
 

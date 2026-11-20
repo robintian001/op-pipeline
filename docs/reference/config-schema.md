@@ -42,7 +42,7 @@
 | `timeout` | float | 无（`0` 视为无） | 秒级超时：线程模式为**软超时**（到点标记失败、不强杀）；`executor="process"` 时为**硬超时**（terminate 子进程） |
 | `cache` | bool | `false` | 是否参与内容指纹缓存（算子须 `deterministic`） |
 | `allow_failure` | bool | `false` | 失败不视为硬失败；报告为 `partial`，下游仍因缺输入跳过 |
-| `executor` | `"thread"` / `"process"` / `"queue"` | 无（先继承运行级，最终 `thread`） | 执行器选择（M2-2/M5-1）：`process` 时算子在子进程执行（载荷须可 pickle，超时为硬超时）；`queue` 时节点载荷经共享队列文件交给独立 worker 进程（需另启 `python -m op_pipeline worker`）；未指定时沿用 `run(executor=...)` / CLI `--executor`（同样接受 `"queue"` 或 `Executor` 实例） |
+| `executor` | `"thread"` / `"process"` / `"process_pool"` / `"queue"` | 无（先继承运行级，最终 `thread`） | 执行器选择（M2-2/M5-1）：`process` 时算子在子进程执行（载荷须可 pickle，超时为硬超时）；`process_pool`（v0.9.1）为池化进程执行器——N 个常驻 worker 消费任务队列，硬超时 terminate 对应 worker 并自动补位、崩溃自愈；`queue` 时节点载荷经共享队列文件交给独立 worker 进程（需另启 `python -m op_pipeline worker`）；未指定时沿用 `run(executor=...)` / CLI `--executor`（同样接受 `"process_pool"` / `"queue"` 或 `Executor` 实例） |
 | `concurrency_group` | str | `""` | **v0.7 新增，可选**：并发分组名；同组节点的同时执行数受运行级 `concurrency_limits[组名]` 限制（只限制实际执行，不含缓存命中）。空串或未配置的组不加限制，缺省行为与旧版一致 |
 | `description` | str | `""` | 备注（不参与执行） |
 
@@ -61,6 +61,7 @@
 | `params` | dict | `None` | **v0.9 新增，可选**：运行级参数注入 map（`PipelineSpec.from_dict/from_file(params=...)` / `run(config, params=...)` / CLI `--param KEY=VALUE`），解析期与配置顶层 `[params]` 合并、**注入优先**，供 `${param:NAME}` 占位符解析；注入的键随后合并进顶层 `params`；缺失且无默认值的占位符抛 `SpecValidationError`（见 §3.2） |
 | `sample_rows` | int | `None`（不采样） | **v0.9 新增，可选**：采样预览行数（`run(config, sample_rows=N)` / CLI `--sample N`，须 ≥1 整数否则 `ValueError`）：输入解析处把 list 句柄截断为前 N 行，dict/str/其他类型原样；采样模式下缓存读写全部禁用；报告 run 级 `sample_rows` 与节点级 `sampled` 标注（语义详见 runtime-semantics §采样） |
 | `lineage` | bool | `True` | **v0.9 新增，可选**：节点行数血缘开关（`run(config, lineage=False)` 可关）。开启时报告 nodes[] 平铺 `rows_in`/`rows_out` 两个 dict（端口名 → list 句柄行数）；`False` 时报告中不含这两个键，行为与 v0.8.0 一致 |
+| `value_preview` | int | `None`（不预览） | **v0.9.1 新增，可选**：值级预览行数（`run(config, value_preview=N)` / CLI `--preview N`，须 ≥1 整数否则 `ValueError`）：报告节点附带 `preview_in`/`preview_out`——list 取前 N 行、dict 取前 N 键、str 截前 200 字符；**只影响报告，不影响执行**（节点真实结果与缓存不受影响） |
 
 > **行为变更（M3-3，T15 治理）**：`table.select_columns` / `table.sort_rows` /
 > `table.derive_column` / `table.join` 的列判定从"首行代表全表列"改为**全表列集合并集**。
@@ -228,11 +229,13 @@ CLI 下 WARNING 会经 stderr 直接展示（`validate` 同样可见）。
 ```
 python -m op_pipeline run      <config> [选项]
 python -m op_pipeline validate <config> [--json]
-python -m op_pipeline init     <dir> [--template minimal|data|scheduler]
+python -m op_pipeline init     <dir> [--template minimal|data|scheduler|quality|subpipeline]
 python -m op_pipeline scaffold op <name> [--dir <path>]
 python -m op_pipeline graph    <config> [--format mermaid|dot|ascii]
 python -m op_pipeline ops      [--json]
 python -m op_pipeline describe <op_name>
+python -m op_pipeline runs     [--db <path>] [--status s] [--pipeline p] [--last N] [--json]
+python -m op_pipeline runs     <run_id>
 python -m op_pipeline explain  <config> [--param KEY=VALUE ...] [--node <id>] [--json]
 python -m op_pipeline events   <file.jsonl> [--run-id ID] [--node ID]
                                [--event node_start|node_finish|run_finish] [--last N] [--summary]
@@ -242,8 +245,11 @@ python -m op_pipeline queue compact --queue <file> --out <dir> [--archive <file>
 
 `run` 选项：`--workdir`、`--workers`、`--cache-dir`（默认 `.pipeline_cache`）、`--no-cache`、
 `--cache-max-entries`、`--cache-max-bytes`、`--spill-warn-bytes`、`--fail-fast`、`--dry-run`、
-`--json PATH`、`--runs DB`、`--resume RUN_ID`、`--executor {thread,process,queue}`、
+`--json PATH`、`--runs DB`、`--resume RUN_ID`、`--executor {thread,process,process_pool,queue}`、
 `--plugin PATH`（可多次，相对配置文件所在目录解析）、`--param KEY=VALUE`（可多次）、
+`--param-file PATH`（v0.9.1 可多次，与 `--param` 合并、命令行覆盖文件值）、
+`--report-out PATH`（v0.9.1 全量报告 JSON 落盘，父目录自动创建、写失败不掩盖运行结果）、
+`--preview N`（v0.9.1 值级预览，语义见 §2.1 `value_preview`）、
 `--sample N`（v0.9 采样预览，语义见 §2.1）、`-v`。
 
 `validate` 只加载/编译/契约校验，不执行、不写输出；`--json` 输出

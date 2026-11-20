@@ -151,6 +151,14 @@ v0.9 起的能力（M8-3）：
 | 节点执行时间线 | 详情页新增甘特式时间线（纯 CSS，零外部资源）：每节点一行，条形位置 = `finished_at − duration` 相对运行开始的偏移，条长 ∝ 耗时；顶部 0%–100% 相对刻度；绿=success、红=failed、灰=缓存命中、淡灰=skipped；旧行缺 `finished_at` 自动跳过，全部异常数据都不会让页面报错 |
 | In/Out 行数列 | 详情页节点表新增 In / Out 两列（`端口=行数` 紧凑展示，端口名排序）：来自 v0.9 的 `nodes.rows_in` / `rows_out` 血缘列，旧行 NULL 显示为空 |
 
+v0.9.1 起的能力（M9）：
+
+| 能力 | 说明 |
+| --- | --- |
+| 列表页筛选 | 列表页与 `/api/runs` 支持 `/?pipeline=xx&since=YYYY-MM-DD&until=YYYY-MM-DD`：按流水线名称与时间段筛选 |
+| 详情页报告折叠区块 | 详情页新增报告 JSON 折叠区块（默认收起，可展开/复制），来自 v0.9.1 的 `runs.report_json` 列 |
+| 聚合统计页 | `GET /stats?days=7`（默认 7 天、上限 90）：按天聚合运行状态/耗时统计 |
+
 ### 2.1 运行对比页：`/compare`（v0.8）
 
 ```text
@@ -169,8 +177,10 @@ GET /compare?a=<run_id>&b=<run_id>
 
 | 路径 | 返回 |
 | --- | --- |
-| `GET /api/runs?page=1&size=20&status=failed` | `{"items": [...], "total": N, "page": 1, "size": 20}`；分页/筛选语义与列表页一致 |
+| `GET /api/runs?page=1&size=20&status=failed` | `{"items": [...], "total": N, "page": 1, "size": 20}`；分页/筛选语义与列表页一致（**v0.9.1 起支持 `pipeline=` / `since=` / `until=` 筛选**） |
 | `GET /api/runs/<run_id>` | `{"run": {...}, "nodes": [...]}`；run 不存在返回 404 JSON `{"error": "..."}` |
+| `GET /api/runs/<run_id>/report` | **v0.9.1 新增**：该 run 的全量报告 JSON（取自 `runs.report_json` 列；旧行/未落库返回 404） |
+| `GET /stats?days=7` | **v0.9.1 新增**：按天聚合的统计页/JSON（默认 7 天、上限 90，非法参数回落默认） |
 | `GET /metrics` | Prometheus 文本，`Content-Type: text/plain; version=0.0.4; charset=utf-8` |
 
 ```bash
@@ -206,7 +216,7 @@ RunStore 是**可选**的 SQLite 运行记录（`--db` / `--runs` / `run_store=.
 
 | 表 | 关键字段 |
 | --- | --- |
-| `runs` | `run_id`(PK)、`pipeline`、`version`、`status`、`started_at`、`finished_at`、`params_json` |
+| `runs` | `run_id`(PK)、`pipeline`、`version`、`status`、`started_at`、`finished_at`、`params_json`、`report_json`（v0.9.1 新增，全量报告 JSON） |
 | `nodes` | `run_id`+`node_id`(PK)、`op`、`status`、`attempts`、`cached`、`error`、`cache_key`、`finished_at`、`duration`（v0.7 新增）、`rows_in`/`rows_out`（v0.9 新增，JSON 文本；未采集/关闭血缘写 NULL） |
 
 - `nodes.duration` 为单节点执行耗时（秒，`REAL DEFAULT 0`）；**v0.7 起**写入，
@@ -254,6 +264,20 @@ slow = store.query(
     ("20260719-101500-ab12",),
 )
 ```
+
+### 3.5 `runs` 子命令：CLI 查询运行记录（v0.9.1）
+
+```powershell
+python -m op_pipeline runs                     # 最近运行记录（缺省库 runs.db）
+python -m op_pipeline runs --status failed --pipeline etl --last 10 --json
+python -m op_pipeline runs 20261120-090000-ab12   # 单条详情
+```
+
+- 列表模式：`--db <path>`（缺省 `runs.db`）、`--status s`（按状态筛选）、
+  `--pipeline p`（按流水线筛选）、`--last N`（只取最近 N 条）、`--json`（JSON 输出），
+  参数可组合；缺省库文件不存在/无法打开退出码 1，正常查询（含无匹配）退出码 0；
+- 直接传 `run_id` 进入详情模式：展示该次运行的状态、耗时与节点明细
+  （含缓存命中、血缘行数、预览字段）。
 
 ---
 
@@ -354,6 +378,22 @@ python -m op_pipeline events events.jsonl --summary
   `node_finish` 事件），与明细输出互斥；
 - **容错**：损坏行（非 JSON / 非 dict / 缺 `event` 字段）记 warn 后跳过，
   不中断；文件不存在/无法读取退出码 1，正常（含空文件、过滤后无匹配）退出码 0。
+
+### 5.3 运行辅助：`--param-file` / `--report-out` / `--preview`（v0.9.1）
+
+```powershell
+python -m op_pipeline run pipeline.json --param LIMIT=3 --param-file params.json
+python -m op_pipeline run pipeline.json --report-out reports/last.json
+python -m op_pipeline run pipeline.json --preview 5
+```
+
+- `--param-file <path>`（**可重复**）：从 JSON 文件注入运行参数，与 `--param KEY=VALUE`
+  合并（文件值并入 `[params]` 段，命令行 `--param` 优先级更高、覆盖文件里的同名键）；
+- `--report-out <path>`：把**全量报告 JSON** 落盘到指定文件（父目录不存在自动创建）；
+  报告写盘失败只记告警，**不改变运行结果与退出码**；
+- `--preview N`：值级预览——报告节点附带 `preview_in` / `preview_out`：
+  list 取前 N 行、dict 取前 N 键、str 截前 200 字符；**只影响报告，不影响执行**
+  （节点真实结果、缓存与下游都不受影响）。
 
 ---
 

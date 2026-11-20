@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS runs (
     status      TEXT NOT NULL,
     started_at  REAL NOT NULL,
     finished_at REAL NOT NULL,
-    params_json TEXT NOT NULL
+    params_json TEXT NOT NULL,
+    report_json TEXT
 );
 CREATE TABLE IF NOT EXISTS nodes (
     run_id      TEXT NOT NULL,
@@ -59,6 +60,7 @@ class RunStore:
         self.conn.executescript(_SCHEMA)
         self._migrate_nodes_duration()
         self._migrate_nodes_rows()
+        self._migrate_runs_report_json()
         self._tables_ready = True
 
     def _migrate_nodes_duration(self) -> None:
@@ -81,6 +83,17 @@ class RunStore:
         if added:
             self.conn.commit()
 
+    def _migrate_runs_report_json(self) -> None:
+        """M9 Task 11：旧库 runs 表补 ``report_json`` 列（幂等；旧行取 NULL）。
+
+        仿 rows_in 先例：新库由 ``_SCHEMA`` 直接建出该列，旧库（v0.9.0 前）
+        打开时 ALTER TABLE 追加；已存在则跳过，重复初始化不报错。
+        """
+        columns = [row[1] for row in self.conn.execute("PRAGMA table_info(runs)")]
+        if "report_json" not in columns:
+            self.conn.execute("ALTER TABLE runs ADD COLUMN report_json TEXT")
+            self.conn.commit()
+
     def record_run(
         self,
         run_id: str,
@@ -90,14 +103,21 @@ class RunStore:
         started_at: float,
         finished_at: float,
         params: dict[str, Any],
+        report_json: str | None = None,
     ) -> None:
+        """写入运行记录；``report_json``（M9 Task 11）为可选末尾参数（兼容既有位置调用）。
+
+        ``report_json`` 为引擎序列化好的全量报告 JSON 文本：None 落 NULL，
+        非 None 原样写入；旧库旧行该列读回为 None（读取时 None 安全）。
+        """
         self._ensure_tables()
         self.conn.execute(
             "INSERT OR REPLACE INTO runs "
-            "(run_id, pipeline, version, status, started_at, finished_at, params_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(run_id, pipeline, version, status, started_at, finished_at, "
+            "params_json, report_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (run_id, pipeline, version, status, started_at, finished_at,
-             json.dumps(params, ensure_ascii=False, default=str)),
+             json.dumps(params, ensure_ascii=False, default=str), report_json),
         )
         self.conn.commit()
 

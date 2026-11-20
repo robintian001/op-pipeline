@@ -47,7 +47,7 @@ from .errors import (
     RefResolutionError,
     SpecValidationError,
 )
-from .executor import Executor, ProcessExecutor, ThreadExecutor
+from .executor import Executor, PooledProcessExecutor, ProcessExecutor, ThreadExecutor
 from .remote import QueueWorkerExecutor  # M5-1：共享队列文件 + 结果目录的跨进程执行器
 from .handlestore import HandleStore, InMemoryHandleStore, SharedHandleStore, SpillHandleStore
 from .expression import evaluate, evaluate_condition, register_function
@@ -82,6 +82,7 @@ __all__ = [
     "PipelineSpec",
     "Plan",
     "PlanNode",
+    "PooledProcessExecutor",
     "Port",
     "ProcessExecutor",
     "QueueWorkerExecutor",
@@ -137,6 +138,7 @@ def run(
     spill_warn_bytes: int | None = None,
     sample_rows: int | None = None,
     lineage: bool = True,
+    value_preview: int | None = None,
 ) -> tuple[RunReport, dict[str, Any]]:
     """从配置文件直接跑一遍，返回 (报告, 全部句柄值)。
 
@@ -155,8 +157,9 @@ def run(
     - ``hooks``（M2-7）：执行事件钩子列表（on_node_start / on_node_finish /
       on_run_finish），节点并行时可能被并发调用，异常只记告警不影响流水线；
       默认 None = 无钩子。
-    - ``executor``（M5-1）：None / 字符串快捷方式（"thread"/"process"/"queue"）/
-      任意 ``Executor`` 实例；"queue" 与实例语义详见 :func:`run_pipeline` docstring。
+    - ``executor``（M5-1）：None / 字符串快捷方式（"thread"/"process"/
+      "process_pool"/"queue"）/ 任意 ``Executor`` 实例；"queue" 与实例语义详见
+      :func:`run_pipeline` docstring；"process_pool"（M9）走常驻 worker 进程池。
     - ``concurrency_limits``（M6-3 Task 8）：节点并发分组上限
       ``{组名: 正整数}``，与节点 ``concurrency_group`` 配合使用，透传给
       ``run_pipeline``；默认 None = 不做组限流。
@@ -169,6 +172,7 @@ def run(
       ``[params]`` 段合并（注入优先）替换；注入的键随后合并进顶层 params。
     - ``sample_rows``（M8-2 Task 4）：采样预览行数，语义详见 :func:`run_pipeline`。
     - ``lineage``（M8-2 Task 5）：行数血缘开关（默认开启）。
+    - ``value_preview``（M9 Task 7）：值级预览行数，语义详见 :func:`run_pipeline`。
     """
     config_path = Path(config).expanduser().resolve()
     load_plugins(
@@ -198,6 +202,7 @@ def run(
         spill_warn_bytes=spill_warn_bytes,
         sample_rows=sample_rows,
         lineage=lineage,
+        value_preview=value_preview,
     )
 
 

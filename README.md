@@ -78,7 +78,7 @@ op_pipeline/
 ├── expression.py      安全表达式求值（AST 白名单）
 ├── graph.py           Mermaid / Graphviz / ASCII 渲染
 ├── cli.py             python -m op_pipeline
-└── ops/               内置算子（59 个，分组见 §8）
+└── ops/               内置算子（68 个，分组见 §8）
     └── pipeline_ops.py    子流水线编排算子 pipeline.run（M8）
 examples/
 ├── pipeline_orders.json / .toml    订单汇总（18 节点，含 fan-out 并行）
@@ -251,16 +251,17 @@ load_plugins(entry_points=True)  # 扫描已安装插件包入口点
 
 ---
 
-## 8. 内置算子（59 个）
+## 8. 内置算子（68 个）
 
 | 分组 | 算子 | 说明 |
 | --- | --- | --- |
 | IO | `io.read_csv` `io.write_csv` `io.read_json` `io.write_json` `io.read_text` `io.write_text` | 表格以 `list[dict]` 为通用交换格式 |
-| 表 | `table.filter_rows` `select_columns` `rename_columns` `drop_columns` `derive_column` `sort_rows` `dedupe` `limit` `join` `union` `take_column` `explode` | 哈希连接、表达式派生列、list 列展开；列判定按全表并集 |
+| 表 | `table.filter_rows` `select_columns` `rename_columns` `drop_columns` `derive_column` `sort_rows` `dedupe` `limit` `join` `union` `take_column` `explode` `fill_null` `replace` `pivot` `unpivot` | 哈希连接、表达式派生列、list 列展开；空值填充、按映射替换与长宽表整形；列判定按全表并集 |
 | 统计 | `stats.aggregate` `count_rows` `value_counts` `describe` | `sum/mean/count/min/max/median/std/nunique/first/last` |
-| 文本 | `text.template` `split_lines` `join_lines` `regex_extract` `replace_regex` | 模板用 `{{key}}`，避开 `${}` |
+| 文本 | `text.template` `split_lines` `join_lines` `regex_extract` `replace_regex` `hash` | 模板用 `{{key}}`，避开 `${}`；hash 支持 md5/sha1/sha256/sha512/blake2b |
+| 压缩 | `compress.gzip` `ungzip` | 标准库 gzip 文本压缩/解压；gzip 写文件不落缓存 |
 | 时间 | `time.parse` `time.shift` `time.now` | ISO/strftime 解析、偏移与当前时间；now 永不缓存 |
-| JSON 结构 | `json.flatten` | 嵌套 dict 扁平化（list 值作为叶子） |
+| JSON 结构 | `json.flatten` `json.parse` `stringify` | 嵌套 dict 扁平化（list 值作为叶子）；JSON 文本与结构互转 |
 | 数据质量 | `quality.null_check` `quality.unique` `quality.schema_check` | 空值率/重复/类型检查；error 抛错、warn 出明细，table 原样透传 |
 | 编排 | `pipeline.run` | 子流水线编排：节点内执行子配置并取回子节点输出；防环与深度上限 5，结果永不落缓存（M8） |
 | 报告 | `report.markdown` `report.html` | 单文件 HTML，无前端依赖 |
@@ -356,6 +357,8 @@ python -c "from scheduler_app import create_server; create_server('runs.db', 800
 - **流水线复用拆分** —— 把通用明细层/汇总层拆成子配置，父配置用 `pipeline.run` 节点执行子配置并通过 `params` 注入参数（示例 `examples/pipeline_subpipeline.json`）；子流水线防环含链路、深度上限 5、结果永不落缓存。
 - **多任务依赖编排** —— 调度器 `--after` 让「日汇总」只在「各分区明细」本轮全部 success 后触发：`python -m scheduler_app.scheduler --pipeline part_a.json --pipeline part_b.json --pipeline daily.json --after daily=part_a,part_b`（pipeline 名 = 配置文件 stem；依赖未全成功则本轮跳过并记 info，成环报 `ConfigError`）。
 - **大表先探后跑** —— 接手陌生大表先小成本验证结构与字段：`python -m op_pipeline run big.json --sample 5`（仅截断 list 句柄、采样时缓存读写禁用；报告含 run 级 `sample_rows` 与节点级 `sampled`）。
+- **值级预览核查** —— 不落盘核对节点中间值（v0.9.1）：`python -m op_pipeline run pipeline.json --preview 5` 报告节点附带 `preview_in`/`preview_out`（list 前 N 行 / dict 前 N 键 / str 截 200 字符），只影响报告不影响执行（节点真实结果与缓存不受影响）。
+- **文本产物压缩存档** —— `compress.gzip` 把文本产物压缩写盘、`compress.ungzip` 反向解压（v0.9.1）：标准库实现零依赖，写文件不落缓存，适合把中间文本压成存档/传输件。
 - **行数血缘审计** —— 报告 nodes[] 平铺的 `rows_in`/`rows_out` 与 Web 详情页 In/Out 列用来发现「某一层行数骤减」；`/compare` 页直接对比两次运行的行数差（+N/-N 与「仅 A/仅 B」）。
 - **运行耗时观测** —— Web 详情页的甘特时间线按相对 run 起点铺开每个节点的执行区间（success 绿 / failed 红 / cached 灰 / skipped 淡灰），一眼定位串行瓶颈段。
 - **数据质量门禁** —— `quality.null_check` / `quality.unique` / `quality.schema_check` 在清洗后校验空值率、重复与类型（error 抛错、warn 出明细，table 原样透传），配合 `allow_failure` 与 `when` 组合出「告警不断流」或「失败即拦」的门禁。

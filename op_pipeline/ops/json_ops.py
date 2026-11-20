@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..operator import Operator
@@ -47,3 +48,50 @@ class Flatten(Operator):
         walk("", dict(data or {}), 0)
         ctx.log(f"扁平化 {len(flat)} 个叶子键")
         return {"data": flat, "count": len(flat)}
+
+
+@op("json.parse")
+class Parse(Operator):
+    """JSON 文本 -> Python 结构（``json.loads`` 语义）。
+
+    - ``text`` 不是 str、或不是合法 JSON 时抛 ValueError；
+    - ``data`` 为解析结果，dict / list / 标量均可。
+    """
+
+    description = "解析 JSON 文本"
+    inputs = [("text", str)]
+    outputs = [("data", Any)]
+
+    def run(self, ctx, text):
+        if not isinstance(text, str):
+            raise ValueError(f"json.parse 的输入必须是 str，实际得到 {type(text).__name__}")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"非法 JSON：{exc}") from exc
+        ctx.log(f"解析 JSON 文本（{len(text)} 字符）")
+        return {"data": data}
+
+
+@op("json.stringify")
+class Stringify(Operator):
+    """Python 结构 -> JSON 文本（默认 indent=2、ensure_ascii=False、不排序键）。
+
+    - ``text`` 为 JSON 字符串，``bytes`` 为其 UTF-8 编码后的字节数；
+    - ``data`` 无法序列化时让 TypeError 自然抛出。
+    """
+
+    description = "结构序列化为 JSON 文本"
+    inputs = [("data", Any)]
+    outputs = [("text", str), ("bytes", int)]
+    params = {
+        "indent": Param(int, default=2, doc="缩进空格数"),
+        "ensure_ascii": Param(bool, default=False, doc="是否把非 ASCII 字符转义"),
+        "sort_keys": Param(bool, default=False, doc="是否按键名排序"),
+    }
+
+    def run(self, ctx, data, indent, ensure_ascii, sort_keys):
+        text = json.dumps(data, indent=indent, ensure_ascii=ensure_ascii, sort_keys=sort_keys)
+        size = len(text.encode("utf-8"))
+        ctx.log(f"序列化为 JSON 文本（{size} 字节）")
+        return {"text": text, "bytes": size}

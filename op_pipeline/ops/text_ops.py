@@ -1,6 +1,7 @@
 """文本算子。"""
 from __future__ import annotations
 
+import hashlib
 import re
 
 from ..operator import Operator
@@ -112,3 +113,29 @@ class ReplaceRegex(Operator):
     def run(self, ctx, text, pattern, replacement, count):
         result, n = re.subn(pattern, replacement, str(text), count=count)
         return {"text": result, "replacements": n}
+
+
+# text.hash 允许的算法白名单（hashlib.new 可直接按名创建）
+_HASH_ALGORITHMS = ("md5", "sha1", "sha256", "sha512", "blake2b")
+
+
+@op("text.hash")
+class HashText(Operator):
+    """计算文本哈希摘要（hexdigest）。"""
+
+    description = "文本哈希摘要"
+    inputs = [("text", str)]
+    outputs = [("digest", str), ("length", int)]
+    params = {
+        "algorithm": Param(str, default="sha256", doc=f"哈希算法，可选：{', '.join(_HASH_ALGORITHMS)}"),
+        "encoding": Param(str, default="utf-8"),
+    }
+
+    def run(self, ctx, text, algorithm, encoding):
+        if algorithm not in _HASH_ALGORITHMS:
+            raise ValueError(
+                f"不支持的哈希算法：{algorithm}（可选：{', '.join(_HASH_ALGORITHMS)}）"
+            )
+        text = str(text)
+        digest = hashlib.new(algorithm, text.encode(encoding)).hexdigest()
+        return {"digest": digest, "length": len(text)}

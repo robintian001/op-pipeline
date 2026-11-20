@@ -39,7 +39,7 @@
 │ 算子层  (ops/) + 外部插件                                                    │
 │   io / table / stats / text / datetime / json / quality / report / control  │
 │   / pipeline / http / db / df / parquet / excel（按 ops/ 模块分组，十四组）   │
-│   共 59 个内置算子                                                          │
+│   共 68 个内置算子                                                          │
 │   业务算子以插件形式平级加入，不与框架耦合                                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```

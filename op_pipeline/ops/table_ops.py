@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 from ..expression import evaluate
@@ -34,6 +35,19 @@ def table_columns(rows: Iterable[dict[str, Any]]) -> list[str]:
             if key not in seen:
                 seen[key] = None
     return list(seen)
+
+
+def _resolve_columns(rows: list[dict[str, Any]], columns: list[str] | None) -> list[str]:
+    """解析目标列：None 表示全部列（所有行键并集）；显式列名必须存在于全表列集。"""
+    all_cols = table_columns(rows)
+    if columns is None:
+        return all_cols
+    missing = [c for c in columns if c not in all_cols]
+    if missing:
+        raise KeyError(
+            f"表中不存在列：{', '.join(map(str, missing))}；可用：{', '.join(sorted(map(str, all_cols)))}"
+        )
+    return list(columns)
 
 
 @op("table.filter_rows", aliases=["filter"])
@@ -361,4 +375,227 @@ class Explode(Operator):
                     new_row[index_column] = i
                 out.append(new_row)
         ctx.log(f"展开列 '{column}'：{len(rows)} -> {len(out)} 行")
+        return {"table": out, "rows": len(out)}
+
+
+@op("table.fill_null")
+class FillNull(Operator):
+    """填充 None 单元格。
+
+    - 只处理「行内存在该键且值为 None」的单元格；行内缺键不处理也不计数，
+      空串 / 0 / False 均不算缺失；
+    - ``columns``：目标列，None 表示全部列（所有行键的并集），
+      指定列不在全表列集时抛 KeyError；
+    - ``filled`` 为本次填充的单元格数；输入行不原地修改。
+    """
+
+    description = "填充 None 单元格"
+    inputs = ["table"]
+    outputs = [("table", list), ("filled", int)]
+    params = {
+        "value": Param(Any, doc="填充值"),
+        "columns": Param(list, default=None, doc="目标列；None 表示全部列"),
+    }
+
+    def run(self, ctx, table, value, columns):
+        rows = list(table or [])
+        target = _resolve_columns(rows, columns)
+        filled = 0
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            new_row = dict(row)
+            for col in target:
+                if col in new_row and new_row[col] is None:
+                    new_row[col] = value
+                    filled += 1
+            out.append(new_row)
+        ctx.log(f"填充 {filled} 个 None 单元格")
+        return {"table": out, "filled": filled}
+
+
+@op("table.replace")
+class Replace(Operator):
+    """按映射替换单元格值。
+
+    - 普通模式：单元格值与映射键相等（==）即替换为对应值；
+    - ``regex=true``：仅对 str 单元格生效，映射键作为正则 pattern
+      做全量替换（re.sub），替换结果与原值相同则不计数；
+    - ``columns``：目标列，None 表示全部列；指定列不存在抛 KeyError；
+    - ``replaced`` 为值被改写的单元格数；输入行不原地修改。
+    """
+
+    description = "按映射替换单元格值"
+    inputs = ["table"]
+    outputs = [("table", list), ("replaced", int)]
+    params = {
+        "mapping": Param(dict, doc="旧值 -> 新值映射；regex 模式下为 pattern -> 替换文本"),
+        "columns": Param(list, default=None, doc="目标列；None 表示全部列"),
+        "regex": Param(bool, default=False, doc="是否按正则全量替换（仅对 str 单元格生效）"),
+    }
+
+    def run(self, ctx, table, mapping, columns, regex):
+        rows = list(table or [])
+        target = _resolve_columns(rows, columns)
+        pairs = list(mapping.items())
+        replaced = 0
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            new_row = dict(row)
+            for col in target:
+                if col not in new_row:
+                    continue
+                old = new_row[col]
+                if regex:
+                    if not isinstance(old, str):
+                        continue
+                    new = old
+                    for pattern, repl in pairs:
+                        new = re.sub(pattern, repl, new)
+                    if new != old:
+                        new_row[col] = new
+                        replaced += 1
+                    continue
+                for old_key, new_value in pairs:
+                    if old == old_key:
+                        new_row[col] = new_value
+                        replaced += 1
+                        break
+            out.append(new_row)
+        ctx.log(f"替换 {replaced} 个单元格")
+        return {"table": out, "replaced": replaced}
+
+
+def _pivot_agg(agg: str | None, values: list[Any]) -> Any:
+    """透视单元格聚合：语义沿用 stats 组惯例。
+
+    sum/mean 仅对 int/float 求值（bool 排除），组内无数值时结果为 None；
+    count 统计非 None 个数；first/last 按出现顺序取首个/末个非 None 值。
+    """
+    if agg is None:
+        return values[0]
+    if agg == "count":
+        return sum(1 for v in values if v is not None)
+    if agg == "first":
+        return next((v for v in values if v is not None), None)
+    if agg == "last":
+        return next((v for v in reversed(values) if v is not None), None)
+    nums = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if not nums:
+        return None
+    if agg == "sum":
+        return sum(nums)
+    return sum(nums) / len(nums)  # mean
+
+
+@op("table.pivot")
+class Pivot(Operator):
+    """长表转宽表：index 列标识行，columns 列的取值变成新列名，values 列为单元格值。
+
+    - ``index``：行标识列，单列名或列表（输出时排在前，多列按声明顺序）；
+    - ``agg``：None 时存在重复 (index值, 键值) 组合即抛 ValueError（含重复样例）；
+      可选 first/last/sum/count/mean，语义见 ``_pivot_agg``；
+    - 键列名为 str(键值) 且按字典序排布；行按 index 值的 str 排序。
+    """
+
+    description = "长表转宽表"
+    inputs = ["table"]
+    outputs = [("table", list), ("rows", int)]
+    params = {
+        "index": Param((str, list), doc="行标识列，单列名或列表"),
+        "columns": Param(str, doc="键列，其取值展开为新列名"),
+        "values": Param(str, doc="值列"),
+        "agg": Param(str, default=None, choices=("first", "last", "sum", "count", "mean"),
+                     doc="聚合方式；None 表示不允许重复组合"),
+    }
+
+    def run(self, ctx, table, index, columns, values, agg):
+        rows = list(table or [])
+        if not rows:
+            return {"table": [], "rows": 0}
+        index_cols = [index] if isinstance(index, str) else list(index)
+        available = table_columns(rows)
+        missing = [c for c in (*index_cols, columns, values) if c not in available]
+        if missing:
+            raise KeyError(
+                f"表中不存在列：{', '.join(map(str, missing))}；可用：{', '.join(sorted(map(str, available)))}"
+            )
+
+        groups: dict[tuple, dict[Any, list[Any]]] = {}
+        for row in rows:
+            key = tuple(row.get(c) for c in index_cols)
+            bucket = groups.setdefault(key, {})
+            bucket.setdefault(row.get(columns), []).append(row.get(values))
+
+        if agg is None:
+            for key, bucket in groups.items():
+                for col_key, cell_values in bucket.items():
+                    if len(cell_values) > 1:
+                        sample = dict(zip(index_cols, key))
+                        raise ValueError(
+                            f"agg=None 时存在重复的 (index, {columns}) 组合："
+                            f"index={sample}, {columns}={col_key!r} 出现 {len(cell_values)} 次；"
+                            "请指定 agg（first/last/sum/count/mean）或先对表去重"
+                        )
+
+        out: list[dict[str, Any]] = []
+        for key in sorted(groups, key=lambda k: tuple(str(v) for v in k)):
+            record: dict[str, Any] = dict(zip(index_cols, key))
+            for col_key in sorted(groups[key], key=str):
+                record[str(col_key)] = _pivot_agg(agg, groups[key][col_key])
+            out.append(record)
+        ctx.log(f"透视 {len(rows)} 行 -> {len(out)} 行")
+        return {"table": out, "rows": len(out)}
+
+
+@op("table.unpivot")
+class Unpivot(Operator):
+    """宽表转长表（逆透视）：把若干值列展开成 (variable, value) 两列。
+
+    - 每个输入行按每个展开列输出一行（值为 None 也输出行；
+      行内缺该键输出 value=None）；
+    - ``columns``：要展开的值列，整表中完全不存在时抛 KeyError；
+    - ``index``：保留的 id 列，None 表示除展开列外的全部列（所有行键的并集），
+      指定列不存在同样抛 KeyError；
+    - ``name_to`` / ``value_to``：原列名 / 原列值写入的新列名。
+    """
+
+    description = "宽表转长表"
+    inputs = ["table"]
+    outputs = [("table", list), ("rows", int)]
+    params = {
+        "columns": Param((str, list), doc="要展开的值列，单列名或列表"),
+        "index": Param((str, list), default=None, doc="保留的 id 列；None 表示除展开列外的全部列"),
+        "name_to": Param(str, default="variable", doc="原列名写入的新列名"),
+        "value_to": Param(str, default="value", doc="原列值写入的新列名"),
+    }
+
+    def run(self, ctx, table, columns, index, name_to, value_to):
+        rows = list(table or [])
+        if not rows:
+            return {"table": [], "rows": 0}
+        expand = [columns] if isinstance(columns, str) else list(columns)
+        available = table_columns(rows)
+        missing = [c for c in expand if c not in available]
+        if missing:
+            raise KeyError(
+                f"表中不存在列：{', '.join(map(str, missing))}；可用：{', '.join(sorted(map(str, available)))}"
+            )
+        if index is None:
+            index_cols = [c for c in available if c not in expand]
+        else:
+            index_cols = [index] if isinstance(index, str) else list(index)
+            missing = [c for c in index_cols if c not in available]
+            if missing:
+                raise KeyError(
+                    f"表中不存在列：{', '.join(map(str, missing))}；可用：{', '.join(sorted(map(str, available)))}"
+                )
+
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            for col in expand:
+                new_row = {c: row.get(c) for c in index_cols}
+                new_row[name_to] = col
+                new_row[value_to] = row.get(col)
+                out.append(new_row)
+        ctx.log(f"逆透视 {len(rows)} 行 -> {len(out)} 行")
         return {"table": out, "rows": len(out)}

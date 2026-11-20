@@ -66,21 +66,67 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """判断表是否存在某列（旧库可能缺 report_json 等列，读前先探测）。"""
+    if not _has_table(conn, table):
+        return False
+    return any(
+        row[1] == column
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    )
+
+
+def _escape_like(text: str) -> str:
+    """转义 LIKE 模式中的通配符（配合 ESCAPE '\\' 使用），使筛选按字面子串匹配。"""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _runs_where(
+    status: str | None,
+    pipeline: str | None,
+    since: float | None,
+    until: float | None,
+) -> tuple[str, list[object]]:
+    """组装 runs 表筛选条件（M9 Task 12.1）：status 精确 + pipeline 子串
+    （不区分大小写）+ since/until 时间戳区间（含 since/until 全天）。"""
+    clauses: list[str] = []
+    params: list[object] = []
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if pipeline:
+        clauses.append("LOWER(pipeline) LIKE LOWER(?) ESCAPE '\\'")
+        params.append(f"%{_escape_like(pipeline)}%")
+    if since is not None:
+        clauses.append("started_at >= ?")
+        params.append(since)
+    if until is not None:
+        clauses.append("started_at < ?")
+        params.append(until)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return where, params
+
+
 def _query_runs(
     conn: sqlite3.Connection,
     *,
     status: str | None = None,
+    pipeline: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
     limit: int | None = None,
     offset: int = 0,
 ) -> list[sqlite3.Row]:
-    """分页查询运行记录：筛选与分页全部下推到 SQL（避免全量加载）。"""
+    """分页查询运行记录：筛选与分页全部下推到 SQL（避免全量加载）。
+
+    M9 Task 12.1：新增 ``pipeline``（子串、不区分大小写）与 ``since``/``until``
+    （ISO 日期、含该天）筛选，与 status 任意组合。
+    """
     sql = (
         "SELECT run_id, pipeline, version, status, started_at, finished_at FROM runs"
     )
-    params: list[object] = []
-    if status:
-        sql += " WHERE status = ?"
-        params.append(status)
+    where, params = _runs_where(status, pipeline, since, until)
+    sql += where
     sql += " ORDER BY started_at DESC, run_id DESC"
     if limit is not None:
         sql += " LIMIT ? OFFSET ?"
@@ -88,13 +134,15 @@ def _query_runs(
     return list(conn.execute(sql, params))
 
 
-def _count_runs(conn: sqlite3.Connection, status: str | None = None) -> int:
-    if status:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM runs WHERE status = ?", (status,)
-        ).fetchone()
-    else:
-        row = conn.execute("SELECT COUNT(*) FROM runs").fetchone()
+def _count_runs(
+    conn: sqlite3.Connection,
+    status: str | None = None,
+    pipeline: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
+) -> int:
+    where, params = _runs_where(status, pipeline, since, until)
+    row = conn.execute(f"SELECT COUNT(*) FROM runs{where}", params).fetchone()
     return int(row[0]) if row else 0
 
 
@@ -141,17 +189,40 @@ def _query_nodes(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
     ))
 
 
+def _parse_day_start(raw: str) -> float | None:
+    """ISO 日期 ``YYYY-MM-DD`` → 本地时区当日 00:00:00 时间戳；非法返回 None。
+
+    since 直接用该值（``started_at >= since`` 含当天）；until 取
+    ``since + 86400``（次日 00:00:00，``started_at < until`` 同样含当天）。
+    """
+    try:
+        return time.mktime(time.strptime(raw, "%Y-%m-%d"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _parse_list_query(
     query: dict[str, list[str]],
-) -> tuple[int, int, str | None]:
-    """解析列表页查询参数：非法值回落默认，page<1→1，size 限 1..200。"""
+) -> tuple[int, int, str | None, str | None, float | None, float | None]:
+    """解析列表页查询参数：非法值回落默认，page<1→1，size 限 1..200。
+
+    M9 Task 12.1：新增 ``pipeline``（子串、不区分大小写，可为空）、
+    ``since``/``until``（ISO 日期、含该天；非法日期忽略该参数）。
+    """
     page = _parse_int(query.get("page", [""])[0], default=1)
     size = _parse_int(query.get("size", [""])[0], default=_PAGE_SIZE_DEFAULT)
     page = max(1, page)
     size = min(_PAGE_SIZE_MAX, max(1, size))
     raw_status = query.get("status", [""])[0]
     status = raw_status if raw_status in _ALLOWED_STATUSES else None
-    return page, size, status
+    pipeline = query.get("pipeline", [""])[0] or None
+    since = _parse_day_start(query.get("since", [""])[0])
+    until_raw = query.get("until", [""])[0]
+    until = (
+        _parse_day_start(until_raw) + 86400
+        if until_raw and _parse_day_start(until_raw) is not None else None
+    )
+    return page, size, status, pipeline, since, until
 
 
 def _parse_int(raw: str, default: int) -> int:
@@ -161,10 +232,26 @@ def _parse_int(raw: str, default: int) -> int:
         return default
 
 
-def _page_href(page: int, size: int, status: str | None) -> str:
+def _page_href(
+    page: int,
+    size: int,
+    status: str | None,
+    pipeline: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
+) -> str:
+    """翻页链接：保留全部筛选参数（M9 Task 12.1 起含 pipeline/since/until）。"""
     params: dict[str, str] = {"page": str(page), "size": str(size)}
     if status:
         params["status"] = status
+    if pipeline:
+        params["pipeline"] = pipeline
+    if since is not None:
+        params["since"] = time.strftime("%Y-%m-%d", time.localtime(since))
+    if until is not None:
+        params["until"] = time.strftime(
+            "%Y-%m-%d", time.localtime(until - 86400)
+        )
     return "/?" + urlencode(params)
 
 
@@ -272,12 +359,18 @@ def _render_index(
     page: int = 1,
     size: int = _PAGE_SIZE_DEFAULT,
     status: str | None = None,
+    pipeline: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
 ) -> str:
-    total = _count_runs(conn, status)
+    total = _count_runs(conn, status, pipeline, since, until)
     pages = max(1, (total + size - 1) // size)
     page = min(max(1, page), pages)  # 越界页回落到合法范围
     offset = (page - 1) * size
-    runs = _query_runs(conn, status=status, limit=size, offset=offset)
+    runs = _query_runs(
+        conn, status=status, pipeline=pipeline, since=since, until=until,
+        limit=size, offset=offset,
+    )
     counts = _node_counts(conn, [r["run_id"] for r in runs])
     rows = "".join(
         f"<tr><td><a href='/run/{html.escape(r['run_id'])}'>{html.escape(r['run_id'])}</a></td>"
@@ -289,14 +382,23 @@ def _render_index(
         for r in runs
     )
     prev_link = (
-        f"<a href='{html.escape(_page_href(page - 1, size, status))}'>← 上一页</a>"
+        f"<a href='{html.escape(_page_href(page - 1, size, status, pipeline, since, until))}'>← 上一页</a>"
         if page > 1 else "<span>← 上一页</span>"
     )
     next_link = (
-        f"<a href='{html.escape(_page_href(page + 1, size, status))}'>下一页 →</a>"
+        f"<a href='{html.escape(_page_href(page + 1, size, status, pipeline, since, until))}'>下一页 →</a>"
         if page < pages else "<span>下一页 →</span>"
     )
-    filter_meta = f" · 状态筛选 {html.escape(status)}" if status else ""
+    filters = []
+    if status:
+        filters.append(f"状态 {html.escape(status)}")
+    if pipeline:
+        filters.append(f"流水线 {html.escape(pipeline)}")
+    if since is not None:
+        filters.append(f"起始 {time.strftime('%Y-%m-%d', time.localtime(since))}")
+    if until is not None:
+        filters.append(f"截止 {time.strftime('%Y-%m-%d', time.localtime(until - 86400))}")
+    filter_meta = f" · 筛选：{'、'.join(filters)}" if filters else ""
     body = f"""<h1>op_pipeline 运行历史</h1>
 <div class="meta">第 {page}/{pages} 页，共 {total} 条运行记录 · 每页 {size} 条{filter_meta}
 · scheduler_app Web UI</div>
@@ -371,6 +473,100 @@ def _render_timeline(run: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
     )
 
 
+def _query_report_json(conn: sqlite3.Connection, run_id: str) -> str | None:
+    """读 runs.report_json（M9 Task 12.2/12.3）。
+
+    返回 ``str``（可为空串 = 该列存在但为 NULL，即"报告未入库"）；
+    仅当 **run 记录不存在** 或 runs 表缺列时返回 None（调用方据此回 404）。
+    """
+    if not _has_column(conn, "runs", "report_json"):
+        return None
+    row = conn.execute(
+        "SELECT report_json FROM runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return row[0] if row[0] is not None else ""
+
+
+def _render_report_section(conn: sqlite3.Connection, run_id: str) -> str:
+    """详情页"报告"折叠区块（M9 Task 12.2）。
+
+    - ``report_json`` 非空：``<details>`` 内展示完整 params（JSON 缩进）、
+      warnings 列表、失败节点（status=failed）的 error 与**完整 traceback**；
+      所有动态文本一律 ``html.escape``（traceback 含 ``<script>`` 等也安全）；
+    - ``report_json`` 为 NULL（未入库）或非法 JSON：显示占位文案，不 500；
+    - 旧库 runs 无 report_json 列：整个区块不渲染。
+    """
+    raw = _query_report_json(conn, run_id)
+    if raw is None or not raw.strip():
+        return (
+            "<h2>运行报告</h2>"
+            "<details><summary>报告</summary>"
+            "<div class='meta'>报告未入库（report_json 为空）</div></details>"
+        )
+    try:
+        report = json.loads(raw)
+    except ValueError:
+        return (
+            "<h2>运行报告</h2>"
+            "<details><summary>报告</summary>"
+            "<div class='meta'>报告数据异常（report_json 非法 JSON）</div></details>"
+        )
+    if not isinstance(report, dict):
+        return (
+            "<h2>运行报告</h2>"
+            "<details><summary>报告</summary>"
+            "<div class='meta'>报告数据异常（report_json 非对象）</div></details>"
+        )
+
+    # 参数：完整 JSON 缩进展示（值可能是嵌套 dict/list，统一序列化后转义）
+    params_html = (
+        html.escape(
+            json.dumps(report.get("params", {}), ensure_ascii=False, indent=2,
+                       default=str)
+        )
+        if report.get("params")
+        else "<div class='meta'>无参数</div>"
+    )
+    warnings = report.get("warnings") or []
+    warnings_html = (
+        "".join(
+            f"<li>{html.escape(str(w))}</li>" for w in warnings
+        )
+        if warnings else "<div class='meta'>无告警</div>"
+    )
+    # 失败节点：完整 error + 完整 traceback（traceback 为空显示占位）
+    failed_nodes = [
+        n for n in (report.get("nodes") or [])
+        if isinstance(n, dict) and n.get("status") == "failed"
+    ]
+    failed_html = ""
+    for node in failed_nodes:
+        node_id = html.escape(str(node.get("id", "")))
+        op = html.escape(str(node.get("op", "")))
+        error = html.escape(str(node.get("error") or ""))
+        traceback = html.escape(str(node.get("traceback") or ""))
+        failed_html += (
+            f"<h4>节点 {node_id}（{op}）</h4>"
+            f"<div class='meta'>错误：{error or '（无错误信息）'}</div>"
+            f"<pre>{traceback or '（无 traceback）'}</pre>"
+        )
+    failed_block = (
+        failed_html
+        if failed_html
+        else "<div class='meta'>无失败节点</div>"
+    )
+    return (
+        "<h2>运行报告</h2>"
+        "<details><summary>报告（参数 / 告警 / 失败节点）</summary>"
+        "<h3>参数（params）</h3><pre>{params}</pre>"
+        "<h3>告警（warnings）</h3><ul>{warnings}</ul>"
+        "<h3>失败节点（完整 traceback）</h3>{failed}"
+        "</details>"
+    ).format(params=params_html, warnings=warnings_html, failed=failed_block)
+
+
 def _render_detail(conn: sqlite3.Connection, run_id: str) -> str:
     run = _query_run(conn, run_id)
     nodes = _query_nodes(conn, run_id)
@@ -399,6 +595,7 @@ def _render_detail(conn: sqlite3.Connection, run_id: str) -> str:
 {node_rows or "<tr><td colspan='10' style='color:#999'>该运行无节点记录</td></tr>"}
 </table>
 {_render_timeline(run, nodes)}
+{_render_report_section(conn, run_id)}
 <p class="meta">错误摘要为节点 error 字段（截断展示）；耗时为单节点执行时长；
 In/Out 为各 list 端口行数血缘（``端口=行数`` 按端口名排序，旧行未采集显示为空）。</p>"""
     return _PAGE.format(title=f"运行详情 {run_id}", body=body)
@@ -542,12 +739,18 @@ def _node_to_dict(node: sqlite3.Row) -> dict[str, object]:
 
 
 def _render_api_runs(conn: sqlite3.Connection, query: dict[str, list[str]]) -> str:
-    """``/api/runs``：分页/筛选语义与列表页完全一致（同一解析与 SQL）。"""
-    page, size, status = _parse_list_query(query)
-    total = _count_runs(conn, status)
+    """``/api/runs``：分页/筛选语义与列表页完全一致（同一解析与 SQL）。
+
+    M9 Task 12.1 起含 pipeline/since/until 筛选（与列表页共用解析）。
+    """
+    page, size, status, pipeline, since, until = _parse_list_query(query)
+    total = _count_runs(conn, status, pipeline, since, until)
     pages = max(1, (total + size - 1) // size)
     page = min(max(1, page), pages)
-    runs = _query_runs(conn, status=status, limit=size, offset=(page - 1) * size)
+    runs = _query_runs(
+        conn, status=status, pipeline=pipeline, since=since, until=until,
+        limit=size, offset=(page - 1) * size,
+    )
     counts = _node_counts(conn, [r["run_id"] for r in runs])
     items = []
     for run in runs:
@@ -567,6 +770,26 @@ def _render_api_run(conn: sqlite3.Connection, run_id: str) -> str | None:
         return None
     nodes = [_node_to_dict(n) for n in _query_nodes(conn, run_id)]
     return json.dumps({"run": _run_to_dict(run), "nodes": nodes}, ensure_ascii=False)
+
+
+def _render_api_report(conn: sqlite3.Connection, run_id: str) -> str | None:
+    """``/api/runs/<id>/report``（M9 Task 12.3）：report_json 解析后的完整对象。
+
+    - run 不存在 → None（调用方回 404）；
+    - report_json 为 NULL / 空 / 非法 JSON → ``{"report": null}``（与页面
+      占位口径一致：未入库按无报告处理，不 500）。
+    """
+    raw = _query_report_json(conn, run_id)
+    if raw is None:
+        return None
+    report = None
+    if raw.strip():
+        try:
+            parsed = json.loads(raw)
+            report = parsed if isinstance(parsed, dict) else None
+        except ValueError:
+            report = None
+    return json.dumps({"report": report}, ensure_ascii=False)
 
 
 def _render_metrics(conn: sqlite3.Connection) -> str:
@@ -597,6 +820,100 @@ def _render_metrics(conn: sqlite3.Connection) -> str:
         f"op_pipeline_runs_duration_seconds {total_duration:.6f}",
     ])
     return "\n".join(lines) + "\n\n"
+
+
+# --------------------------------------------------------------------------- #
+# /stats 聚合页（M9 Task 13）
+# --------------------------------------------------------------------------- #
+_STATS_DAYS_DEFAULT = 7  # 默认统计窗口（天）
+_STATS_DAYS_MAX = 90  # 窗口上限；非法/超上限回退默认
+
+
+def _parse_stats_days(query: dict[str, list[str]]) -> int:
+    """解析 ``days`` 参数：1..90 合法；非法（非整数/≤0/超上限）回退默认 7。"""
+    days = _parse_int(query.get("days", [""])[0], default=_STATS_DAYS_DEFAULT)
+    if not (1 <= days <= _STATS_DAYS_MAX):
+        days = _STATS_DAYS_DEFAULT
+    return days
+
+
+def _stats_by_pipeline(
+    conn: sqlite3.Connection, since_ts: float
+) -> list[sqlite3.Row]:
+    """按 pipeline 汇总：运行总数 / 成功次数 / 成功率基数 / 平均耗时（秒）。
+
+    全部下推到 SQLite 聚合（AVG/SUM/CASE），不加载全表。
+    """
+    return list(conn.execute(
+        "SELECT pipeline, COUNT(*) AS runs, "
+        "SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes, "
+        "AVG(finished_at - started_at) AS avg_duration "
+        "FROM runs WHERE started_at >= ? "
+        "GROUP BY pipeline ORDER BY runs DESC, pipeline ASC",
+        (since_ts,),
+    ))
+
+
+def _stats_failed_nodes(
+    conn: sqlite3.Connection, since_ts: float
+) -> list[sqlite3.Row]:
+    """失败节点 Top10（M9 Task 13.1）：按 node_id 聚合失败次数，标注 op。
+
+    窗口口径与按 pipeline 汇总一致（join runs 按 started_at 过滤）；
+    op 取 MAX（同 id 多 op 时确定性取字典序最大者）。
+    """
+    if not _has_table(conn, "nodes"):
+        return []
+    return list(conn.execute(
+        "SELECT n.node_id, MAX(n.op) AS op, COUNT(*) AS fails "
+        "FROM nodes n JOIN runs r ON r.run_id = n.run_id "
+        "WHERE n.status = 'failed' AND r.started_at >= ? "
+        "GROUP BY n.node_id ORDER BY fails DESC, n.node_id ASC LIMIT 10",
+        (since_ts,),
+    ))
+
+
+def _render_stats(conn: sqlite3.Connection, query: dict[str, list[str]]) -> str:
+    """``/stats?days=N`` 聚合页：按 pipeline 汇总 + 失败节点 Top10。
+
+    纯 SQLite 聚合 + 内联 HTML（复用 _PAGE 模板与转义风格），零外部资源。
+    """
+    days = _parse_stats_days(query)
+    now = time.time()
+    since_ts = now - days * 86400
+    by_pipeline = _stats_by_pipeline(conn, since_ts)
+    failed_nodes = _stats_failed_nodes(conn, since_ts)
+    pipeline_rows = "".join(
+        f"<tr><td>{html.escape(row['pipeline'])}</td>"
+        f"<td>{row['runs']}</td>"
+        f"<td>{row['successes']}/{row['runs']} "
+        f"（{row['successes'] / row['runs'] * 100:.1f}%）</td>"
+        f"<td>{float(row['avg_duration'] or 0.0):.2f}s</td></tr>"
+        for row in by_pipeline
+    )
+    node_rows = "".join(
+        f"<tr><td>{i + 1}</td>"
+        f"<td>{html.escape(row['node_id'])}</td>"
+        f"<td>{html.escape(row['op'])}</td>"
+        f"<td>{row['fails']}</td></tr>"
+        for i, row in enumerate(failed_nodes)
+    )
+    body = f"""<h1>运行统计</h1>
+<div class="meta">统计窗口：最近 {days} 天（自 {_fmt_time(since_ts)} 起）· 共 {sum(row['runs'] for row in by_pipeline)} 条运行 · scheduler_app Web UI</div>
+<h2>按流水线汇总</h2>
+<table>
+<tr><th>流水线</th><th>运行总数</th><th>成功率（成功/总数）</th><th>平均耗时</th></tr>
+{pipeline_rows or "<tr><td colspan='4' style='color:#999'>窗口内无运行记录</td></tr>"}
+</table>
+<h2>失败节点 Top10</h2>
+<table>
+<tr><th>排名</th><th>节点</th><th>算子</th><th>失败次数</th></tr>
+{node_rows or "<tr><td colspan='4' style='color:#999'>窗口内无失败节点</td></tr>"}
+</table>
+<p class="meta">成功率 = 成功次数/运行总数；平均耗时为 finished_at − started_at 均值；
+失败节点按 node_id 跨运行聚合，窗口口径与流水线汇总一致（按 started_at）。</p>
+<p><a href="/">← 返回运行历史</a></p>"""
+    return _PAGE.format(title="运行统计", body=body)
 
 
 def _render_404(message: str) -> str:
@@ -646,9 +963,10 @@ def _make_handler(db_path: str | Path) -> type[BaseHTTPRequestHandler]:
             conn = _connect(resolved)
             try:
                 if path in ("/", ""):
-                    page, size, status = _parse_list_query(query)
+                    page, size, status, pipeline, since, until = _parse_list_query(query)
                     self._send(200, _render_index(
                         conn, page=page, size=size, status=status,
+                        pipeline=pipeline, since=since, until=until,
                     ))
                 elif path == "/compare":
                     run_a = query.get("a", [""])[0]
@@ -670,6 +988,20 @@ def _make_handler(db_path: str | Path) -> type[BaseHTTPRequestHandler]:
                     self._send(200, _render_compare(conn, row_a, row_b))
                 elif path == "/api/runs":
                     self._send_json(200, _render_api_runs(conn, query))
+                elif path.startswith("/api/runs/") and path.endswith("/report"):
+                    # M9 Task 12.3：报告 JSON（须先于通用 /api/runs/<id> 分支匹配）
+                    run_id = unquote(path[len("/api/runs/"):-len("/report")])
+                    payload = _render_api_report(conn, run_id)
+                    if payload is None:
+                        self._send_json(
+                            404,
+                            json.dumps(
+                                {"error": f"未找到运行记录：{run_id}"},
+                                ensure_ascii=False,
+                            ),
+                        )
+                    else:
+                        self._send_json(200, payload)
                 elif path.startswith("/api/runs/"):
                     run_id = unquote(path[len("/api/runs/"):])
                     payload = _render_api_run(conn, run_id)
@@ -683,6 +1015,8 @@ def _make_handler(db_path: str | Path) -> type[BaseHTTPRequestHandler]:
                         )
                     else:
                         self._send_json(200, payload)
+                elif path == "/stats":
+                    self._send(200, _render_stats(conn, query))
                 elif path == "/metrics":
                     self._send_body(
                         200, _render_metrics(conn),

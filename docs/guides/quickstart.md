@@ -257,5 +257,5 @@ CLI 会自动发现，无需 `--plugin`。更多扩展方式见
 - [运维指南](operations.md)：scheduler_app 定时调度、告警与保留策略、Web UI、RunStore 与远程 worker 排障；
 - [API 参考](../reference/api.md)：稳定公开 API、稳定性承诺与分组索引；
 - [配置规范](../reference/config-schema.md)：顶层/节点字段、引用语法、表达式子集与 CLI；
-- [算子清单](../reference/operator-catalog.md)：59 个内置算子的输入/输出/参数契约；
+- [算子清单](../reference/operator-catalog.md)：68 个内置算子的输入/输出/参数契约；
 - [扩展设计](../design/extension-points.md)：插件信任、入口点发布、替换执行器/缓存/句柄存储。

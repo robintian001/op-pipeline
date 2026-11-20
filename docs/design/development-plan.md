@@ -484,6 +484,39 @@
 
 ---
 
+## 7.8 M9：池化执行、报告落地与观测深化（v0.9.1）
+
+目标：在 v0.9 基础上做第二波增量——算子库存扩展到压缩/文本哈希/表整形方向、
+运行参数与全量报告的落地、值级预览与运行记录查询/聚合的观测深化，以及池化进程
+执行器；内核语义与默认行为保持不变，全部为可选加法。
+
+| 编号 | 方向 | 关键交付 |
+| --- | --- | --- |
+| M9-1 | 算子库存扩展（第二波） | 新增 9 个算子（59→68，全零依赖）：`json.parse` / `json.stringify`、`table.fill_null` / `table.replace` / `table.pivot` / `table.unpivot`、`text.hash`、`compress.gzip` / `compress.ungzip`（`compress_ops.py` 新模块，标准库 gzip，写文件不落缓存） |
+| M9-2 | 运行参数与报告落地 | `--param-file PATH`（可重复，与 `--param` 合并、命令行覆盖文件值）；`--report-out PATH`（全量报告 JSON 落盘、父目录自动创建、写失败只告警不改变运行结果与退出码）；`init --template` 新增 `quality` / `subpipeline` 模板 |
+| M9-3 | 观测性深化（值级与聚合） | `run --preview N`（运行级 `value_preview`）值级预览——报告节点附带 `preview_in`/`preview_out`（list 前 N 行 / dict 前 N 键 / str 截 200 字符），只影响报告不影响执行；`runs` CLI 子命令（列表/详情，`--db` 缺省 `runs.db`、库不存在退出码 1、无匹配退出码 0）；RunStore `runs` 表补 `report_json` 列（全量报告 JSON，幂等自动迁移）；Web 列表页 `pipeline=`/`since=`/`until=` 筛选、详情页报告折叠区块、`GET /api/runs/<id>/report`、`GET /stats?days=7`（默认 7 上限 90）聚合页 |
+| M9-4 | 池化进程执行器 | `executor="process_pool"` → `PooledProcessExecutor`：N 个常驻 spawn worker 消费任务队列，硬超时 terminate 对应 worker 并自动补位、崩溃自愈；载荷不可 pickle 时回退线程 |
+
+**M9 完成定义（DoD）**：全量回归全绿；主示例与压缩/预览/`runs` 端到端通过；
+`pyproject.toml` 升 `0.9.1`；`CHANGELOG` 归档 0.9.1；配置规范/运维指南/API 清单/
+算子清单与实现对齐，报告 schema 变更全部为加法。
+
+> **M9 已完成并关闭（v0.9.1，2026-11-20）**：M9-1 ~ M9-4 全部落地，无 BREAKING——
+> 所有新增参数可选（`value_preview`/`--param-file`/`--report-out`/`--preview`/
+> `--executor process_pool` 等），默认行为与 v0.9.0 一致；报告 schema 纯加法
+> （run 级 `value_preview`、节点级 `preview_in`/`preview_out`），RunStore runs 表
+> 补 `report_json` 列自动迁移；算子总数 59→68（62 零依赖内置 + 6 可选依赖），
+> 新增压缩模块 compress；新增 `runs` CLI 子命令与 `/stats` / `/api/runs/<id>/report`
+> Web 路由。
+> 文档同步：配置规范（executor 取值补 `process_pool`、运行级参数 `value_preview`、
+> CLI 选项 `--param-file`/`--report-out`/`--preview`/`runs`）、运维指南（§3.5 `runs`
+> 子命令、§2 Web 筛选与报告区块/`/stats`、§5.3 运行辅助选项）、稳定 API 清单
+> （`run_pipeline`/`Engine` 的 `value_preview`、`PooledProcessExecutor`、`report_json`、
+> 9 个新算子一句话契约）与算子清单（新增 json/table 扩展与 text.hash、压缩小节，
+> 总数复核 68）。
+
+---
+
 ## 8. 技术债映射
 
 [扩展设计 §5](extension-points.md#5-已知技术债与实现缺口) 的 T1–T15 与本计划的对应关系：

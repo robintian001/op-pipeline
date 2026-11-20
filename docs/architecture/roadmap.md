@@ -25,7 +25,7 @@
 
 | 维度 | 现状 | 直接推论 |
 | --- | --- | --- |
-| 数据处理 | `list[dict]` 行表 + 59 个算子（53 个零依赖 + 6 个可选依赖），覆盖文件→清洗→质量→聚合→报告 | 文件型、批式、中等数据量最顺手 |
+| 数据处理 | `list[dict]` 行表 + 68 个算子（62 个零依赖 + 6 个可选依赖），覆盖文件→清洗→质量→聚合→报告 | 文件型、批式、中等数据量最顺手 |
 | 数据规模 | 句柄默认全内存驻留，超阈值可落盘（`SpillHandleStore`）；缓存走 pickle 文件，v0.8 起可选容量上限（`max_entries`/`max_bytes`，按 mtime 淘汰） | 适合 MB～几百 MB 级；GB 级以上仍不适合 |
 | 计算模型 | 同步算子 + 线程池（默认 `min(8, CPU)`）；async 宿主经 `run_pipeline_async` 桥接（M2-8，`run_in_executor`） | IO 并行有效，CPU 密集无收益；桥接保证事件循环不被阻塞 |
 | 可靠性 | 重试/退避、`allow_failure`、`fail_fast` 完整；元数据持久化与断点续跑（M2-5/M2-6，`--runs` + `--resume`）可选开启；远程队列支持租约认领与过期重投（M7-1，`--lease-seconds`） | 可接受"失败重跑"，也可 `--resume` 只重跑失败段；远程 worker 崩溃后任务可回收 |
@@ -232,6 +232,35 @@ RunStore schema 与算子数（50）不变，零第三方依赖与可嵌入定�
 
 原则仍是"加法、可选、默认不变"：所有新增参数可选且缺省行为与 v0.8.0 一致，
 报告 schema 变更为纯加法（run 级 `sample_rows`、节点级 `sampled`/`rows_in`/`rows_out`），
+零第三方依赖与可嵌入定位保持。
+
+---
+
+### 阶段 7：池化执行、报告落地与观测深化（对应版本 0.9.1）— **已完成（v0.9.1，2026-11-20）**
+
+定位：**v0.9 的第二波增量**——算子库存补上压缩/文本哈希/表整形方向，运行参数与
+全量报告落地，值级预览与运行记录查询/聚合的观测深化，以及池化进程执行器。四条方向：
+
+- **算子库存扩展（第二波）**（M9-1）：结构 `json.parse`/`json.stringify`、表整形
+  `table.fill_null`/`table.replace`/`table.pivot`/`table.unpivot`、文本 `text.hash`、
+  压缩 `compress.gzip`/`compress.ungzip`（`compress_ops.py` 新模块，标准库 gzip、
+  写文件不落缓存）共 9 个新算子，全部零第三方依赖，算子数 59→68（62 零依赖内置 +
+  6 可选依赖）；
+- **运行参数与报告落地**（M9-2）：`--param-file PATH`（可重复，与 `--param` 合并、
+  命令行覆盖文件值）；`--report-out PATH`（全量报告 JSON 落盘、父目录自动创建、
+  写失败只告警不改变运行结果与退出码）；`init --template` 新增 `quality`/`subpipeline`；
+- **观测性深化（值级与聚合）**（M9-3）：`--preview N` / `value_preview` 值级预览
+  （报告节点附带 `preview_in`/`preview_out`：list 前 N 行 / dict 前 N 键 / str 截
+  200 字符，只影响报告不影响执行）；`runs` CLI 子命令（列表/详情，`--db` 缺省
+  `runs.db`、库不存在退出码 1、无匹配退出码 0）；RunStore runs 表补 `report_json`
+  列（幂等迁移）；Web 列表页 `pipeline=`/`since=`/`until=` 筛选、详情页报告折叠区块、
+  `GET /api/runs/<id>/report`、`GET /stats?days=7`（默认 7 上限 90）聚合页；
+- **池化进程执行器**（M9-4）：`executor="process_pool"` →
+  `PooledProcessExecutor`——N 个常驻 spawn worker 消费任务队列，硬超时 terminate
+  对应 worker 并自动补位、崩溃自愈，载荷不可 pickle 时回退线程。
+
+原则仍是"加法、可选、默认不变"：所有新增参数可选且缺省行为与 v0.9.0 一致，
+报告 schema 继续纯加法（run 级 `value_preview`、节点级 `preview_in`/`preview_out`），
 零第三方依赖与可嵌入定位保持。
 
 ---

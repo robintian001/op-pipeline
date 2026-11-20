@@ -6,12 +6,13 @@ import json
 import logging
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from .cache import CacheStore
 from .context import RunContext
-from .engine import Engine, _masked_params, storage_warnings
+from .engine import Engine, RunReport, _masked_params, storage_warnings
 from .errors import RefResolutionError, SpecValidationError
 from .graph import to_ascii, to_dot, to_mermaid
 from .registry import default_registry, load_plugins
@@ -41,6 +42,45 @@ def _parse_overrides(items: list[str] | None) -> dict[str, Any]:
         key, raw = item.split("=", 1)
         out[key.strip()] = _parse_value(raw)
     return out
+
+
+def _load_param_files(paths: list[str] | None) -> dict[str, Any]:
+    """M9 Task 8：逐文件加载 ``--param-file`` 的 JSON 参数（顶层必须是 object）。
+
+    文件不存在 / 不是合法 JSON / 顶层不是 dict 都视为用法错误：打印中文错误
+    并 ``SystemExit(2)``（与 ``--param`` 非法值的处理风格一致）。
+    """
+    out: dict[str, Any] = {}
+    for item in paths or []:
+        path = Path(item).expanduser()
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"--param-file 无法读取：{path}（{exc}）", file=sys.stderr)
+            raise SystemExit(2) from None
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            print(f"--param-file 不是合法 JSON：{path}（{exc}）", file=sys.stderr)
+            raise SystemExit(2) from None
+        if not isinstance(data, dict):
+            print(f"--param-file 顶层必须是 JSON 对象（dict）：{path}", file=sys.stderr)
+            raise SystemExit(2) from None
+        out.update(data)
+    return out
+
+
+def _merged_params(
+    param: list[str] | None, param_files: list[str] | None
+) -> dict[str, Any]:
+    """M9 Task 8：合并 ``--param-file``（JSON 文件）与 ``--param``（KEY=VALUE）。
+
+    各文件按顺序累加；命令行 ``--param`` 最后合并，覆盖文件中的同名键。
+    合并结果即运行级参数注入 map（``${param:...}`` 解析期替换，语义同 --param）。
+    """
+    params = _load_param_files(param_files)
+    params.update(_parse_overrides(param))
+    return params
 
 
 def _load(
@@ -80,8 +120,29 @@ class _WarningCollector(logging.Handler):
 
 
 # --------------------------------------------------------------------------- #
+def _write_report_out(path: str, report: RunReport, workdir: str) -> None:
+    """M9 Task 8：把全量运行报告 JSON 写到 ``--report-out`` 指定路径。
+
+    与 ``RunReport.to_json`` 同规则（ensure_ascii=False、indent=2、default=str）；
+    相对路径按工作目录解析，父目录自动创建。任何写失败只记 ``logger.error``，
+    调用方照常返回运行结果与退出码，绝不掩盖运行状态。
+    """
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        target = Path(workdir) / target
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        log.error("运行报告写入失败（不影响运行结果与退出码）：%s（%s）", target, exc)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    overrides = _parse_overrides(args.param)
+    # M9 Task 8：--param-file 与 --param 合并（命令行 --param 覆盖文件值）
+    overrides = _merged_params(args.param, args.param_file)
     # M8-2 Task 1：--param 值同时作为运行级参数注入（${param:...} 解析期替换）
     spec = _load(args.config, args.plugin, params=overrides)
     plan = build_plan(spec, default_registry, overrides=overrides)
@@ -94,6 +155,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # M8-2 Task 4：--sample N 采样预览；非法值在创建上下文之前就拒绝
     if args.sample is not None and args.sample < 1:
         print("--sample 必须是 ≥1 的整数", file=sys.stderr)
+        return 2
+    # M9 Task 7：--preview N 值级预览；非法值在创建上下文之前就拒绝
+    if args.preview is not None and args.preview < 1:
+        print("--preview 必须是 ≥1 的整数", file=sys.stderr)
         return 2
 
     workdir = args.workdir or str(Path(args.config).expanduser().resolve().parent)
@@ -123,7 +188,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     engine = Engine(plan, context, cache_store=cache_store, max_workers=args.workers,
                     fail_fast=args.fail_fast, executor=args.executor, run_store=run_store,
-                    resume_run_id=args.resume, sample_rows=args.sample)
+                    resume_run_id=args.resume, sample_rows=args.sample,
+                    value_preview=args.preview)
 
     report = engine.run()
     if run_store is not None:
@@ -136,6 +202,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             spill_warn_bytes=args.spill_warn_bytes,
         )
     )
+    # M9 Task 8：--report-out 全量报告落盘（不传参数不写文件）
+    if args.report_out:
+        _write_report_out(args.report_out, report, workdir)
     print(report.summary())
     # M5-4（Task 10）：失败节点在 CLI 报告追加截断堆栈——
     # NodeResult.traceback 已由引擎 _clip_traceback 截断（保留末尾约 2000 字符），
@@ -304,6 +373,133 @@ op = "report.markdown"
 report = "${report.text}"
 """
 
+_QUALITY_PIPELINE = """\
+name = "quality_gate"
+version = "1"
+description = "质量示例：schema_check + null_check 双门禁（warn/error 模式 + allow_failure 语义）"
+
+# 数据用 control.const 内联注入，不依赖任何外部文件，validate 可直接通过。
+# 自定义算子示例见 plugins/my_ops.py；需要时显式加载：
+#   python -m op_pipeline run pipeline.toml --plugin plugins/my_ops.py
+
+[[nodes]]
+id = "source"
+op = "control.const"
+
+  [nodes.params]
+  value = [
+    { id = 1, name = "alice", region = "north", amount = 120 },
+    { id = 2, name = "bob", region = "south", amount = 80 },
+    { id = 3, name = "", region = "north", amount = 5 },
+  ]
+
+# 第一道门禁：类型检查（mode = "error" —— 违例即节点失败，硬门禁）
+[[nodes]]
+id = "schema_gate"
+op = "quality.schema_check"
+
+  [nodes.inputs]
+  table = "${source.value}"
+
+  [nodes.params]
+  expected = { id = "int", name = "str", region = "str", amount = "int" }
+  strict_columns = true
+  mode = "error"
+
+# 第二道门禁：空值率检查（mode = "warn" —— 违例只出明细不中断，
+# 明细交给 report 节点展示；name = "" 即为一条空值违例）
+[[nodes]]
+id = "null_gate"
+op = "quality.null_check"
+
+  [nodes.inputs]
+  table = "${schema_gate.table}"
+
+  [nodes.params]
+  columns = ["name", "region"]
+  max_null_ratio = 0.0
+  mode = "warn"
+
+# allow_failure 语义示例：本节点（error 门禁）会因 region 重复而失败，
+# 但 allow_failure = true 时失败只影响自身，不中断整条流水线。
+[[nodes]]
+id = "audit"
+op = "quality.unique"
+allow_failure = true
+
+  [nodes.inputs]
+  table = "${null_gate.table}"
+
+  [nodes.params]
+  keys = ["region"]
+  mode = "error"
+
+[[nodes]]
+id = "report"
+op = "report.markdown"
+
+  [nodes.params]
+  title = "质量检查报告"
+  blocks = [
+    { heading = "数据", level = 2 },
+    { table = "${null_gate.table}", title = "通过门禁的数据" },
+    { text = "空值违例数：${null_gate.violations}" },
+  ]
+
+[outputs]
+report = "${report.text}"
+"""
+
+_SUBPIPELINE_PARENT = """\
+name = "subpipeline_demo"
+version = "1"
+description = "编排示例：父配置调用子流水线（pipeline.run）并把 ${param:} 注入子配置"
+
+# 父配置通过内置算子 pipeline.run 执行同目录的子配置 child.toml，
+# 并从子流水线取回节点输出；运行级参数经 params 注入子流水线：
+#   python -m op_pipeline run pipeline.toml --param CITY=上海
+
+[params]
+CITY = "北京"
+
+[[nodes]]
+id = "sub"
+op = "pipeline.run"
+
+  [nodes.params]
+  config = "child.toml"
+  node = "greet"
+  params = { CITY = "${param:CITY}" }
+
+[[nodes]]
+id = "wrap"
+op = "control.passthrough"
+
+  [nodes.inputs]
+  value = "${sub.result}"
+
+[outputs]
+out = "${wrap.value}"
+"""
+
+_SUBPIPELINE_CHILD = """\
+name = "child"
+version = "1"
+description = "子流水线：被 pipeline.toml 调用，接收父配置注入的 ${param:} 运行级参数"
+
+# ${param:CITY:-北京} 的 :- 默认值保证 child.toml 可被独立 validate；
+# 经父配置 pipeline.run 注入时使用注入值。
+[[nodes]]
+id = "greet"
+op = "control.const"
+
+  [nodes.params]
+  value = "你好，${param:CITY:-北京}！"
+
+[outputs]
+greeting = "${greet.value}"
+"""
+
 _SCHEDULER_TOML = """\
 # scheduler 模板：定时执行同目录的 pipeline.toml
 #
@@ -468,12 +664,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     target.mkdir(parents=True, exist_ok=True)
 
     files = {
-        "pipeline.toml": _DATA_PIPELINE if args.template == "data" else _MINIMAL_PIPELINE,
+        "pipeline.toml": _QUALITY_PIPELINE
+        if args.template == "quality"
+        else (_DATA_PIPELINE if args.template == "data" else _MINIMAL_PIPELINE),
         "plugins/my_ops.py": _INIT_PLUGIN,
         "tests/test_my_ops.py": _INIT_PLUGIN_TEST,
     }
     if args.template == "scheduler":
         files["scheduler.toml"] = _SCHEDULER_TOML
+    elif args.template == "subpipeline":
+        # M9 Task 9：subpipeline 模板只生成两个配置文件（父配置 + 子配置）
+        files = {"pipeline.toml": _SUBPIPELINE_PARENT, "child.toml": _SUBPIPELINE_CHILD}
 
     for rel, content in files.items():
         path = target / rel
@@ -637,7 +838,8 @@ def cmd_explain(args: argparse.Namespace) -> int:
     plan = None
     try:
         try:
-            overrides = _parse_overrides(args.param)
+            # M9 Task 8：--param-file 与 --param 合并（命令行 --param 覆盖文件值）
+            overrides = _merged_params(args.param, args.param_file)
             spec = _load(args.config, args.plugin, params=overrides)
             plan = build_plan(spec, default_registry)
         except SpecValidationError as exc:
@@ -862,6 +1064,137 @@ def cmd_queue_compact(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# M9 Task 10：runs —— 查询 RunStore 运行历史（列表/详情，复用 store 查询 API）
+# --------------------------------------------------------------------------- #
+def _fmt_ts(epoch: Any) -> str:
+    """时间戳（秒）格式化为本地时间字符串；无记录返回 '（无）'。"""
+    if not isinstance(epoch, (int, float)):
+        return "（无）"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+def _row_total(raw: Any) -> int | None:
+    """把 nodes.rows_in/rows_out 的 JSON 文本求和为总行数（无记录返回 None）。"""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    total = sum(v for v in data.values() if isinstance(v, (int, float)))
+    return int(total) if total else None
+
+
+def _runs_list(store: RunStore, args: argparse.Namespace) -> int:
+    """列表模式：--status 精确过滤、--pipeline 子串过滤、--last 截取全部下推到 SQL。"""
+    sql = "SELECT run_id, pipeline, version, status, started_at, finished_at FROM runs"
+    conds: list[str] = []
+    params: list[Any] = []
+    if args.status:
+        conds.append("status = ?")
+        params.append(args.status)
+    if args.pipeline:
+        conds.append("pipeline LIKE ?")
+        params.append(f"%{args.pipeline}%")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY started_at DESC, run_id DESC"
+    if args.last is not None:
+        sql += " LIMIT ?"
+        params.append(args.last)
+    rows = store.query(sql, tuple(params))
+
+    items = [
+        {
+            "run_id": r[0],
+            "pipeline": r[1],
+            "version": r[2],
+            "status": r[3],
+            "started_at": _fmt_ts(r[4]),
+            "finished_at": _fmt_ts(r[5]),
+        }
+        for r in rows
+    ]
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+        return 0
+    if not items:
+        print("（无匹配的运行记录）")
+    for item in items:
+        print(
+            f"{item['run_id']}  {item['pipeline']} v{item['version']}  "
+            f"{item['status']}  {item['started_at']}"
+        )
+    return 0
+
+
+def _runs_detail(store: RunStore, run_id: str) -> int:
+    """详情模式：run 摘要 + 节点状态/尝试次数/错误摘要/行数。"""
+    rows = store.query(
+        "SELECT run_id, pipeline, version, status, started_at, finished_at "
+        "FROM runs WHERE run_id = ?",
+        (run_id,),
+    )
+    if not rows:
+        print(f"运行记录不存在：{run_id}", file=sys.stderr)
+        return 0
+    run = rows[0]
+    print(f"run_id   : {run[0]}")
+    print(f"pipeline : {run[1]} (v{run[2]})")
+    print(f"status   : {run[3]}")
+    print(f"时间     : {_fmt_ts(run[4])} → {_fmt_ts(run[5])}")
+
+    nodes = store.query(
+        "SELECT node_id, op, status, attempts, cached, error, duration, "
+        "rows_in, rows_out FROM nodes WHERE run_id = ? "
+        "ORDER BY finished_at, node_id",
+        (run_id,),
+    )
+    if not nodes:
+        print("节点     ：（无记录）")
+        return 0
+    print(f"\n节点（{len(nodes)} 个）：")
+    print(f"{'节点':<24}{'状态':<10}{'尝试':>6}{'耗时':>9}{'行数 in/out':>16}  算子")
+    for node in nodes:
+        node_id, op, status, attempts, cached, error, duration, rows_in, rows_out = node
+        total_in, total_out = _row_total(rows_in), _row_total(rows_out)
+        rows_text = "、".join(
+            f"{name}={value}"
+            for name, value in (("in", total_in), ("out", total_out))
+            if value is not None
+        ) or "—"
+        mark = " [cache]" if cached else ""
+        print(
+            f"{node_id:<24}{status:<10}{attempts:>6}{duration:>9.2f}s"
+            f"{rows_text:>16}  {op}{mark}"
+        )
+        if error:
+            print(f"{'':<24}└─ {str(error).splitlines()[0][:120]}")
+    return 0
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    """M9 Task 10：查询 RunStore 运行历史。
+
+    ``runs [--db] [--status] [--pipeline] [--last] [--json]`` 列表模式；
+    ``runs <run_id> [--db]`` 详情模式。库不存在退出码 1；库存在但无匹配退出码 0。
+    """
+    if args.last is not None and args.last < 1:
+        print("--last 必须是 ≥1 的整数", file=sys.stderr)
+        return 2
+    db = Path(args.db).expanduser()
+    if not db.is_file():
+        print(f"运行记录库不存在：{db}", file=sys.stderr)
+        return 1
+    with RunStore(db) as store:
+        if args.run_id is not None:
+            return _runs_detail(store, args.run_id)
+        return _runs_list(store, args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="op_pipeline", description="算子级可配置流水线框架")
     parser.add_argument("-v", "--verbose", action="store_true", help="打印调试日志")
@@ -874,6 +1207,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="执行流水线")
     common(run)
+    run.add_argument(
+        "--param-file", action="append", default=None,
+        help="M9 从 JSON 文件加载流水线参数（顶层必须是对象，可多次指定；"
+             "命令行 --param 覆盖文件值）",
+    )
     run.add_argument("--workdir", default=None, help="工作目录（相对路径基准），默认取配置文件所在目录")
     run.add_argument("--workers", type=int, default=None, help="最大并发节点数")
     run.add_argument(
@@ -895,8 +1233,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--fail-fast", action="store_true", help="任一节点失败即停止调度新节点")
     run.add_argument(
-        "--executor", choices=("thread", "process", "queue"), default=None,
+        "--executor", choices=("thread", "process", "process_pool", "queue"), default=None,
         help="运行级执行器：process 时未显式指定的节点在子进程执行（硬超时）；"
+             "process_pool 时用常驻 worker 进程池复用执行（默认 min(8, CPU) 个 worker，"
+             "硬超时 terminate 在跑 worker 并自动补位）；"
              "queue 时引擎自建队列执行器——队列与结果目录推导自工作目录下的 "
              ".op_pipeline/remote/（jobs.jsonl 与 results/），需另启 worker 消费："
              "python -m op_pipeline worker --queue <工作目录>/.op_pipeline/remote/jobs.jsonl "
@@ -918,6 +1258,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="M8-2 采样预览：每个节点解析输入后把 list 类型句柄截断为前 N 行，"
              "缓存读写全部禁用；必须是 ≥1 的整数（默认不采样）",
     )
+    run.add_argument(
+        "--preview", type=int, default=None,
+        help="M9 值级预览：报告节点附带 preview_in/preview_out（list 取前 N 行、"
+             "dict 取前 N 键、str 截 200 字符）；只影响报告不影响执行，"
+             "必须是 ≥1 的整数（默认不采集）",
+    )
+    run.add_argument(
+        "--report-out", default=None,
+        help="M9 运行结束后把全量报告 JSON 落盘到指定路径"
+             "（相对路径按工作目录解析，父目录自动创建；不传则默认不写文件）",
+    )
     run.set_defaults(func=cmd_run)
 
     validate = sub.add_parser("validate", help="只校验配置，不执行")
@@ -931,8 +1282,11 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="生成脚手架项目（M7-2）")
     init.add_argument("dir", help="目标目录（已存在且非空时拒绝）")
     init.add_argument(
-        "--template", choices=("minimal", "data", "scheduler"), default="minimal",
-        help="模板类型：minimal / data / scheduler（默认 minimal）",
+        "--template",
+        choices=("minimal", "data", "scheduler", "quality", "subpipeline"),
+        default="minimal",
+        help="模板类型：minimal / data / scheduler / quality / subpipeline"
+             "（默认 minimal；quality=质量双门禁，subpipeline=父子编排）",
     )
     init.set_defaults(func=cmd_init)
 
@@ -954,6 +1308,11 @@ def build_parser() -> argparse.ArgumentParser:
         "explain", help="M8-2：输出解析后的最终生效配置（不执行节点、零文件产出）"
     )
     common(explain)
+    explain.add_argument(
+        "--param-file", action="append", default=None,
+        help="M9 从 JSON 文件加载流水线参数（顶层必须是对象，可多次指定；"
+             "命令行 --param 覆盖文件值）",
+    )
     explain.add_argument("--node", default=None, help="只输出指定 id 的节点")
     explain.add_argument(
         "--json", action="store_true",
@@ -1030,6 +1389,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="归档文件路径（默认 <队列同目录>/<队列 stem>.archive.jsonl）",
     )
     compact.set_defaults(func=cmd_queue_compact)
+
+    runs = sub.add_parser("runs", help="M9：查询运行历史记录（RunStore SQLite 库）")
+    runs.add_argument(
+        "run_id", nargs="?", default=None,
+        help="运行记录 run_id；省略则列出运行记录（可配 --status/--pipeline/--last 过滤）",
+    )
+    runs.add_argument("--db", default="runs.db", help="运行记录库路径（默认 runs.db）")
+    runs.add_argument(
+        "--status", default=None,
+        help="按状态过滤（如 success / failed / partial）",
+    )
+    runs.add_argument(
+        "--pipeline", default=None,
+        help="按流水线名过滤（子串匹配）",
+    )
+    runs.add_argument(
+        "--last", type=int, default=None,
+        help="最多列出最近 N 条（必须是 ≥1 的整数；默认全部）",
+    )
+    runs.add_argument("--json", action="store_true", help="列表以 JSON 数组输出")
+    runs.set_defaults(func=cmd_runs)
     return parser
 
 

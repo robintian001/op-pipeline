@@ -558,9 +558,10 @@ class NodeSpec:
         merged = {k: raw.get(k, fallback.get(k)) for k in _STRATEGY_KEYS}
         timeout_raw = merged["timeout"]
         executor_raw = merged["executor"] or ""
-        if executor_raw not in ("", "thread", "process", "queue"):
+        if executor_raw not in ("", "thread", "process", "process_pool", "queue"):
             raise ConfigError(
-                f"节点 [{node_id}] 的 executor 只能是 thread/process/queue，实际是 {executor_raw!r}"
+                f"节点 [{node_id}] 的 executor 只能是 thread/process/process_pool/queue，"
+                f"实际是 {executor_raw!r}"
             )
         # M6-3 Task 8：并发分组必须是字符串（空串 = 未声明，不加组限流）
         group_raw = raw.get("concurrency_group", "")

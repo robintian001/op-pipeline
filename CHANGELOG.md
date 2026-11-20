@@ -5,6 +5,42 @@
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-20
+
+### Added
+
+- 算子库存扩展（M9-1）：新增 JSON 文本算子 `json.parse` / `json.stringify`
+  （`ops/json_ops.py`）、表清洗与整形 `table.fill_null` / `table.replace` /
+  `table.pivot` / `table.unpivot`（`ops/table_ops.py`）、文本摘要 `text.hash`
+  （`ops/text_ops.py`）、压缩算子 `compress.gzip` / `compress.ungzip`
+  （新模块 `ops/compress_ops.py`），全部零第三方依赖。
+- 池化进程执行器（M9 Task 6）：`executor="process_pool"` 字符串别名接入——
+  常驻 worker 进程池 `PooledProcessExecutor`（默认 `min(8, CPU)` 个 worker），
+  节点级声明同样触发建池；单任务硬超时 `terminate()` 在跑 worker 并自动补位，
+  worker 异常退出同补位、在跑任务按失败结算，不可 pickle 载荷回退线程执行。
+- 值级预览（M9 Task 7）：`run_pipeline`/`Engine` 新增 `value_preview=N`（CLI
+  `run --preview N`）——报告节点附带 `preview_in`/`preview_out`（list 前 N 行 /
+  dict 前 N 键 / str 截 200 字符），只影响报告不影响执行。
+- 开发者体验（M9-2）：CLI `run`/`explain` 新增 `--param-file <path>`（可重复，
+  与 `--param` 合并且命令行覆盖文件值）；`run --report-out <path>` 全量报告
+  JSON 落盘（父目录自动创建，写失败不掩盖运行结果）；`init --template` 新增
+  `quality` 与 `subpipeline` 两种模板；新增 `runs` 历史查询子命令（列表/详情、
+  `--status`/`--pipeline`/`--last`/`--json` 过滤，库不存在退出码 1、无匹配 0）。
+- 观测性深化（M9-3）：`RunStore` `runs` 表补 `report_json TEXT` 列（全量报告
+  JSON 入库，与 `--report-out` 同序列化规则，旧库幂等自动迁移）；Web UI 列表页
+  新增 `pipeline=`/`since`/`until` 筛选、详情页报告折叠区块（完整
+  params/warnings/失败节点 traceback，HTML 转义）、`GET /api/runs/<id>/report`
+  只读 API、`/stats?days=7` 聚合页（按 pipeline 汇总总数/成功率/平均耗时 +
+  失败节点 Top10）。
+
+### Changed
+
+- 算子总数 59 → 68（62 个零依赖内置 + 6 个可选依赖）。
+- 兼容性：报告 schema 变更全部为加法（节点级 `preview_in`/`preview_out`、
+  可空 `report_json` 列），未改动或删除任何既有键；新参数全部可选
+  （`value_preview`/`--param-file`/`--report-out`/`--preview`/`--template` 等），
+  默认行为与 v0.9.0 一致。
+
 ## [0.9.0] - 2026-11-19
 
 ### Added
